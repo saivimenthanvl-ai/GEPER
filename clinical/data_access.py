@@ -665,6 +665,49 @@ def auditable(
             else:
                 session = None
 
+            # ── w137: WHICH ORGANISATION THE ROW IS FILED UNDER, WHEN THE
+            # ACTING PRINCIPAL IS NOT A STAFF `Session`.
+            #
+            # THE DEFECT. Every audit row's org_id/user_id was bound from
+            # `session` above and from nothing else, and `session` is None for
+            # every requires_session=False method. `read_audit` is
+            # Auditor-gated and filters `WHERE org_id = %s`, so a row written
+            # with org_id NULL is recorded where the organisation that owns it
+            # cannot look. `terminate_my_patient_session` is the method that
+            # shape reaches -- a patient logging out of the portal -- and the
+            # organisation was never unknown: it is on the PatientSession, and
+            # w132 had to carry it in `details` instead.
+            #
+            # THIS IS NOT A WIDENING OF DECISION 7. The refusal above is keyed
+            # on requires_session=True and is untouched; a PatientSession is
+            # still refused by every staff operation, and the tripwire for
+            # that is test_w137_patient_backend.py::TestDecisionSevenWasNotWidened
+            # as well as w130's own suite. What changes here is only which
+            # column an already-permitted call's row lands in.
+            #
+            # COUNTED at 4213cd3, so the blast radius is a fact: sixteen
+            # methods declare requires_session=False; ten are auditable=False
+            # and write no row at all; of the remaining six,
+            # log_failed_login, login, create_organisation, create_user and
+            # patient_login all carry a literal org_id (or a name) parameter
+            # and are already bound by the fallbacks below.
+            # terminate_my_patient_session is the only one whose acting
+            # principal is an object, and it is the only row this changes.
+            #
+            # user_id COMES FROM `getattr`, AND THAT IS THE POINT.
+            # audit_log.user_id means a `users` row; PatientSession
+            # deliberately has no user_id (see its docstring), so a patient
+            # logout keeps a NULL there and the acting credential stays in
+            # `details`. A staff Session presented to a patient-principal
+            # method -- the denied path _require_patient_session exists for --
+            # does name its user, which is exactly what an auditor reading a
+            # refused attempt needs.
+            acting_principal = (
+                args[0] if (not requires_session and args and isinstance(args[0], (Session, PatientSession))) else None
+            )
+            principal_org_id = session.org_id if session else getattr(acting_principal, "org_id", None)
+            principal_user_id = session.user_id if session else getattr(acting_principal, "user_id", None)
+
             # Bind arguments to resolve positional/keyword ambiguity
             # Try to get the original function's signature if wrapped
             original_func = func
@@ -689,8 +732,8 @@ def auditable(
                 # Build audit details — pass resolved parameters to avoid positional/keyword issues
                 details = details_builder(bound_params, result) if details_builder else {}
                 # For provisioning methods without session, extract org_id from parameters
-                write_org_id = session.org_id if session else None
-                write_user_id = session.user_id if session else None
+                write_org_id = principal_org_id
+                write_user_id = principal_user_id
 
                 # For organisation creation, result is the org_id
                 if not session and isinstance(result, uuid.UUID) and resource_type == "organisation":
@@ -738,8 +781,8 @@ def auditable(
                     resource_type,
                     resource_id="<denied>",
                     outcome="denied",
-                    org_id=session.org_id if session else None,
-                    user_id=session.user_id if session else None,
+                    org_id=principal_org_id,
+                    user_id=principal_user_id,
                     actor_role=self._get_actor_role(session) if session else None,
                     details=details if details else None,
                     ip_address=bound_params.get("ip_address"),
@@ -761,8 +804,8 @@ def auditable(
                     resource_type,
                     resource_id="<error>",
                     outcome="error",
-                    org_id=session.org_id if session else None,
-                    user_id=session.user_id if session else None,
+                    org_id=principal_org_id,
+                    user_id=principal_user_id,
                     actor_role=self._get_actor_role(session) if session else None,
                     details=details if details else None,
                     ip_address=bound_params.get("ip_address"),
@@ -2544,14 +2587,19 @@ class DataAccess:
         # requires_session=False BECAUSE THE DECORATOR REFUSES A PatientSession
         # WHERE requires_session=True (w130 decision 7), which is correct and
         # is not being worked around: this method is not a staff operation.
-        # The consequence is honest and is recorded rather than hidden — the
-        # decorator binds the audit row's org_id/user_id COLUMNS from a staff
-        # Session, so this row's org_id is NULL and the organisation and the
-        # acting credential are carried in `details` below. Teaching the
-        # decorator to bind them from a patient session would widen the one
-        # place in this layer that refuses patient principals, which is the
-        # dependency-widening the second-axis design exists to refuse. Pinned
-        # by test_w132_logout.py so the gap is a decision on the record.
+        #
+        # w132 SHIPPED THIS WITH A NULL org_id AND SAID SO; w137 CLOSED IT.
+        # The decorator bound the audit row's org_id/user_id COLUMNS from a
+        # staff Session and from nothing else, so every row written here had
+        # org_id NULL — and read_audit is Auditor-gated and filters
+        # `WHERE org_id = %s`, so a patient session termination was recorded
+        # where the organisation that owns it could not look. The organisation
+        # was never unknown: it is on the PatientSession. The decorator now
+        # reads it from the acting principal for requires_session=False
+        # methods, WITHOUT touching decision 7's refusal, which is keyed on
+        # requires_session=True. `user_id` stays NULL here because a patient
+        # is not a `users` row; the acting credential stays in `details`
+        # below, where it also was before.
         requires_session=False,
         # `getattr`, NOT attribute access, AND IT IS NOT DEFENSIVE HABIT. The
         # decorator runs the details_builder on the DENIED and ERRORED paths

@@ -48,7 +48,7 @@ from __future__ import annotations
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response, status
 from pydantic import BaseModel
 
 from clinical.data_access import (
@@ -59,7 +59,7 @@ from clinical.data_access import (
     NotFoundError,
     PatientSession,
 )
-from clinical.endpoints import _anonymous_refusal, _get_data_access
+from clinical.endpoints import _anonymous_refusal, _clear_session_cookie, _get_data_access
 
 router = APIRouter(prefix="/portal", tags=["portal"])
 
@@ -203,3 +203,44 @@ async def list_my_tests(
         )
         for o in orders
     ]
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="End the calling PATIENT session",
+    responses={
+        204: {"description": "The session is terminated and the cookie cleared"},
+        401: {"description": "Not authenticated"},
+    },
+)
+async def patient_logout(
+    patient_session: PatientSession = Depends(_get_patient_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> Response:
+    """
+    End the calling patient session and clear the portal cookie.
+
+    THE MIRROR OF `/auth/logout`, and a mirror rather than a shared handler
+    for the reason the whole portal is: `_get_patient_session` is not
+    `_get_session`, the cookie is not the staff cookie, and the table is not
+    `sessions`. A staff session id presented here is refused exactly as an
+    unknown id is — same status, same body — so this route cannot be used to
+    confirm that an id names a real session somewhere.
+
+    NO BODY, NO PATH PARAMETER. See `/auth/logout`: there is nothing to name,
+    so there is nothing to check.
+
+    THE COOKIE IS CLEARED ON `/portal`, THE PATH IT WAS SET WITH. A deletion
+    sent on `/` would add a second, empty cookie and leave the live one in the
+    jar — harmless here because the server-side row is what actually ends the
+    session, and still worth getting right, because a credential sitting in a
+    browser that everyone believes was cleared is its own kind of hazard.
+    """
+    try:
+        dao.terminate_my_patient_session(patient_session)
+    except AuthorizationError:
+        raise _anonymous_refusal()
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _clear_session_cookie(response, _PATIENT_SESSION_COOKIE, path="/portal")
+    return response

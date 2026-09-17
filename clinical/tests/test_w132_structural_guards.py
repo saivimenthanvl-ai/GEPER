@@ -192,6 +192,12 @@ class TestTheRouteCensus:
             ("/portal/me/tests", ("GET",)),
             ("/auth/login", ("POST",)),
             ("/portal/login", ("POST",)),
+            # w132c. The two logout routes. They are NOT on the auth router:
+            # logout consumes a session, so each lives in the module that owns
+            # its principal's dependency — /auth/logout on a second, unprefixed
+            # router in endpoints.py, /portal/logout on the portal router.
+            ("/auth/logout", ("POST",)),
+            ("/portal/logout", ("POST",)),
         }
     )
 
@@ -209,7 +215,7 @@ class TestTheRouteCensus:
         from clinical.app import app
 
         census = served_routes(app)
-        assert len(census) == 9, census
+        assert len(census) == 11, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

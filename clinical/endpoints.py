@@ -25,7 +25,7 @@ import os
 import uuid
 from typing import Iterator, Optional
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response, status
 from pydantic import BaseModel
 
 from clinical.data_access import (
@@ -37,6 +37,16 @@ from clinical.data_access import (
 )
 
 router = APIRouter(prefix="/exceptions", tags=["exceptions"])
+
+# A SECOND ROUTER IN THIS MODULE, AND IT CARRIES NO PREFIX. `router` above is
+# prefixed `/exceptions`, so a route outside that tree cannot live on it. The
+# staff logout route belongs in THIS file rather than in `auth_endpoints.py`
+# because logout CONSUMES a session — it is the one authentication act that
+# takes a credential instead of minting one — and `_get_session` lives here.
+# `auth_endpoints.py` is pinned by a structural guard NOT to import either
+# session dependency, precisely so that a login route can never grow into one
+# that accepts a session.
+session_router = APIRouter(tags=["authentication"])
 
 
 class ExceptionListItem(BaseModel):
@@ -320,6 +330,83 @@ def _get_session(
         return dao.session_valid(session_id)
     except AuthenticationError:
         raise _anonymous_refusal()
+
+
+def _clear_session_cookie(response: Response, name: str, path: str) -> None:
+    """
+    THE ONLY PLACE IN THIS REPOSITORY THAT CLEARS A COOKIE — the mirror of
+    `auth_endpoints._set_session_cookie`, which is the only place that sets
+    one.
+
+    WHY IT IS IN THIS MODULE AND THE SETTER IS IN THAT ONE, stated because a
+    reader will otherwise assume somebody was careless: `auth_endpoints`
+    imports from here, so the reverse import would be a cycle. What matters is
+    that each half is singular and that the two agree on `path`, which is
+    pinned structurally — see `test_w132_structural_guards.py`.
+
+    `path` MUST MATCH THE PATH THE COOKIE WAS SET WITH. A browser keys a
+    cookie on (name, domain, path); a deletion sent with a different path
+    creates a second, empty cookie and leaves the live credential in the jar.
+    The server-side termination is what actually ends the session, so a
+    mismatch here would not leave the session usable — but it would leave a
+    valid-looking credential in the browser, which is a different and worse
+    kind of confusion.
+
+    `httponly`/`secure`/`samesite` are repeated because a deletion is an
+    ordinary Set-Cookie with an expiry in the past: over plain HTTP a browser
+    would ignore a Secure deletion for a Secure cookie, so the attributes must
+    match the ones the cookie was set with.
+    """
+    response.delete_cookie(
+        key=name,
+        path=path,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+
+
+@session_router.post(
+    "/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="End the calling STAFF session",
+    responses={
+        204: {"description": "The session is terminated and the cookie cleared"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+    },
+)
+async def staff_logout(
+    session: Session = Depends(_get_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> Response:
+    """
+    End the calling session and clear the cookie.
+
+    THERE IS NO REQUEST BODY AND NO PATH PARAMETER, so a caller has no way to
+    name a session. That is the same construction `/portal/me` uses to make
+    "the patient cannot ask for somebody else's record" structural rather than
+    checked, and it is what the obvious wrong version gets wrong: a
+    `{"session_id": ...}` body scoped only to the caller's organisation lets
+    any authenticated user end a colleague's session from a route called
+    logout. A body that does not exist cannot carry an identifier, and a
+    query string that invents one is ignored by construction.
+
+    BOTH HALVES, AND THE SERVER HALF IS THE ONE THAT MATTERS. The cookie is
+    cleared so the browser stops presenting a credential it can no longer use;
+    the session is terminated server-side so that a copy of the cookie taken
+    from anywhere else is dead too. A logout that only cleared the cookie
+    would look identical to a person and be worth nothing to an attacker
+    holding the id.
+
+    EVERY REFUSAL IS THE SAME REFUSAL: an anonymous caller, a malformed id, an
+    unknown id, an already-terminated session and a PATIENT session id all
+    reach `_get_session`, which answers `_anonymous_refusal()`. So this route
+    tells nobody which session ids exist — including by succeeding.
+    """
+    dao.terminate_my_session(session)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _clear_session_cookie(response, _SESSION_COOKIE, path="/")
+    return response
 
 
 @router.get(

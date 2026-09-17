@@ -1189,6 +1189,57 @@ class DataAccess:
             (now, session.user_id, target_session_id, session.org_id),
         )
 
+    @auditable(
+        action="session_logged_out",
+        resource_type="session",
+        requires_session=True,
+        details_builder=lambda params, result: {"session_id": str(result)},
+    )
+    @transactional
+    def terminate_my_session(self, session: Session) -> uuid.UUID:
+        """
+        End THE CALLING session. Log out.
+
+        IT TAKES NO TARGET IDENTIFIER, AND THAT IS THE WHOLE DESIGN. The
+        obvious version of this method accepts a `target_session_id` and ends
+        it, scoped to the caller's organisation — and that hands every
+        authenticated user the capability `terminate_session` reserves for an
+        Administrator, through a route called "logout". The defence is not a
+        check that the target belongs to the caller: a check can be forgotten,
+        refactored away, or made optional by a later `if target_session_id is
+        None` convenience. THERE IS NOTHING TO CHECK, because the id ended is
+        read from the session object the dependency produced and there is no
+        other way to name one.
+
+        NO ROLE IS REQUIRED, and that distinguishes it from
+        `terminate_session` above rather than duplicating it. Ending somebody
+        else's session is an administrative act; ending your own is not, and
+        a self-logout gated on Administrator would mean ordinary staff could
+        not log out at all — a defect that would read like security.
+
+        `terminated_by` holds the acting user. `terminated_at IS NULL` in the
+        predicate makes a second call a no-op rather than a rewrite: the
+        recorded moment a session ended must be the first one, not the last
+        redundant request.
+
+        RETURNS THE SESSION ID so that @auditable's `resource_id` names the
+        session that ended. A `-> None` here would record `<none>` — the w120
+        defect — and an audit row that cannot name its subject is not an
+        audit.
+
+        NOT A CREDENTIAL REVOCATION. This ends one session. The credential
+        that minted it is untouched and can mint another immediately, which is
+        correct for logout and is NOT what `users.disabled` /
+        `patient_logins.disabled` are for.
+        """
+        now = self._clock.now()
+        self._execute(
+            "UPDATE sessions SET terminated_at = %s, terminated_by = %s "
+            "WHERE session_id = %s AND org_id = %s AND terminated_at IS NULL",
+            (now, session.user_id, session.session_id, session.org_id),
+        )
+        return session.session_id
+
     # ── roles ────────────────────────────────────────────────────────────────
 
     @auditable(
@@ -2397,6 +2448,76 @@ class DataAccess:
             patient_id=patient_id,
             org_id=org_id,
         )
+
+    @auditable(
+        action="patient_session_logged_out",
+        resource_type="patient_session",
+        # requires_session=False BECAUSE THE DECORATOR REFUSES A PatientSession
+        # WHERE requires_session=True (w130 decision 7), which is correct and
+        # is not being worked around: this method is not a staff operation.
+        # The consequence is honest and is recorded rather than hidden — the
+        # decorator binds the audit row's org_id/user_id COLUMNS from a staff
+        # Session, so this row's org_id is NULL and the organisation and the
+        # acting credential are carried in `details` below. Teaching the
+        # decorator to bind them from a patient session would widen the one
+        # place in this layer that refuses patient principals, which is the
+        # dependency-widening the second-axis design exists to refuse. Pinned
+        # by test_w132_logout.py so the gap is a decision on the record.
+        requires_session=False,
+        # `getattr`, NOT attribute access, AND IT IS NOT DEFENSIVE HABIT. The
+        # decorator runs the details_builder on the DENIED and ERRORED paths
+        # too, where the argument is whatever the caller passed -- including
+        # the staff `Session` that `_require_patient_session` exists to
+        # refuse, which has no `patient_login_id`. Plain access raised
+        # AttributeError from inside the audit writer and MASKED the
+        # AuthorizationError, turning a clean refusal into a crash. Found by
+        # test_a_staff_session_is_refused_by_the_patient_logout_method.
+        details_builder=lambda params, result: {
+            "session_id": str(getattr(params.get("patient_session"), "session_id", None)),
+            "org_id": str(getattr(params.get("patient_session"), "org_id", None)),
+            "patient_login_id": str(getattr(params.get("patient_session"), "patient_login_id", None)),
+        },
+    )
+    @transactional
+    def terminate_my_patient_session(self, patient_session: "PatientSession") -> uuid.UUID:
+        """
+        End THE CALLING patient session. The patient's logout.
+
+        A DELIBERATE MIRROR of `terminate_my_session`, against a different
+        table, and a mirror rather than a shared helper for the same reason
+        `patient_login` mirrors `login`: one function reaching two session
+        tables is the union this design refuses.
+
+        IT TAKES NO TARGET IDENTIFIER, for the reason given there. And it ends
+        ONE ROW, NOT EVERY ROW THE CREDENTIAL HOLDS — the plausible wrong
+        version keys the UPDATE on `patient_login_id`, which reads like a
+        tidier logout and silently signs a patient out of every device they
+        have. "Log out everywhere" is a different, rulable feature with a
+        different name; it is not the default meaning of a logout button, and
+        nothing in an absence-shaped test can tell the two apart. The positive
+        twin in test_w132_logout.py is what does.
+
+        `terminated_by` HOLDS THE `patient_login_id` — the credential that
+        performed the act, which `patient_sessions` already carries — and this
+        is expressible WITHOUT A SCHEMA CHANGE only because `terminated_by`
+        has NO foreign key on either session table. Had it referenced
+        `users (user_id, org_id)`, which `terminate_session` writing
+        `session.user_id` there makes a reasonable thing to assume, a patient
+        could not name themselves as the actor and this would have been a
+        migration in a repository that has no migration mechanism and three
+        schema changes already held unlanded.
+
+        NOT A CREDENTIAL REVOCATION: `patient_logins.disabled` still has no
+        writer anywhere in this repository, and this method is not one.
+        """
+        self._require_patient_session(patient_session)
+        now = self._clock.now()
+        self._execute(
+            "UPDATE patient_sessions SET terminated_at = %s, terminated_by = %s "
+            "WHERE session_id = %s AND org_id = %s AND terminated_at IS NULL",
+            (now, patient_session.patient_login_id, patient_session.session_id, patient_session.org_id),
+        )
+        return patient_session.session_id
 
     # ── patient portal identity (w130) ───────────────────────────────────────
     #

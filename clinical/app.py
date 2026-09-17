@@ -69,7 +69,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from clinical.auth_endpoints import router as auth_router
-from clinical.endpoints import router
+from clinical.endpoints import router, session_router
 from clinical.portal_endpoints import router as portal_router
 
 _DSN_ENV = "CLINICAL_DSN"
@@ -124,6 +124,15 @@ app.include_router(portal_router)
 # Mounted alongside, never through: it adds no dependency to the two routers
 # above, and neither of them imports it.
 app.include_router(auth_router)
+
+# w132c. `POST /auth/logout`. It is a SECOND, UNPREFIXED router out of
+# clinical/endpoints.py rather than a third route in auth_endpoints.py,
+# because logout is the one authentication act that CONSUMES a session
+# instead of minting one — it depends on `_get_session`, which lives there,
+# and `auth_endpoints.py` is pinned by a structural guard not to import
+# either session dependency. `POST /portal/logout` is on `portal_router`
+# above for the mirror reason: `_get_patient_session` lives in that file.
+app.include_router(session_router)
 
 
 @app.get("/healthz", tags=["health"], summary="Liveness probe")

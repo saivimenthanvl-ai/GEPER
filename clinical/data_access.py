@@ -1583,13 +1583,64 @@ class DataAccess:
     )
     @transactional
     def set_user_disabled(self, session: Session, target_user_id: uuid.UUID, disabled: bool) -> None:
-        """Offboarding. Never a DELETE -- that would orphan the audit chain."""
+        """
+        Offboarding. Never a DELETE -- that would orphan the audit chain.
+
+        AND IT ENDS THE USER'S LIVE SESSIONS (w133). Until w133 this method
+        wrote one row in `users` and nothing else, and that was a real gap
+        rather than a tidy omission: `session_valid` reads only `sessions` and
+        `_require_role` reads only `role_assignments`, so NOTHING anywhere
+        consulted `users.disabled` once a session existed. A user disabled at
+        10:00 passed validation at 10:01 and kept every Administrator-gated
+        capability -- including disabling somebody else -- for up to the 24h
+        absolute cap, with the 30-minute idle window refreshed by their own
+        activity. Measured, not reasoned: the two capability rows in
+        test_w133_staff_revocation.py failed with "DID NOT RAISE" against the
+        previous version of this method.
+
+        The statement is in THIS body, not a second decorated call, because
+        @auditable commits after every audit row it writes: a composition
+        would commit "user_disabled" while the sessions ran on, and an audit
+        that records something that did not happen is worse than one that
+        records nothing.
+
+        `terminated_by` holds the ACTING Administrator, consistent with
+        terminate_session. `terminated_at IS NULL` makes a second disable a
+        no-op rather than a rewrite. ONLY WHEN `disabled` IS TRUTHY: re-enabling
+        must not terminate anything, and it does not resurrect anything either.
+
+        POINT-IN-TIME, NOT CONTINUOUS, AND THE RESIDUE IS REAL. This ends the
+        sessions that exist WHEN IT RUNS. `session_valid` is unchanged -- one
+        row from `sessions` by primary key, no join on `users` -- so a
+        `disabled` flag set by any other route (direct SQL, a restore, a
+        future bootstrap) leaves that user's live sessions valid until their
+        own window closes. Closing that residue means reading the principal
+        row on every authenticated request, which is a change to the hottest
+        path in this layer and was deliberately not made here. Proved, not
+        described, by test_w133_staff_revocation.py::TestTheResidueIsReal.
+
+        WHAT IT DOES NOT DO: it does not touch role resolution. `_require_role`
+        still reads `role_assignments` and still never consults this flag. The
+        capability is removed by the session ending, which is what
+        `_get_session` revalidates on every request -- not by the roles
+        changing. That distinction is why the staff tests make a real
+        role-gated call through the request path rather than asserting on
+        validation alone.
+        """
         self._require_role(session, "Administrator")
         self.get_user(session, target_user_id)
+        now = self._clock.now()
         self._execute(
             "UPDATE users SET disabled = %s, updated_at = %s WHERE user_id = %s AND org_id = %s",
-            (disabled, self._clock.now(), target_user_id, session.org_id),
+            (disabled, now, target_user_id, session.org_id),
         )
+
+        if disabled:
+            self._execute(
+                "UPDATE sessions SET terminated_at = %s, terminated_by = %s "
+                "WHERE user_id = %s AND org_id = %s AND terminated_at IS NULL",
+                (now, session.user_id, target_user_id, session.org_id),
+            )
 
     @auditable(
         action="totp_enrolled",

@@ -300,10 +300,12 @@ async def get_exceptions_for_order(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Order not found",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving exceptions: {str(e)}",
+            detail=f"Error retrieving exceptions: {type(e).__name__}",
         )
 
 
@@ -382,10 +384,12 @@ async def get_exceptions_worklist(
 
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving worklist: {str(e)}",
+            detail=f"Error retrieving worklist: {type(e).__name__}",
         )
 
 
@@ -502,8 +506,27 @@ async def resolve_exception(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exception {exception_id} not found",
         )
+    except HTTPException:
+        # Do not re-wrap. Wrapping turned the handler's own 404 and its own 500
+        # into "Error resolving exception: 500: ...", which is how one half of
+        # the existence oracle got its distinctive wording.
+        raise
     except Exception as e:
+        # w129 GAP-2, second half. THE TYPE, NEVER THE TEXT.
+        #
+        # This read f"...{str(e)}". Measured at 9bc3abd, that returned
+        #   {"detail":"Error resolving exception: current transaction is
+        #    aborted, commands ignored until end of transaction block"}
+        # to an authenticated caller in a DIFFERENT organisation -- the driver's
+        # own message, and the half of the existence oracle that told the caller
+        # its guessed UUID belongs to nobody. clinical/app.py:118-121 settled
+        # the rule for this repository and gives the reason in one line: "a
+        # libpq error message quotes the connection string back".
+        #
+        # The same statement stood on the two neighbouring read routes in this
+        # file and is changed there too; fixing only the route the oracle was
+        # found on would have left the identical leak twice over.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error resolving exception: {str(e)}",
+            detail=f"Error resolving exception: {type(e).__name__}",
         )

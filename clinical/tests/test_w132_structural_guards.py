@@ -22,12 +22,106 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
+
 CLINICAL = pathlib.Path(__file__).resolve().parent.parent
 TREE = CLINICAL.parent
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# THE ANCHOR (w132c) — the cannot-fail shape, applied to these guards
+# themselves.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# EVERY GUARD IN THIS FILE READS SOURCE BY PATH, and a path is a claim about
+# where something is. When the claim is wrong the guard does not fail — it
+# reads an empty directory, finds zero offenders, and reports green. That is
+# the Phase 5d cannot-fail shape exactly: a test satisfied by the broken state
+# as readily as by the working one, except that here the "broken state" is the
+# test's own footing.
+#
+# THIS IS NOT HYPOTHETICAL ON THIS REPOSITORY. Four concrete ways the footing
+# moves, none of which any assertion below would otherwise notice:
+#
+#   * THE TWO CI JOBS RUN FROM DIFFERENT WORKING DIRECTORIES — the clinical
+#     job from `clinical/`, the geper job from `geper/`. A path built by
+#     parent traversal from `__file__` is stable under that; a path built from
+#     the process's cwd is not, and the two are one careless edit apart.
+#   * A MOVED TEST FILE. `parent.parent` is a distance, not a destination.
+#     Move this file one directory deeper and `CLINICAL` becomes `clinical/`
+#     — no, it becomes `clinical/tests/`, whose `rglob("*.py")` finds only
+#     tests and whose `auth_endpoints.py` does not exist.
+#   * A RENAMED PACKAGE. `TREE.rglob` over a tree with no `clinical/` in it
+#     returns files, so a count-based sanity check still passes; what
+#     disappears is the specific module every guard is about.
+#   * AN INSTALLED SECOND COPY. The guards read a file from disk while the
+#     application under test imports `clinical.auth_endpoints` from
+#     site-packages. Both succeed, and they are about different code.
+#
+# So: every path this file uses goes through `_anchor()`, which names LANDMARK
+# FILES rather than counting anything, and the anchor has its own negative
+# twin (`TestTheAnchorItself`) proving it fails on an empty tree. A guard that
+# cannot find its target now FAILS LOUDLY instead of passing quietly.
+
+# Files that must exist for ANY guard in this file to mean anything. Landmarks,
+# not a census: the list is short, specific, and spans both packages, so it
+# cannot be satisfied by an arbitrary Python tree.
+_LANDMARKS = (
+    "clinical/app.py",
+    "clinical/endpoints.py",
+    "clinical/portal_endpoints.py",
+    "clinical/auth_endpoints.py",
+    "clinical/data_access.py",
+    "clinical/schema.sql",
+    "geper/api/main.py",
+)
+
+
+def _anchor(root=None):
+    """
+    Confirm `root` really is this repository's tree, or raise.
+
+    Returns the root so call sites can write `_anchor() / "clinical"` and
+    cannot accidentally skip it.
+    """
+    root = TREE if root is None else pathlib.Path(root)
+    missing = [rel for rel in _LANDMARKS if not (root / rel).is_file()]
+    if missing:
+        raise AssertionError(
+            f"THE GUARDS ARE NOT ANCHORED. Reading from {root}, which is missing {missing}. "
+            "These structural tests read source by path; a path that resolves somewhere "
+            "without the modules they are about does not make them fail, it makes them find "
+            "nothing and pass. Fix the path -- do not relax the landmark list."
+        )
+    return root
+
+
+def _source(relative):
+    """The text of one file under the anchored tree, proved non-empty."""
+    path = _anchor() / relative
+    text = path.read_text(encoding="utf-8")
+    assert text.strip(), f"{path} exists but is empty -- every guard reading it would pass vacuously"
+    return text
+
+
 def _python_files():
-    return [path for path in TREE.rglob("*.py") if "__pycache__" not in path.parts and ".git" not in path.parts]
+    """
+    Every Python file in the tree, ANCHORED AND PROVED NON-VACUOUS.
+
+    The census guards below are set comparisons ("exactly these modules call
+    `set_cookie`"), and a set comparison against an empty census fails loudly
+    for the *equality* rows and silently for the *absence* rows. The
+    membership assertion is what covers the absence rows.
+    """
+    root = _anchor()
+    found = [path for path in root.rglob("*.py") if "__pycache__" not in path.parts and ".git" not in path.parts]
+    relative = {path.relative_to(root).as_posix() for path in found}
+    expected = {rel for rel in _LANDMARKS if rel.endswith(".py")}
+    assert expected <= relative, (
+        f"the file walk under {root} did not find {sorted(expected - relative)} -- "
+        "it is walking the wrong tree, and every absence-shaped guard built on it is vacuous"
+    )
+    return found
 
 
 def _calls_named(path, attribute):
@@ -37,16 +131,131 @@ def _calls_named(path, attribute):
     written down: `auth_endpoints.py`'s own docstring contains the words
     `set_cookie` and `_create_system_session`, so a grep-shaped guard reports
     the prose as a call and fails green.
+
+    A FILE THAT CANNOT BE PARSED IS AN ERROR, NOT A ZERO (w132c). This used to
+    swallow `SyntaxError` and `UnicodeDecodeError` and return 0, which is the
+    anchoring defect in miniature: a mojibaked or half-written module — Rule 7
+    names exactly how one gets that way on this toolchain — would report "does
+    not call set_cookie" and every census here would agree with it.
     """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError):
-        return 0
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        raise AssertionError(
+            f"{path} could not be parsed ({exc!r}), so this guard cannot say anything about it. "
+            "Reporting zero calls here would be a silent pass."
+        ) from exc
     return sum(
         1
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == attribute
     )
+
+
+def _calls_of(source, function_name):
+    """
+    Every call of a bare `function_name(...)`, as (positional args, keywords),
+    with each argument rendered back to source.
+    """
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == function_name:
+            found.append(
+                (
+                    [ast.unparse(a) for a in node.args],
+                    {kw.arg: ast.unparse(kw.value) for kw in node.keywords},
+                )
+            )
+    return found
+
+
+class TestTheAnchorItself:
+    """
+    STANDING RULE 4 APPLIED TO THE FOOTING. Without these rows the anchor is
+    an assertion nobody has watched fail, which is the same thing as no
+    anchor: `_anchor()` could be `return root` and every guard in this file
+    would still be green.
+    """
+
+    def test_the_anchor_accepts_the_real_tree(self):
+        assert _anchor() == TREE
+
+    def test_the_anchor_refuses_an_empty_directory(self, tmp_path):
+        with pytest.raises(AssertionError) as caught:
+            _anchor(tmp_path)
+        assert "NOT ANCHORED" in str(caught.value)
+
+    def test_the_anchor_refuses_a_tree_that_is_one_directory_off(self, tmp_path):
+        """
+        THE REALISTIC FAILURE, and the one a mere `path.exists()` check misses:
+        a root that is a plausible Python tree with the right NAMES in the
+        wrong PLACES. Here `clinical/` exists and `geper/api/main.py` does not,
+        which is what a guard pointed at `clinical/` itself would see.
+        """
+        (tmp_path / "clinical").mkdir()
+        for name in ("app.py", "endpoints.py", "portal_endpoints.py", "auth_endpoints.py", "data_access.py"):
+            (tmp_path / "clinical" / name).write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "clinical" / "schema.sql").write_text("-- x\n", encoding="utf-8")
+
+        with pytest.raises(AssertionError) as caught:
+            _anchor(tmp_path)
+        assert "geper/api/main.py" in str(caught.value)
+
+    def test_the_file_walk_refuses_a_tree_without_the_modules(self, tmp_path, monkeypatch):
+        """
+        `_python_files()` is the base of every census row. Pointed at a tree
+        with no `clinical/` it must fail rather than return an empty list --
+        the empty list is what makes `assert not offenders` pass forever.
+        """
+        monkeypatch.setattr("clinical.tests.test_w132_structural_guards.TREE", tmp_path)
+        with pytest.raises(AssertionError):
+            _python_files()
+
+    def test_the_call_matcher_refuses_a_file_it_cannot_parse(self, tmp_path):
+        broken = tmp_path / "broken.py"
+        broken.write_text("def f(:\n", encoding="utf-8")
+        with pytest.raises(AssertionError) as caught:
+            _calls_named(broken, "set_cookie")
+        assert "could not be parsed" in str(caught.value)
+
+    def test_the_source_reader_refuses_an_empty_file(self, tmp_path, monkeypatch):
+        (tmp_path / "empty.py").write_text("", encoding="utf-8")
+        monkeypatch.setattr("clinical.tests.test_w132_structural_guards._anchor", lambda root=None: tmp_path)
+        with pytest.raises(AssertionError) as caught:
+            _source("empty.py")
+        assert "empty" in str(caught.value)
+
+
+class TestTheGuardsReadTheCodeThatRuns:
+    """
+    THE OTHER HALF OF ANCHORING, and the one the landmark list cannot cover.
+    A landmark check proves a file exists at a path. It does NOT prove that
+    the path is where Python loads the module from — and if the application
+    under test imports `clinical.auth_endpoints` from an installed copy while
+    these guards read the working tree, both succeed and they are about
+    different code. Every behavioural test in the wave would then be testing
+    one file and every structural test pinning another.
+    """
+
+    def test_each_module_these_guards_read_is_the_module_python_imports(self):
+        import clinical.app
+        import clinical.auth_endpoints
+        import clinical.data_access
+        import clinical.endpoints
+        import clinical.portal_endpoints
+
+        for module, relative in (
+            (clinical.app, "clinical/app.py"),
+            (clinical.endpoints, "clinical/endpoints.py"),
+            (clinical.portal_endpoints, "clinical/portal_endpoints.py"),
+            (clinical.auth_endpoints, "clinical/auth_endpoints.py"),
+            (clinical.data_access, "clinical/data_access.py"),
+        ):
+            loaded = pathlib.Path(module.__file__).resolve()
+            assert loaded == (TREE / relative), (
+                f"{module.__name__} is imported from {loaded}, but these guards read "
+                f"{TREE / relative}. They are pinning a file the tests do not run."
+            )
 
 
 class TestCookiePolicyLivesInExactlyOneModule:
@@ -71,12 +280,12 @@ class TestCookiePolicyLivesInExactlyOneModule:
         that finds nothing anywhere — which is exactly what a grep for the
         wrong symbol does.
         """
-        assert _calls_named(CLINICAL / "auth_endpoints.py", "set_cookie") >= 1
+        assert _calls_named(_anchor() / "clinical/auth_endpoints.py", "set_cookie") >= 1
 
     def test_the_cookie_helper_is_the_only_caller_inside_that_module(self):
         """One module is not enough if the module itself has two policies:
         both routes must go through `_set_session_cookie`."""
-        tree = ast.parse((CLINICAL / "auth_endpoints.py").read_text(encoding="utf-8"))
+        tree = ast.parse(_source("clinical/auth_endpoints.py"))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -129,11 +338,25 @@ class TestThePerimeterIsStillEmpty:
         )
 
     def test_no_cors_import_reaches_the_clinical_package(self):
-        for path in CLINICAL.rglob("*.py"):
+        """
+        ANCHORED (w132c). This is an ABSENCE row — "no file contains
+        CORSMiddleware" — and an absence row over an empty walk is the purest
+        vacuous pass there is. The scanned set is therefore both counted and
+        named: the landmark modules must be among the files actually opened.
+        """
+        scanned = []
+        for path in (_anchor() / "clinical").rglob("*.py"):
             if "__pycache__" in path.parts or path.parts[-2:-1] == ("tests",):
                 continue
+            scanned.append(path)
             source = path.read_text(encoding="utf-8")
             assert "CORSMiddleware" not in source, path
+
+        names = {path.name for path in scanned}
+        assert {"app.py", "endpoints.py", "portal_endpoints.py", "auth_endpoints.py"} <= names, (
+            f"the scan opened {sorted(names)} -- it is not reading the clinical package, "
+            "so finding no CORS import proves nothing"
+        )
 
 
 def served_routes(app):
@@ -241,7 +464,7 @@ class TestTheRefusalStaysUniform:
         accounts. So the named clause is pinned here in addition to the
         behaviour.
         """
-        tree = ast.parse((CLINICAL / "auth_endpoints.py").read_text(encoding="utf-8"))
+        tree = ast.parse(_source("clinical/auth_endpoints.py"))
         named = set()
         for handler in ast.walk(tree):
             if not isinstance(handler, ast.ExceptHandler) or handler.type is None:
@@ -255,7 +478,7 @@ class TestTheRefusalStaysUniform:
     def test_the_anonymous_refusal_is_one_function_and_the_auth_module_uses_it(self):
         """A second hand-written `HTTPException(401, ...)` in the auth module
         is how two refusals that differ by a byte begin."""
-        source = (CLINICAL / "auth_endpoints.py").read_text(encoding="utf-8")
+        source = _source("clinical/auth_endpoints.py")
         assert "_anonymous_refusal" in source
         tree = ast.parse(source)
         for node in ast.walk(tree):
@@ -276,7 +499,7 @@ class TestTheStaffDependencyWasStillNotWidened:
     """
 
     def test_get_session_still_validates_a_staff_session_only(self):
-        source = (CLINICAL / "endpoints.py").read_text(encoding="utf-8")
+        source = _source("clinical/endpoints.py")
         body = source[source.index("def _get_session(") :]
         body = body[: body.index("\n@router.")]
         assert "dao.session_valid(" in body
@@ -289,7 +512,7 @@ class TestTheStaffDependencyWasStillNotWidened:
         not accept them. Importing `_get_session` here would be the first step
         towards a login route that takes a session.
         """
-        source = (CLINICAL / "auth_endpoints.py").read_text(encoding="utf-8")
+        source = _source("clinical/auth_endpoints.py")
         tree = ast.parse(source)
         imported = set()
         for node in ast.walk(tree):
@@ -299,9 +522,262 @@ class TestTheStaffDependencyWasStillNotWidened:
         assert "_get_patient_session" not in imported, imported
 
     def test_the_twin_the_import_walker_sees_the_imports_that_are_there(self):
-        tree = ast.parse((CLINICAL / "auth_endpoints.py").read_text(encoding="utf-8"))
+        tree = ast.parse(_source("clinical/auth_endpoints.py"))
         imported = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 imported.update(alias.name for alias in node.names)
         assert {"_get_data_access", "_anonymous_refusal", "_SESSION_COOKIE"} <= imported, imported
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# w132c — THE LOGOUT SURFACE
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTheCookieIsClearedInExactlyOnePlaceAndOnTheRightPath:
+    """
+    The mirror of `TestCookiePolicyLivesInExactlyOneModule`, for the half the
+    wave just added. Setting a cookie and clearing one are the same decision
+    made twice, and the second one is the easy one to get wrong quietly: a
+    browser keys a cookie on (name, domain, path), so a deletion sent on a
+    different path adds a second empty cookie and leaves the live credential
+    in the jar. Nothing observable breaks — the person appears logged out,
+    because the server-side row IS terminated — and the credential the whole
+    design calls a bearer token stays in the browser.
+    """
+
+    def test_only_one_module_clears_a_cookie(self):
+        clearers = {
+            path.relative_to(TREE).as_posix(): _calls_named(path, "delete_cookie")
+            for path in _python_files()
+            if _calls_named(path, "delete_cookie")
+        }
+        assert set(clearers) == {"clinical/endpoints.py"}, clearers
+
+    def test_the_twin_the_matcher_finds_the_call_that_exists(self):
+        """Standing Rule 4: without this the row above is satisfied by a
+        matcher that finds nothing anywhere."""
+        assert _calls_named(_anchor() / "clinical/endpoints.py", "delete_cookie") >= 1
+
+    def test_the_clear_helper_is_the_only_caller_inside_that_module(self):
+        tree = ast.parse(_source("clinical/endpoints.py"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            direct = [
+                call
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "delete_cookie"
+            ]
+            if direct:
+                assert node.name == "_clear_session_cookie", (
+                    f"{node.name} clears a cookie directly instead of going through "
+                    "_clear_session_cookie -- that is how two cookie policies begin"
+                )
+
+    def test_every_cookie_is_cleared_on_the_path_it_was_set_with(self):
+        """
+        THE ROW THAT CANNOT BE WRITTEN BEHAVIOURALLY WITHOUT A REAL BROWSER,
+        and the reason it is here rather than only in the logout tests: a test
+        client's cookie jar does not enforce path scoping, so a mismatched
+        clear passes every HTTP assertion in this repository. Read from the
+        source instead, as (cookie name, path) pairs, and required to AGREE.
+        """
+        set_calls = _calls_of(_source("clinical/auth_endpoints.py"), "_set_session_cookie")
+        clear_calls = _calls_of(_source("clinical/endpoints.py"), "_clear_session_cookie") + _calls_of(
+            _source("clinical/portal_endpoints.py"), "_clear_session_cookie"
+        )
+
+        def pairs(calls):
+            out = set()
+            for args, keywords in calls:
+                assert len(args) >= 2, args
+                path = keywords.get("path")
+                assert path is not None, ("a cookie call with no explicit path", args, keywords)
+                out.add((args[1], path))
+            return out
+
+        set_pairs = pairs(set_calls)
+        clear_pairs = pairs(clear_calls)
+
+        # Non-vacuity FIRST: two principals, two cookies, so two of each. An
+        # empty set equals an empty set, which is the failure this whole file
+        # is about.
+        assert len(set_pairs) == 2, set_pairs
+        assert len(clear_pairs) == 2, clear_pairs
+        assert set_pairs == clear_pairs, (
+            f"a cookie is set as {sorted(set_pairs)} and cleared as {sorted(clear_pairs)}. "
+            "A deletion on a different path leaves the live credential in the browser."
+        )
+
+    def test_the_two_cookies_are_still_two_and_are_the_w130_names(self):
+        """One cookie serving both principals would undo w130's separation,
+        and it would arrive looking like a tidy-up of the pair above."""
+        named = {args[1] for args, _ in _calls_of(_source("clinical/auth_endpoints.py"), "_set_session_cookie")}
+        assert named == {"_SESSION_COOKIE", "_PATIENT_SESSION_COOKIE"}, named
+
+
+class TestTheLogoutRoutesCannotNameASession:
+    """
+    THE STRUCTURAL FORM OF THE WRONG VERSION THIS WAVE WAS BUILT AGAINST. The
+    behavioural row (`test_the_route_accepts_no_body_that_could_name_a_session`)
+    proves today's handler ignores a supplied id. This proves the handler has
+    no way to RECEIVE one — the property that survives a refactor, because a
+    body model added "so the client can say which session" fails no
+    behavioural test until somebody also wires it up, and then it passes all
+    of them.
+    """
+
+    HANDLERS = (
+        ("clinical/endpoints.py", "staff_logout", "session"),
+        ("clinical/portal_endpoints.py", "patient_logout", "patient_session"),
+    )
+
+    def _handler(self, relative, name):
+        for node in ast.walk(ast.parse(_source(relative))):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return node
+        raise AssertionError(f"no handler {name!r} in {relative} -- the guard is reading the wrong file")
+
+    def test_neither_handler_takes_anything_but_its_dependencies(self):
+        for relative, name, principal in self.HANDLERS:
+            node = self._handler(relative, name)
+            params = [a.arg for a in node.args.args]
+            assert params == [principal, "dao"], (
+                f"{name} takes {params}. A logout that accepts a parameter is a logout that can "
+                "be asked to end somebody else's session."
+            )
+            # Every parameter has a `Depends(...)` default, so none of them is
+            # a body or a path parameter FastAPI would fill from the request.
+            defaults = [ast.unparse(d) for d in node.args.defaults]
+            assert len(defaults) == len(params), (params, defaults)
+            assert all(d.startswith("Depends(") for d in defaults), defaults
+
+    def test_neither_route_declares_a_path_parameter(self):
+        """
+        The route PATH only — not the whole decorator, whose `responses=`
+        dictionary contains braces of its own and would make this row pass or
+        fail for the wrong reason.
+        """
+        for relative, name, _ in self.HANDLERS:
+            node = self._handler(relative, name)
+            paths = [
+                d.args[0].value
+                for d in node.decorator_list
+                if isinstance(d, ast.Call) and d.args and isinstance(d.args[0], ast.Constant)
+            ]
+            assert len(paths) == 1, (name, paths)
+            assert "{" not in paths[0], (name, paths)
+            assert paths[0].endswith("logout"), (name, paths)
+
+    def test_each_handler_calls_its_own_principals_termination_and_no_other(self):
+        """
+        `terminate_session` is the ADMINISTRATOR-GATED method that ends
+        SOMEBODY ELSE'S session. A logout handler reaching it would be that
+        capability behind a route anybody can call, and the two names differ
+        by one word.
+        """
+        expected = {
+            "staff_logout": "terminate_my_session",
+            "patient_logout": "terminate_my_patient_session",
+        }
+        for relative, name, _ in self.HANDLERS:
+            node = self._handler(relative, name)
+            called = {
+                call.func.attr
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            }
+            assert expected[name] in called, (name, called)
+            assert "terminate_session" not in called, (
+                f"{name} calls terminate_session -- the Administrator-gated method that ends ANOTHER session"
+            )
+            other = expected["patient_logout" if name == "staff_logout" else "staff_logout"]
+            assert other not in called, (name, called)
+
+
+class TestTheTerminationMethodsTakeNoTarget:
+    """
+    The same property one layer down, where it actually holds. A route guard
+    can be satisfied by a handler that reads an id from somewhere else; the
+    METHOD having no parameter to put one in cannot.
+
+    Read from the AST of `data_access.py` rather than `inspect.signature`,
+    because `@auditable` wraps every public method in a bare `def
+    wrapper(self, *args, **kwargs)` with no `functools.wraps` — so
+    `inspect.signature` reports `['self', 'args', 'kwargs']` for every method
+    in that layer, identically, whatever it declares.
+    """
+
+    EXPECTED = {
+        "terminate_my_session": ["self", "session"],
+        "terminate_my_patient_session": ["self", "patient_session"],
+        # The contrast, pinned deliberately: the administrative method DOES
+        # take a target, and must keep doing so. Without this row the class
+        # above is satisfied by a matcher that finds no parameters anywhere.
+        "terminate_session": ["self", "session", "target_session_id"],
+    }
+
+    def test_each_termination_method_declares_exactly_its_expected_parameters(self):
+        tree = ast.parse(_source("clinical/data_access.py"))
+        classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "DataAccess"]
+        assert classes, "no class DataAccess -- the guard is reading the wrong file"
+
+        found = {
+            node.name: [a.arg for a in node.args.args]
+            for node in classes[0].body
+            if isinstance(node, ast.FunctionDef) and node.name in self.EXPECTED
+        }
+        assert found == self.EXPECTED, found
+
+    def test_the_self_logout_methods_require_no_role(self):
+        """
+        `_require_role` in a self-logout would mean only Administrators could
+        log out. The administrative method must still carry it, which is the
+        twin that stops this row passing against a matcher that finds nothing.
+        """
+        tree = ast.parse(_source("clinical/data_access.py"))
+        bodies = {
+            node.name: ast.unparse(node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name in self.EXPECTED
+        }
+        assert "_require_role" not in bodies["terminate_my_session"], bodies["terminate_my_session"]
+        assert "_require_role" not in bodies["terminate_my_patient_session"]
+        assert "_require_role(session, 'Administrator')" in bodies["terminate_session"], (
+            "terminate_session lost its Administrator gate -- this wave must not have weakened it"
+        )
+
+
+class TestTheLoginModuleStillMintsAndDoesNotConsume:
+    """
+    w132c did NOT put the logout routes in `auth_endpoints.py`, and this pins
+    the reason rather than leaving it in a commit message. That module mints
+    credentials; the guard forbidding it to import a session dependency is
+    what stops a login route growing into one that accepts a session, and the
+    obvious place to have put logout would have forced that guard to be
+    relaxed.
+    """
+
+    def _decorators(self):
+        source = _source("clinical/auth_endpoints.py")
+        found = [
+            ast.unparse(d)
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for d in node.decorator_list
+        ]
+        assert found, "no decorated functions found -- the guard is reading the wrong file"
+        return found
+
+    def test_the_auth_module_declares_no_logout_route(self):
+        decorators = self._decorators()
+        assert not any("logout" in d for d in decorators), decorators
+
+    def test_the_twin_the_scan_sees_the_login_routes_that_are_there(self):
+        decorators = self._decorators()
+        assert sum("/auth/login" in d for d in decorators) == 1, decorators
+        assert sum("/portal/login" in d for d in decorators) == 1, decorators

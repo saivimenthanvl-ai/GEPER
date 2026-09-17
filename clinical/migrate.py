@@ -428,6 +428,17 @@ def _acquire(connection, lock_timeout: str) -> None:
 
 
 def _release(connection) -> None:
+    """
+    ROLL BACK FIRST, THEN UNLOCK. The ordering is load-bearing and it was found
+    by a test rather than by reasoning. `_release` runs in a `finally`, so it
+    also runs after a migration has FAILED -- and a failed statement leaves the
+    connection in an ABORTED transaction, where Postgres rejects every further
+    command with InFailedSqlTransaction. The unlock therefore raised inside the
+    `finally`, the SESSION-level advisory lock stayed held for the life of the
+    connection, and the next runner queued behind a process that had already
+    given up. The symptom is a deploy that hangs, and it names nothing.
+    """
+    connection.rollback()
     with connection.cursor() as cur:
         cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
     connection.commit()

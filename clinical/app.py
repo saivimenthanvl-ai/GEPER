@@ -68,6 +68,7 @@ from typing import Dict
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from clinical.auth_endpoints import router as auth_router
 from clinical.endpoints import router
 from clinical.portal_endpoints import router as portal_router
 
@@ -112,6 +113,17 @@ app.include_router(router)
 # dependency accepting either principal) is the cheap move that silently
 # destroys per-patient isolation.
 app.include_router(portal_router)
+
+# w132. The authentication surface: POST /auth/login and POST /portal/login,
+# in ONE module with NO router prefix, each route declaring its full path.
+# Two routes rather than one because the route is what names the principal —
+# a combined endpoint could not avoid disclosing which credential store an
+# address lives in, on a timing channel that no equalisation inside either
+# method reaches. See clinical/auth_endpoints.py.
+#
+# Mounted alongside, never through: it adds no dependency to the two routers
+# above, and neither of them imports it.
+app.include_router(auth_router)
 
 
 @app.get("/healthz", tags=["health"], summary="Liveness probe")

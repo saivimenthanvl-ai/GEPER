@@ -23,6 +23,7 @@ import ast
 import datetime as dt
 import os
 import pathlib
+import re
 import uuid
 
 import pytest
@@ -31,6 +32,7 @@ from clinical.data_access import (
     GENERIC_AUTH_ERROR,
     MAX_FAILED_LOGIN_ATTEMPTS,
     ORG_SCOPED_TABLES,
+    TABLES_EXEMPT_FROM_ORG_SCOPING,
     AuthenticationError,
     AuthorizationError,
     BcryptHasher,
@@ -580,6 +582,81 @@ class TestStructuralIsolation:
     """
 
     @staticmethod
+    def _schema_tables() -> dict[str, str]:
+        """
+        Every CREATE TABLE in schema.sql, name -> column/constraint body.
+
+        The census the coverage guard is derived from. Parsing the schema
+        rather than reading a hand-written tuple is the whole point: a table
+        that exists is on this list the moment it is created, whether or not
+        anybody remembered to mention it in Python.
+        """
+        src = SCHEMA_PATH.read_text(encoding="utf-8")
+        return dict(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\((.*?)\n\);", src, re.S))
+
+    @classmethod
+    def _org_owned_tables(cls) -> set[str]:
+        """Schema census minus the written exemptions. Never the hand-written tuple."""
+        return set(cls._schema_tables()) - set(TABLES_EXEMPT_FROM_ORG_SCOPING)
+
+    def test_org_scoped_table_coverage_is_derived_from_the_schema(self):
+        """
+        w129 GAP-3. ORG_SCOPED_TABLES listed twelve of the schema's twenty-six
+        tables. The twelve it omitted were not exempt and not argued for --
+        they were simply missing, and a missing name is a guard rail that
+        silently declines to look. exception_events, where the cross-tenant
+        write of GAP-1 landed, was one of them.
+
+        So the coverage is derived here from schema.sql, and the tuple is held
+        to the derivation. A new org-owned table fails this test on the day it
+        is created; the only way out is to name it in
+        TABLES_EXEMPT_FROM_ORG_SCOPING with a reason somebody has to write down.
+        """
+        census = set(self._schema_tables())
+        assert census, "parsed no CREATE TABLE from schema.sql -- the census regex is broken, not the schema"
+
+        exempt = set(TABLES_EXEMPT_FROM_ORG_SCOPING)
+        listed = set(ORG_SCOPED_TABLES)
+
+        assert not (listed & exempt), f"table(s) both listed as org-scoped and exempted: {sorted(listed & exempt)}"
+        assert not (exempt - census), f"exemption(s) for table(s) that are not in schema.sql: {sorted(exempt - census)}"
+
+        missing = census - exempt - listed
+        assert not missing, (
+            f"org-owned table(s) in schema.sql that ORG_SCOPED_TABLES does not cover: {sorted(missing)}. "
+            "Add the name and bind org_id in every statement against it, or exempt it in "
+            "TABLES_EXEMPT_FROM_ORG_SCOPING with a written reason."
+        )
+        stale = listed - census
+        assert not stale, f"ORG_SCOPED_TABLES names table(s) that schema.sql does not create: {sorted(stale)}"
+
+    def test_only_a_table_without_an_org_id_column_may_be_exempt(self):
+        """
+        The interlock that stops the exemption list becoming the new hiding
+        place. Exemption is available only where the column genuinely does not
+        exist -- so a table cannot be exempted out of the org_id rule once it
+        has an org_id, and conversely every name on ORG_SCOPED_TABLES must
+        actually have the column it is being held to.
+        """
+        tables = self._schema_tables()
+
+        def has_org_id(body: str) -> bool:
+            return re.search(r"^\s*org_id\b", body, re.M) is not None
+
+        wrongly_exempt = [name for name in TABLES_EXEMPT_FROM_ORG_SCOPING if has_org_id(tables.get(name, ""))]
+        assert not wrongly_exempt, (
+            f"table(s) exempted from org scoping that DO have an org_id column: {wrongly_exempt}. "
+            "The exemption exists for tables where the column is absent, not for tables where "
+            "binding it was inconvenient."
+        )
+
+        no_column = [name for name in ORG_SCOPED_TABLES if not has_org_id(tables.get(name, ""))]
+        assert not no_column, (
+            f"table(s) declared org-scoped with no org_id column in schema.sql: {no_column}. "
+            "The statements against them cannot bind what the table does not have."
+        )
+
+    @staticmethod
     def _sql_literals() -> list[str]:
         source = (pathlib.Path(__file__).resolve().parent.parent / "data_access.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -592,13 +669,25 @@ class TestStructuralIsolation:
         return out
 
     def test_every_org_scoped_statement_binds_org_id(self):
+        """
+        Driven off the SCHEMA-DERIVED set, deliberately, and not off
+        ORG_SCOPED_TABLES.
+
+        If this read the tuple, then deleting a name from the tuple would
+        delete the check -- which is precisely the shape of the GAP-3 defect:
+        the guard was silent about exception_events because nobody had typed
+        its name. Deriving the set here means the only way to stop this test
+        looking at a table is to remove the table from the schema or to write
+        an exemption for it, and the exemption is itself checked above.
+        """
+        scoped = self._org_owned_tables()
         offenders = []
         for sql in self._sql_literals():
-            touches_scoped = any(
-                f"{verb} {table}" in sql for table in ORG_SCOPED_TABLES for verb in ("FROM", "INTO", "UPDATE", "JOIN")
+            touched = sorted(
+                {table for table in scoped for verb in ("FROM", "INTO", "UPDATE", "JOIN") if f"{verb} {table}" in sql}
             )
-            if touches_scoped and "org_id" not in sql:
-                offenders.append(sql)
+            if touched and "org_id" not in sql:
+                offenders.append(f"{','.join(touched)}: {sql}")
         assert not offenders, "statement(s) against an org-scoped table without an org_id predicate:\n  " + "\n  ".join(
             offenders
         )

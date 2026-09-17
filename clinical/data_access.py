@@ -392,23 +392,70 @@ def _clean_identity_value(value: Optional[str], field: str, allow_none: bool = F
 
 
 # Tables whose rows belong to exactly one organisation. Every statement this
-# module issues against one of these must bind org_id. The isolation test
-# reads this tuple, so adding a table here without adding the predicate is
-# what makes the test fail.
+# module issues against one of these must bind org_id.
+#
+# w129 — HOW THIS LIST IS NOW MAINTAINED, AND WHY THE OLD ANSWER WAS THE DEFECT.
+# This used to be a hand-written subset: twelve names out of the schema's
+# twenty-six tables. The other twelve org-owned tables were simply absent, and
+# absence is invisible — so the guard rail in test_identity.py had no opinion
+# about them at all. That is how GAP-1 shipped green: exception_events, the
+# table at the centre of a cross-tenant write, was never on the list, so the
+# test that exists to catch exactly that never looked at it.
+#
+# The fix is NOT to add the missing twelve names; that reproduces the defect
+# for table twenty-seven. The coverage is now DERIVED from schema.sql by
+# clinical/tests/test_identity.py: every CREATE TABLE in the schema is
+# org-owned unless it appears in TABLES_EXEMPT_FROM_ORG_SCOPING below with a
+# written reason. This tuple is checked against that derivation, so a new
+# table is covered the day it is created and the only way to leave one out is
+# to argue for it in writing.
 ORG_SCOPED_TABLES = (
+    "organisations",
     "users",
     "role_assignments",
     "sessions",
     "totp_backup_codes",
+    "audit_log",
     "patients",
+    "external_identifiers",
     "consents",
+    "tests",
     "orders",
     "samples",
+    "fastq_sets",
     "sequencing_runs",
     "vcfs",
     "interpretations",
     "reports",
+    "reviewer_claims",
+    "release_events",
+    "amendments",
+    "amendment_notifications",
+    "notification_read_receipts",
+    "retention_policies",
+    "exceptions",
+    "exception_events",
 )
+
+
+# Tables in schema.sql that are deliberately NOT held to the org_id rule, each
+# with the reason. An exemption you can read is a decision; an omission you
+# cannot see is a hole — and the hole is what GAP-1 rode in on.
+#
+# A name may only appear here if the table genuinely has no org_id column;
+# test_identity.py enforces that, so a table cannot be exempted out of trouble
+# once it has the column.
+TABLES_EXEMPT_FROM_ORG_SCOPING = {
+    "test_genes": (
+        "No org_id column exists on this table, so no statement against it could "
+        "bind one. Its single reference, test_genes.test_id -> tests (test_id), is "
+        "the non-composite foreign key recorded as GAP-4 by the w129 Phase A audit; "
+        "tests carries no UNIQUE (org_id, test_id) that would let it be composite. "
+        "data_access.py issues zero statements against this table — counted, not "
+        "assumed. This exemption records a known structural asymmetry; it does not "
+        "claim the table is not org-owned."
+    ),
+}
 
 
 # ─── Audit decorator ────────────────────────────────────────────────────────

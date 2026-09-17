@@ -666,7 +666,18 @@ def main(argv=None) -> int:
         print(f"clinical.migrate: {exc}", file=sys.stderr)
         return 2
 
-    if args.verify and not state.ok:
+    # EXIT NON-ZERO WHENEVER THE DATABASE IS NOT AT THE VERSION THIS CODE
+    # EXPECTS -- not only under --verify. A deploy step that runs `--migrate`
+    # and exits 0 on a database whose history claims a version the catalog
+    # does not have is the falsely-ready report this mechanism exists to end,
+    # moved from /readyz into the pipeline. "Nothing was pending" is not
+    # "everything is right": a drifted or checksum-mismatched database has
+    # nothing pending and is still wrong.
+    #
+    # --status is the exception and stays 0 always: it is a QUERY. An operator
+    # asking what a database is at has not failed by getting an answer, and a
+    # non-zero status would make `--status` unusable in a shell pipeline.
+    if not args.status and not state.ok:
         return 3
     return 0
 

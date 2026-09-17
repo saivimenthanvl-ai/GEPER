@@ -612,6 +612,83 @@ class TestFailureIsObservableAndNeverRecordedAsSuccess:
             assert state.current_version is None
 
 
+class TestTheCommandLineExitCodeIsAVerdict:
+    """
+    The CLI is what a deploy pipeline runs, so its EXIT CODE is the verdict
+    anything automated will act on. A pipeline reads the number, never the
+    text, and a step that exits 0 on a database this code cannot serve is the
+    falsely-ready report moved out of /readyz and into the deploy.
+
+    `main()` is called directly rather than through a subprocess: it is the
+    entry point `python -m clinical.migrate` runs, and a subprocess would add
+    an interpreter start to every row for no extra coverage.
+    """
+
+    def test_migrate_exits_non_zero_when_the_database_is_still_not_right(self, monkeypatch, capsys):
+        """
+        CATCHES: an exit code that reports only "did I raise". Here there is
+        nothing pending -- `--migrate` has no work to do and does not fail --
+        and the database is nonetheless wrong: the history claims migration 2
+        and `exception_events` is gone. "Nothing was pending" is not
+        "everything is right".
+
+        The stdout is asserted too, not just the code: the operator must be
+        told WHICH way it is wrong.
+        """
+        with scratch_database() as dsn, connect(dsn) as connection:
+            _fresh_from_schema_sql(connection)
+            _apply_sql(connection, "DROP TABLE exception_events CASCADE")
+
+            monkeypatch.setenv("CLINICAL_BOOTSTRAP_DSN", dsn)
+            code = migrate.main(["--migrate"])
+            out = capsys.readouterr().out
+
+        assert code == 3
+        assert "schema_drift" in out
+        assert "exception_events" in out
+
+    def test_the_positive_twin_a_correct_database_exits_zero(self, monkeypatch, capsys):
+        """Without this the row above passes against a CLI that always exits
+        3, which would make every deploy fail and teach everyone to ignore the
+        code."""
+        with scratch_database() as dsn, connect(dsn) as connection:
+            _fresh_from_schema_sql(connection)
+
+            monkeypatch.setenv("CLINICAL_BOOTSTRAP_DSN", dsn)
+            code = migrate.main(["--migrate"])
+            out = capsys.readouterr().out
+
+        assert code == 0
+        assert "verdict       : OK" in out
+        assert "(nothing pending)" in out
+
+    def test_status_is_a_query_and_exits_zero_even_on_a_bad_database(self, monkeypatch, capsys):
+        """
+        The deliberate exception, asserted so it is a decision rather than an
+        oversight: an operator asking what a database is at has not failed by
+        getting an answer, and a non-zero `--status` is unusable in a shell.
+        The VERDICT still has to be in the output.
+        """
+        with scratch_database() as dsn:
+            monkeypatch.setenv("CLINICAL_BOOTSTRAP_DSN", dsn)
+            code = migrate.main(["--status"])
+            out = capsys.readouterr().out
+
+        assert code == 0
+        assert "schema_not_initialised" in out
+
+    def test_a_missing_administrative_dsn_is_refused_and_named(self, monkeypatch, capsys):
+        """CATCHES: a CLI that falls back to CLINICAL_DSN, which is the
+        application role -- the one the entire GRANT/REVOKE block exists to
+        deny these privileges to."""
+        monkeypatch.delenv("CLINICAL_BOOTSTRAP_DSN", raising=False)
+        code = migrate.main(["--status"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "CLINICAL_BOOTSTRAP_DSN" in err
+        assert "not CLINICAL_DSN" in err
+
+
 def test_the_migration_tests_never_call_the_drop_and_recreate_fixture():
     """
     STRUCTURAL, and it is about this file rather than about the mechanism.

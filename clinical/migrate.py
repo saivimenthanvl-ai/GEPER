@@ -234,7 +234,20 @@ def discover(directory: Optional[pathlib.Path] = None) -> Tuple[Migration, ...]:
             )
         seen[version] = path
         raw = path.read_bytes()
-        text = raw.decode("utf-8")
+        # read_text, NOT raw.decode(): text mode applies universal-newline
+        # translation, so a CRLF checkout sends LF -- which is exactly what
+        # `clinical/bootstrap.py::apply_schema` and every test fixture have
+        # always done with schema.sql. It matters far more than it looks, and
+        # it was MEASURED by the equivalence proof rather than reasoned:
+        # Postgres stores a PL/pgSQL function's SOURCE TEXT verbatim, so the
+        # same CREATE FUNCTION sent with CRLF and with LF yields two
+        # `pg_get_functiondef` outputs that differ on every line. A database
+        # built from schema.sql and one built from these migrations would then
+        # hold literally different `enforce_content_immutability` functions --
+        # on Windows only, invisibly, with every other test still green.
+        # `checksum_of` hashes the RAW bytes and normalises separately, so
+        # identity and content never disagree.
+        text = path.read_text(encoding="utf-8")
         found.append(
             Migration(
                 version=version,

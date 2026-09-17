@@ -3737,11 +3737,33 @@ class DataAccess:
 
         ⚠️ AUTHENTICATION BYPASS BY DESIGN
         ──────────────────────────────────
-        This method creates a session WITHOUT authentication. It is called only from
-        the automatic submission path and MUST NOT be callable from any request-handling
-        context or endpoint. If called from anywhere else, it is an authentication bypass.
+        This method creates a session WITHOUT authentication, and the session_id it
+        mints is a real row in `sessions` and therefore a valid bearer credential for
+        clinical/endpoints.py::_get_session. It MUST NOT be called from any
+        request-handling context or endpoint. If it is, that is an authentication
+        bypass.
 
-        An AST test enforces that this method is called from exactly one location.
+        THE CALL SITES, AND WHY THIS PARAGRAPH USED TO BE FALSE (w129 GAP-5).
+        It used to say "an AST test enforces that this method is called from exactly
+        one location". Both halves were wrong. The test read only data_access.py and
+        matched only `self._create_system_session(`, of which there are none, so it
+        asserted 0 <= 1 and had never examined a call site. And the real number is not
+        one: there are FOUR, all spelled `self.data_access._create_system_session`,
+        all outside this file --
+
+            geper/api/exception_retry_worker.py  ExceptionRetryWorker._process_all_orgs
+            geper/api/submission_worker.py       InterpretationWorker._create_submission_failure_exception
+            geper/api/submission_worker.py       InterpretationWorker._clinical_preflight
+            geper/api/submission_worker.py       InterpretationWorker.reconcile_interrupted_submissions
+
+        THE RULE IS ABOUT WHERE, NOT HOW MANY. Every call site must sit inside a
+        background worker class in geper/api/ that runs as its own process, has no
+        human actor, and is not reachable from any served route -- counted: neither
+        worker class is referenced by geper/api/main.py, clinical/app.py or
+        clinical/endpoints.py, and each is instantiated only by its own module's
+        main(). The four sites are pinned BY NAME in
+        clinical/tests/test_identity.py::TestStructuralIsolation, so a fifth fails
+        the suite and so does narrowing the scan back to this file.
         """
         now = self._clock.now()
         system_email = f"system+{org_id}@platform"

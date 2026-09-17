@@ -68,6 +68,7 @@ from typing import Dict
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from clinical import migrate
 from clinical.auth_endpoints import router as auth_router
 from clinical.endpoints import router, session_router
 from clinical.portal_endpoints import router as portal_router
@@ -158,7 +159,32 @@ async def readyz() -> JSONResponse:
       1. `CLINICAL_DSN` is configured at all;
       2. a connection can be opened and `SELECT 1` answered;
       3. the schema is present -- otherwise Postgres is up and this is not the
-         clinical database.
+         clinical database;
+      4. the schema is at the VERSION this code was written for (w126m).
+
+    WHY STEP 4 EXISTS, AND IT IS THE WHOLE OF THIS WAVE'S PRODUCTION CHANGE.
+    `_SENTINEL_TABLE` is `sessions`, and `sessions` exists in every variant of
+    this schema there has ever been -- it is a baseline table no held change
+    touches. So steps 1-3 answered 200 for EVERY wrong pairing of code and
+    database: a service whose code names a column its database does not have
+    reported healthy to Docker's HEALTHCHECK and to any orchestrator, and then
+    failed the reads that column is in. Step 3 detects ABSENCE; it has never
+    been able to detect a VERSION, and the two are different questions.
+
+    Step 4 asks `clinical/migrate.py` instead, which answers from the
+    migration history AND from `pg_catalog` -- so a database that is behind,
+    that has never been migrated, whose migration files have been edited since
+    they ran, or whose history claims an object the catalog does not have, is
+    all reported NOT ready, each by its own name.
+
+    IT DETECTS, IT DOES NOT FIX. Migrating needs privileges the entire
+    GRANT/REVOKE block exists to deny `clinical_app`, and `clinical_app` is
+    what this connection is. `python -m clinical.migrate` is the other half
+    and it is run by an operator with the administrative DSN.
+
+    THE 200 BODY IS UNCHANGED, deliberately: this is a probe other things
+    parse, and a new field in the ready response is endpoint behaviour that
+    nothing asked to change. Everything new here is a 503.
     """
     dsn = os.environ.get(_DSN_ENV)
     if not dsn:
@@ -166,6 +192,7 @@ async def readyz() -> JSONResponse:
 
     import psycopg
 
+    state = None
     try:
         with psycopg.connect(dsn, connect_timeout=_PROBE_CONNECT_TIMEOUT_SECONDS) as connection:
             with connection.cursor() as cursor:
@@ -173,6 +200,16 @@ async def readyz() -> JSONResponse:
                 cursor.fetchone()
                 cursor.execute("SELECT to_regclass(%s)", (_SENTINEL_TABLE,))
                 row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                # Its own try: a failure HERE is not the database being
+                # unreachable, and labelling it that way would send an
+                # operator to look at the network. Either way it is 503 --
+                # a probe that cannot establish the version must not report
+                # ready, which is the same fail-closed rule as the rest.
+                try:
+                    state = migrate.inspect_state(connection)
+                except Exception as exc:  # noqa: BLE001
+                    return _not_ready("schema_state_unreadable", type(exc).__name__)
     except Exception as exc:  # noqa: BLE001 -- a probe reports every failure as not-ready
         # The exception TYPE, never its text: a DSN can carry a password and a
         # libpq error message quotes the connection string back.
@@ -183,6 +220,12 @@ async def readyz() -> JSONResponse:
             "schema_missing",
             f"connected, but table {_SENTINEL_TABLE!r} does not exist; run clinical.bootstrap.",
         )
+
+    # w126m. `state.reason` and `state.detail` name migration versions and
+    # object names out of this repository's own files -- never a DSN, never a
+    # row, never a credential.
+    if state is not None and not state.ok:
+        return _not_ready(state.reason, state.detail)
 
     return JSONResponse(status_code=200, content={"status": "ready", "database": "ok", "schema": "ok"})
 

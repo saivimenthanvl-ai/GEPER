@@ -130,7 +130,7 @@ def _hpo_terms_to_cli_arg(hpo_terms) -> str:
     hpo_terms as an OBJECT -- `"hpo_terms": { ... }`
     (GEPER_CLINICAL_PLATFORM_SPEC.md:526, in the POST /interpretations
     contract block) -- and the implemented request model
-    (geper/api/main.py:290) agrees: Optional[Dict[str, Any]]. The one
+    (geper/api/main.py:310) agrees: Optional[Dict[str, Any]]. The one
     concrete shape attested anywhere in this repo
     (geper/api/tests/test_interpretations_api.py:197,
     geper/api/tests/test_submission_worker.py) is {"terms": [...]}.

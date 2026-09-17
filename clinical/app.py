@@ -35,6 +35,21 @@ container. `/readyz` says "this service can do its job" -- if it fails, stop
 sending it traffic, because restarting will not fix a database that is down.
 Collapsing them means a database outage restart-loops every replica.
 
+THE INTERACTIVE DOCUMENTATION IS OFF UNLESS SOMEBODY TURNS IT ON (w132).
+FastAPI mounts `/openapi.json`, `/docs`, `/docs/oauth2-redirect` and `/redoc`
+by default, and nobody in this repository ever declared them -- so nobody
+decided they were public. They were, and they are the largest anonymous
+disclosure on the service: `/openapi.json` alone hands out every path, every
+method, every response model field by field (`PortalPatientResponse` ->
+patient_id, name, dob, sex), every declared status code and every handler
+docstring, to a caller holding no credential.
+
+THE DOCSTRINGS AND RESPONSE MODELS STAY IN THE CODE. What goes is the
+anonymous SURFACE, not the documentation: `openapi_url=None` unmounts the
+route, it does not delete a schema. Set `CLINICAL_ENABLE_DOCS=1` and all four
+come back, unchanged, which is why this is a gate and not a deletion -- a
+deletion invites the next developer to re-add them without the gate.
+
 NO API-KEY LAYER, DELIBERATELY. `geper/api/main.py`'s `_require_api_key` is
 the repository's ingress pattern and it is FAIL-OPEN by design: with
 `GEPER_API_KEYS` unset it allows every request ("dev mode"). That is a
@@ -69,10 +84,22 @@ _PROBE_CONNECT_TIMEOUT_SECONDS = 3
 # holding no schema at all.
 _SENTINEL_TABLE = "sessions"
 
+# w132 fix A. Read at import, once, so the served surface cannot change under
+# a running process. "1", "true" and "yes" are accepted; anything else, and
+# the absence of the variable, leaves all four documentation routes unmounted.
+_DOCS_ENV = "CLINICAL_ENABLE_DOCS"
+_DOCS_ENABLED = os.environ.get(_DOCS_ENV, "").strip().lower() in {"1", "true", "yes"}
+
 app = FastAPI(
     title="GEPER Clinical API",
     version="1.0.0",
     description="Clinical ordering, consent and exception handling.",
+    # None UNMOUNTS the route. The schema is still built on demand by
+    # `app.openapi()`, so the response models and docstrings below are intact
+    # and a developer with the flag set sees exactly what they saw before.
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
 )
 
 app.include_router(router)

@@ -22,6 +22,7 @@ own database per test and drop it afterwards -- see
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 
 import pytest
@@ -442,6 +443,102 @@ class TestFailureIsObservableAndNeverRecordedAsSuccess:
             migrate.migrate(connection, migrations)
             assert [row[0] for row in _history(connection)] == [1, 2]
             assert _catalog_has_table(connection, "w126m_half")
+
+    def test_a_migration_whose_first_object_already_exists_is_not_recorded_as_applied(self, tmp_path):
+        """
+        WRONG B -- "make it idempotent: CREATE TABLE IF NOT EXISTS everywhere",
+        or its runner-side twin, a runner that swallows duplicate-object errors
+        and calls the step done. Its own author says why it is wrong, three
+        lines below the pattern in this repository's one real in-place upgrade
+        (geper/api/submission_store.py): "CREATE TABLE IF NOT EXISTS does not
+        add a column to a store file created before it existed."
+
+        THE CONSTRUCTION: migration 2 creates TWO tables. The first already
+        exists, so the statement raises 42P07 -- and the SECOND table, which is
+        what the migration was actually for, never gets created. A runner that
+        treats "already there" as "done" records version 2 and the second table
+        is missing for ever, silently.
+
+        BOTH CHANNELS, and the catalog one is the load-bearing half:
+          * the history must NOT contain version 2;
+          * `w126m_b_wanted` must NOT be in the catalog;
+          * and the verdict must not be ok -- under the wrong runner the
+            history says applied and the MIGRATION-ASSERT below says otherwise,
+            so this is WRONG I's shape arriving through WRONG B's door.
+        """
+        history_sql = (migrate.MIGRATIONS_DIR / "0001_schema_migrations.sql").read_text(encoding="utf-8")
+        directory = _write_migrations(
+            tmp_path / "m",
+            {
+                "0001_history.sql": history_sql,
+                "0002_two_tables.sql": (
+                    "-- MIGRATION-ASSERT: to_regclass('w126m_b_wanted') IS NOT NULL\n"
+                    "CREATE TABLE w126m_b_existing (a INT);\n"
+                    "CREATE TABLE w126m_b_wanted (a INT);\n"
+                ),
+            },
+        )
+        migrations = migrate.discover(directory)
+        with scratch_database() as dsn, connect(dsn) as connection:
+            # the table is already there -- the state every real "re-run it,
+            # it's idempotent" attempt meets
+            _apply_sql(connection, "CREATE TABLE w126m_b_existing (a INT)")
+
+            with pytest.raises(Exception):  # noqa: B017 -- psycopg raises DuplicateTable
+                migrate.migrate(connection, migrations)
+            connection.rollback()
+
+            assert [row[0] for row in _history(connection)] == [1]
+            assert not _catalog_has_table(connection, "w126m_b_wanted")
+            assert migrate.inspect_state(connection, migrations).ok is False
+
+    def test_the_history_row_and_the_ddl_are_one_transaction(self, tmp_path):
+        """
+        WRONG E, AND IT NEEDS ITS OWN ROW because the obvious failing-migration
+        test does not catch it. When the migration's own SQL fails, a runner
+        that commits the DDL and THEN records still loses the DDL -- psycopg
+        sends the whole file as one statement, so the failure rolls it back
+        either way, and the two implementations are indistinguishable.
+
+        WHAT DISTINGUISHES THEM is a migration whose DDL SUCCEEDS and whose
+        HISTORY ROW CANNOT BE WRITTEN. `version` is the PRIMARY KEY, so
+        re-applying an already-recorded version is exactly that case:
+          * one transaction  -> the duplicate key takes the statement down with
+            it, and the row this migration would have inserted is NOT there;
+          * two transactions -> the statement is already committed when the
+            duplicate key arrives, and the row IS there, for ever, with nothing
+            in the history to say it happened.
+
+        `_apply` is called directly because `_apply` IS the transaction
+        boundary -- it is the unit under test, not an implementation detail
+        being poked at. The assertion is on the CONTENT of the table, never on
+        a count: a count of one is satisfied by either outcome if the first row
+        went missing.
+        """
+        history_sql = (migrate.MIGRATIONS_DIR / "0001_schema_migrations.sql").read_text(encoding="utf-8")
+        directory = _write_migrations(
+            tmp_path / "m",
+            {
+                "0001_history.sql": history_sql,
+                "0002_seed.sql": ("CREATE TABLE w126m_e (note TEXT);\nINSERT INTO w126m_e (note) VALUES ('first');\n"),
+            },
+        )
+        migrations = migrate.discover(directory)
+        with scratch_database() as dsn, connect(dsn) as connection:
+            migrate.migrate(connection, migrations)
+            with connection.cursor() as cur:
+                cur.execute("SELECT note FROM w126m_e ORDER BY note")
+                assert [r[0] for r in cur.fetchall()] == ["first"]
+
+            replay = dataclasses.replace(migrations[1], sql="INSERT INTO w126m_e (note) VALUES ('second');")
+            with pytest.raises(Exception):  # noqa: B017 -- UniqueViolation on version
+                migrate._apply(connection, replay)
+            connection.rollback()
+
+            with connection.cursor() as cur:
+                cur.execute("SELECT note FROM w126m_e ORDER BY note")
+                assert [r[0] for r in cur.fetchall()] == ["first"]
+            assert [row[0] for row in _history(connection)] == [1, 2]
 
     def test_a_history_that_says_applied_while_the_catalog_disagrees_is_not_ok(self, tmp_path):
         """

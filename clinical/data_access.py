@@ -2177,11 +2177,16 @@ class DataAccess:
         create_sequencing_run -- the automatic path does not come through
         here (`self.create_vcf(` occurs zero times in this file).
 
-        record_fastq_set and find_fastq_set_by_checksums are NOT gated, and
-        the reason is structural rather than a judgement: they take a raw
-        org_id and no session, so there is no session whose roles could be
-        consulted. That is reported as a gap in the model, not routed around
-        by minting a session for them.
+        w129 reported here that record_fastq_set and find_fastq_set_by_checksums
+        were NOT gated because "they take a raw org_id and no session, so there
+        is no session whose roles could be consulted". THAT IS NO LONGER TRUE
+        and the gap it reported is closed: w129c gave both a caller-supplied
+        `Session`, and `record_fastq_set` now requires the `System` role. It is
+        gated on the INTERNAL principal rather than on Lab technician, because
+        detection is the platform observing a directory and not a member of
+        laboratory staff. The read keeps its existing authorisation posture --
+        no role gate, still non-auditable -- and only stopped naming its own
+        organisation.
         """
         self._require_role(session, "Lab technician")
 
@@ -6104,10 +6109,10 @@ class DataAccess:
         auditable=False,
         action="find_fastq_set_by_checksums",
         resource_type="fastq_set",
-        requires_session=False,
+        requires_session=True,
         reason="idempotency probe on every scan; auditing it would bury the detections in noise",
     )
-    def find_fastq_set_by_checksums(self, org_id: uuid.UUID, r1_checksum: str, r2_checksum: str) -> Optional[uuid.UUID]:
+    def find_fastq_set_by_checksums(self, session: Session, r1_checksum: str, r2_checksum: str) -> Optional[uuid.UUID]:
         """
         The existing row for this exact pair of file contents, if any.
 
@@ -6116,22 +6121,31 @@ class DataAccess:
         observation; a reused path with new content is a DIFFERENT one. This is
         why `fastq_sets` deliberately carries no `UNIQUE (org_id, r1_path)`: a
         path-based constraint would have been wrong in both directions.
-        Scoped to org_id like every other read here.
+
+        w129c: THE ORGANISATION IS READ OFF THE SESSION, NOT OFF AN ARGUMENT.
+        This used to take a raw `org_id`, which made the tenant scope a CLAIM
+        the caller asserted rather than a property of an authenticated
+        principal -- and a checksum probe that can name any organisation is an
+        existence oracle over another tenant's file contents. The ruling left
+        the READ PATH's AUTHORISATION alone and it is left alone: no role gate,
+        still `auditable=False` for the reason above. Only the source of the
+        org_id changed, which is what `Session`'s own docstring already
+        requires of every call that takes one.
         """
         row = self._query_one(
             "SELECT fastq_set_id FROM fastq_sets WHERE org_id = %s AND r1_checksum = %s AND r2_checksum = %s",
-            (org_id, r1_checksum, r2_checksum),
+            (session.org_id, r1_checksum, r2_checksum),
         )
         return None if row is None else row[0]
 
     @auditable(
         action="fastq_set_detected",
         resource_type="fastq_set",
-        requires_session=False,
+        requires_session=True,
     )
     def record_fastq_set(
         self,
-        org_id: uuid.UUID,
+        session: Session,
         sample_id: uuid.UUID,
         r1_path: str,
         r2_path: str,
@@ -6150,18 +6164,46 @@ class DataAccess:
         caller which sample ids exist elsewhere. So the resolution below
         filters on org_id and the caller cannot tell the two cases apart.
 
-        No `session` argument: a scheduled scan has no logged-in user. The
-        audit row is written by `@auditable(requires_session=False)`, which
-        takes `org_id` from the bound parameters and leaves the actor null --
-        the existing provisioning-method path, not a second one. An earlier
-        draft called `self._audit` by hand as well and would have written TWO
-        rows per detection; `test_every_public_method_has_auditable_decorator`
-        is what caught the missing decorator, and the duplicate was the thing
-        that fix removed.
+        w129c: IT TAKES A SESSION AND THE SESSION MUST HOLD `System`.
+
+        This paragraph used to read "No `session` argument: a scheduled scan
+        has no logged-in user", and reached for the PROVISIONING audit path
+        (org_id off the bound parameters, actor null). That was DRIFT, not
+        architecture. "No logged-in user" is precisely the condition the System
+        principal exists to answer -- `record_pipeline_result` in this same
+        file already has the shape: it takes a `Session` and the worker mints
+        it. Two precedents were available and the provisioning one was picked
+        in passing, never argued. Three things were wrong as a result: the
+        organisation was a caller-supplied CLAIM rather than a property of an
+        authenticated principal; every detection was audited with a NULL
+        ACTOR; and this was the only `requires_session=False` method in the
+        file that writes a tenant-scoped row -- a category of one.
+
+        THE ROLE GATE IS `System`, NOT `Lab technician`. Detection is the
+        platform observing a directory, not a member of laboratory staff
+        receiving a specimen, and w129 forbids treating an internal principal
+        as a normal human staff role. A human session holding Administrator,
+        Interpreter, Orderer AND Lab technician is refused here.
+
+        THE SESSION COMES FROM THE CALLER. Neither this method nor
+        `clinical/ingestion.py` mints one. `_create_system_session` is an
+        authentication bypass whose invariant is about WHERE, not how many:
+        every call site sits in a background worker class in `geper/api/`.
+        Minting one in the scanner would be a FIFTH site in a non-worker module
+        and test_identity.py's
+        `test_create_system_session_call_sites_are_the_four_pinned_worker_sites`
+        would fail -- correctly. The not-yet-written scheduler is the thing
+        that has to be explicit about which principal it runs as.
+
+        The audit row still comes from `@auditable` and only from it: an
+        earlier draft called `self._audit` by hand as well and would have
+        written TWO rows per detection.
         """
+        self._require_role(session, "System")
+
         sample = self._query_one(
             "SELECT sample_id FROM samples WHERE sample_id = %s AND org_id = %s",
-            (sample_id, org_id),
+            (sample_id, session.org_id),
         )
         if sample is None:
             raise NotFoundError(f"Sample {sample_id} not found")
@@ -6171,7 +6213,7 @@ class DataAccess:
             "INSERT INTO fastq_sets (fastq_set_id, org_id, sample_id, r1_path, r2_path, "
             "r1_checksum, r2_checksum, detected_at, state) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'detected')",
-            (fastq_set_id, org_id, sample_id, r1_path, r2_path, r1_checksum, r2_checksum, detected_at),
+            (fastq_set_id, session.org_id, sample_id, r1_path, r2_path, r1_checksum, r2_checksum, detected_at),
         )
         return fastq_set_id
 

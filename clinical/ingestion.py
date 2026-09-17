@@ -23,6 +23,14 @@ a query of its own. That is deliberate -- a second module writing its own
 INSERTs would be a parallel mechanism, which is the divergence that costs more
 than the duplication saves.
 
+IT DOES NOT OWN ITS PRINCIPAL EITHER (w129c). `scan_org` takes the CALLER'S
+`Session` and reads the organisation off it; it does not accept an `org_id`
+and it does not mint a session. `_create_system_session` is an authentication
+bypass confined by name to background worker classes in `geper/api/`, and this
+module is not one -- so the scheduler that eventually drives a sweep is the
+thing that has to be explicit about which principal it runs as. That is the
+decision being pushed up rather than guessed at here.
+
 THE FILENAME CONTRACT IS RULED, NOT CHOSEN, AND IT IS NARROW ON PURPOSE:
 
     {sample_id}_{tag}_R1_001.fastq.gz
@@ -63,7 +71,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from clinical.data_access import Clock, NotFoundError, SystemClock
+from clinical.data_access import Clock, NotFoundError, Session, SystemClock
 
 # Anchored at both ends: a partial match is not a match. The read marker is
 # captured rather than assumed so R1 and R2 are told apart by the filename
@@ -129,7 +137,34 @@ class FastqScanner:
 
     # ── the scan ─────────────────────────────────────────────────────────────
 
-    def scan_org(self, org_id: uuid.UUID) -> ScanResult:
+    def scan_org(self, session: Session) -> ScanResult:
+        """
+        Scan the organisation THE SESSION BELONGS TO.
+
+        w129c: THE SESSION COMES FROM THE CALLER AND IS NOT MINTED HERE. This
+        used to take a raw `org_id` and pass it straight to `DataAccess`, which
+        made the tenant scope a claim the caller asserted. It now takes the
+        principal, and the organisation -- which directory is read, which
+        sample resolves, which organisation's row is written and who the audit
+        row names -- follows from that one object.
+
+        IT DOES NOT MINT THE SESSION, DELIBERATELY. `_create_system_session` is
+        an authentication bypass; its invariant is that every call site sits
+        inside a background worker class in `geper/api/` with no human actor
+        and no route reaching it. This module is not one, so a scanner-minted
+        session would be a fifth call site in a non-worker module and
+        test_identity.py's call-site guard would fail. The scheduler that will
+        eventually drive this is the thing that must say which principal it
+        runs as -- which is the point of pushing the decision up here.
+
+        `record_fastq_set` requires the `System` role, so an
+        `AuthorizationError` from a session that does not hold it propagates
+        out of this method rather than being folded into a `rejected` outcome.
+        A refusal that looked like "that file was no good" would be a silent
+        authorisation failure, and the outcomes here are for file-level
+        verdicts.
+        """
+        org_id = session.org_id
         result = ScanResult(org_id=org_id)
         incoming = self._root / str(org_id) / "incoming"
         if not incoming.is_dir():
@@ -147,14 +182,14 @@ class FastqScanner:
                 present = r1 or r2
                 result.rejected.append(ScanOutcome(reason="incomplete_pair", detail=present.name, sample_id=sample_str))
                 continue
-            self._consider(result, org_id, sample_str, r1, r2)
+            self._consider(result, session, sample_str, r1, r2)
 
         # Only the files seen THIS scan are remembered, so a set that
         # disappears and returns starts its stability clock again.
         self._last_sizes = {p: p.stat().st_size for p in self._existing(mates)}
         return result
 
-    def _consider(self, result: ScanResult, org_id: uuid.UUID, sample_str: str, r1: Path, r2: Path) -> None:
+    def _consider(self, result: ScanResult, session: Session, sample_str: str, r1: Path, r2: Path) -> None:
         if not self._sizes_held(r1, r2):
             result.deferred.append(ScanOutcome(reason="awaiting_size_stability", detail=r1.name, sample_id=sample_str))
             return
@@ -167,7 +202,7 @@ class FastqScanner:
         r1_checksum = self._checksum(r1)
         r2_checksum = self._checksum(r2)
 
-        existing = self._dao.find_fastq_set_by_checksums(org_id, r1_checksum, r2_checksum)
+        existing = self._dao.find_fastq_set_by_checksums(session, r1_checksum, r2_checksum)
         if existing is not None:
             # The same two file contents, already recorded. Not an error and
             # not a re-ingest: the table is append-only, so there is nothing to
@@ -187,7 +222,7 @@ class FastqScanner:
 
         try:
             fastq_set_id = self._dao.record_fastq_set(
-                org_id=org_id,
+                session,
                 sample_id=sample_id,
                 r1_path=str(r1),
                 r2_path=str(r2),

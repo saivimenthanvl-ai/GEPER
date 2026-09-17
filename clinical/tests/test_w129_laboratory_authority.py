@@ -32,10 +32,19 @@ are deliberately untouched: the ruling leaves reads on the existing model.
 submission path and it runs under the System principal
 (`_create_system_session`), which the ruling names as an internal principal
 that must not be treated as a normal human staff role. `record_fastq_set` and
-`find_fastq_set_by_checksums` are also excluded, for a harder reason: they
-take a raw `org_id` and NO session, so there is no session whose roles could
-be consulted. That is reported, not worked around -- inventing a session for
-them would be the parallel mechanism this wave is forbidden to build.
+`find_fastq_set_by_checksums` were also excluded from THIS file, for a harder
+reason: at w129 they took a raw `org_id` and NO session, so there was no
+session whose roles could be consulted. That was reported rather than worked
+around -- inventing a session for them inside this wave would have been the
+parallel mechanism it was forbidden to build.
+
+W129c CLOSED THAT GAP, and it is closed in the other file rather than this
+one. Both now take a caller-supplied `Session`, and the WRITE requires the
+`System` role -- the internal principal, NOT `Lab technician`, for exactly the
+reason this file's second paragraph gives about `record_pipeline_result`. The
+session comes from the caller; the scanner does not mint one. The four cells
+for that operation are in
+`clinical/tests/test_w129c_fastq_session.py`.
 
 THE FOUR CELLS are tested for each operation: right role + right organisation
 allowed; wrong role + right organisation refused; right role + WRONG

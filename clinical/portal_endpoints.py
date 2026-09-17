@@ -22,13 +22,28 @@ a header.
 
 WHAT IS NOT HERE, AND WHY EACH ABSENCE IS DELIBERATE:
 
-  * NO LOGIN ROUTE. There is no HTTP authentication endpoint in this
-    repository for ANYONE — `DataAccess.login` has exactly one non-test caller
-    and it is a command-line tool. Adding the first one for patients only
-    would make the patient surface the reference implementation for staff
-    authentication over HTTP, which is a decision about the whole service and
-    not about patient identity. `patient_login` is reachable from the data
-    layer; wiring it to a route is a separate, deliberate piece of work.
+  * NO LOGIN ROUTE **IN THIS FILE** — and the reason has changed, so it is
+    rewritten rather than left standing (w138, Rule 3: fix the claim).
+
+    WHAT THIS PARAGRAPH USED TO SAY, AND WHY IT IS NOW FALSE: "There is no
+    HTTP authentication endpoint in this repository for ANYONE." That was
+    true at w130 and is FALSE from w132 onwards — `POST /auth/login` and
+    `POST /portal/login` are both served, from `clinical/auth_endpoints.py`.
+    Leaving the old sentence here was the live hazard: this is the file an
+    implementer opens to add a patient route, and its header told them the
+    patient login route they were about to duplicate did not exist.
+
+    THE ORIGINAL REASONING SURVIVED INTACT AND IS WHY THE ROUTE IS NOT HERE.
+    Adding the first HTTP login for patients only would have made the patient
+    surface the reference implementation for staff authentication over HTTP,
+    which is a decision about the whole service. w132 did not do that: it
+    added BOTH routes, in ONE module, over ONE mechanism, so that neither is
+    the other's precedent. `auth_endpoints.py`'s own header records the rest —
+    why a single combined route would be a timing oracle, and why the two
+    handlers must never consult each other's store.
+
+    WHAT REMAINS ABSENT HERE, unchanged: any route in THIS router that
+    authenticates. A patient session arrives already minted.
   * NO REGISTRATION ROUTE. Enrolment is a staff act (decision 4), performed
     through `enrol_patient_login` by an authenticated staff Administrator.
     A public self-registration route would be the first session-free method

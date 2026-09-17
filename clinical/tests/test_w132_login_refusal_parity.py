@@ -197,8 +197,27 @@ _UNKNOWN_UUID = "00000000-0000-0000-0000-000000000000"
 
 def _authenticated_route_probes(client, credential):
     """
-    Every mounted route that requires a principal, exercised with `credential`
-    (a dict of cookies, possibly empty).
+    FIVE of the seven mounted routes that require a principal, exercised with
+    `credential` (a dict of cookies, possibly empty).
+
+    ── CORRECTED IN w138. THIS USED TO SAY "Every mounted route that ───────
+    requires a principal". It was true when written and is FALSE at
+    a931869: `POST /auth/logout` and `POST /portal/logout` were added in the
+    same wave as this file, both require a principal, and NEITHER IS IN ANY
+    REFUSAL-PARITY SET IN THIS REPOSITORY. A logout route is an easy one to
+    omit precisely because its success is a 204 rather than a 200.
+
+    The patient half of that is closed by
+    `test_w138_patient_portal_api.py::TestEveryPortalRefusalIsOnePairOn
+    EveryRoute`, which collects eight credential states across all three
+    authenticated PORTAL routes -- `/portal/logout` included. The STAFF half
+    (`POST /auth/logout`) is still in no set; it is carded in
+    `w138-patient-portal-api-audit.md` as C-16 for the wave that owns the
+    remaining w132 items, because widening this dict changes the staff
+    refusal surface and that is not Wave 4's to change.
+
+    DO NOT re-widen the claim above without adding the two routes.
+    ────────────────────────────────────────────────────────────────────────
 
     `owner` is supplied on the worklist deliberately: whether a missing
     required query parameter yields 422 BEFORE the 401 was an open question
@@ -220,8 +239,31 @@ def _authenticated_route_probes(client, credential):
 
 def _login_probes(client, seeded, throttle):
     """
-    All eight of `login()`'s failure reasons and all six of
+    All eight of `login()`'s failure reasons and FOUR OF SIX of
     `patient_login()`'s, driven through the real routes.
+
+    ── CORRECTED IN w138. THIS DOCSTRING USED TO SAY "all six". ────────────
+    It was false, and it was the kind of false that hides a hole: the dict
+    below posts five bodies to `/portal/login`, of which one
+    ("staff address at /portal/login") is a CROSS-PRINCIPAL row and not one
+    of the six reasons at all. The four reasons actually exercised here are
+    unknown_organisation, organisation_disabled, unknown_patient_login and
+    invalid_password.
+
+    THE TWO THAT WERE MISSING ARE `locked_out` AND `patient_login_disabled`
+    — a credential that EXISTS and is locked, and one that EXISTS and has
+    been revoked. They are exactly the two that separate an UNAUTHORISED
+    patient from a NONEXISTENT one, and the staff half of this same dict
+    carries both of its equivalents ("staff locked out", "staff disabled
+    account"), so the gap was patient-only.
+
+    THEY ARE NOW IN A SET OF SIZE ONE IN
+    `test_w138_patient_portal_api.py::TestTheLoginRefusalIsOneAnswerOver
+    AllSixReasons`, whose case list is DERIVED FROM `patient_login`'s own
+    source rather than typed out — which is the defence this docstring
+    turned out to need. DO NOT re-widen the claim here without moving the
+    probes; the two files are meant to be read together.
+    ────────────────────────────────────────────────────────────────────────
 
     The throttle is cleared between attempts: this function makes more
     requests from one source than the limiter allows, and a 429 here would be

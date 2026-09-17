@@ -19,21 +19,29 @@ that would mean a new combined authentication method inside
 hat. A request to `/portal/login` is a request to authenticate against
 `patient_logins`, full stop.
 
-WHY THIS MODULE AND NOT `portal_endpoints.py`. That file records "NO LOGIN
-ROUTE" as a deliberate absence, with the reason: adding one for patients only
-would make the patient surface the reference implementation for staff
-authentication over HTTP. Both routes live here so that neither is the
-other's precedent and so that anyone editing one reads the other.
+WHY THIS MODULE AND NOT `portal_endpoints.py`. That file records the reason:
+adding one login route for patients only would make the patient surface the
+reference implementation for staff authentication over HTTP. Both routes live
+here so that neither is the other's precedent and so that anyone editing one
+reads the other. (Its paragraph was rewritten in w138 — it used to claim
+there was no HTTP login route for anyone, which these two routes made false.)
 
 NO PREFIX ON THE ROUTER, DELIBERATELY. Each route declares its full path, so
 this file cannot silently acquire a patient route under `/auth/` or a staff
 route under `/portal/`.
 
 WHAT IS NOT HERE:
-  * NO LOGOUT. `terminate_session` ends SOMEONE ELSE'S session and is
-    Administrator-gated; self-logout needs a new data-layer method for each
-    principal, and that is a separate, rulable piece of work. A login route
-    with no logout is incomplete but coherent.
+  * NO LOGOUT **IN THIS FILE**, and the reason has changed (w138, Rule 3).
+    This paragraph used to read "NO LOGOUT ... self-logout needs a new
+    data-layer method for each principal, and that is a separate, rulable
+    piece of work". That work was DONE, in the same wave: `terminate_my_
+    session` and `terminate_my_patient_session` both exist, and
+    `POST /auth/logout` and `POST /portal/logout` are both served — from
+    `endpoints.py` and `portal_endpoints.py` respectively, each next to the
+    dependency that authenticates it. `terminate_session`, which ends SOMEONE
+    ELSE'S session, is still Administrator-gated and still has no route.
+    So: no logout HERE, because a logout belongs with its principal's
+    dependency, not with the login routes.
   * NO `/auth/me`. The login response is a 204 and a cookie. Anything in the
     body that differed between principals would be a classification oracle,
     and there is no UI to need it.

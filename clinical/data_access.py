@@ -1648,7 +1648,31 @@ class DataAccess:
         priority: str = "routine",
         clinical_indication: Optional[str] = None,
     ) -> uuid.UUID:
-        """Create a new order in draft state. Requires valid patient, test, and consent."""
+        """
+        Create a new order in draft state. Requires valid patient, test, and consent.
+
+        Requires the Orderer role (w129 phase B). Ordering a test is the
+        clinical decision the Orderer role names, and until w129 nothing
+        consulted it: `Orderer` occurred exactly once in all non-test Python
+        of clinical/ and geper/, inside the ROLES tuple, so every
+        authenticated session in the organisation could order equally.
+
+        Gated with `_require_role` and the session model -- the same
+        mechanism the nine pre-existing role gates use. No hierarchy is
+        introduced: an Administrator is not implicitly an Orderer, because
+        the ruling gives Administrator organisation/staff administration and
+        a role that silently subsumes the others is the RBAC redesign the
+        same ruling forbids.
+
+        create_patient, record_consent and withdraw_consent are NOT gated
+        here. They are patient-registration and consent operations, they act
+        on `patients` and `consents` rather than `orders`, and no role in the
+        vocabulary names them; inventing one from create_order's proximity
+        would be reading the model off a workflow diagram instead of off the
+        code.
+        """
+        self._require_role(session, "Orderer")
+
         if priority not in ("routine", "urgent"):
             raise ValueError(f"Priority must be 'routine' or 'urgent', not {priority!r}")
 
@@ -1717,7 +1741,16 @@ class DataAccess:
     )
     @transactional
     def place_order(self, session: Session, order_id: uuid.UUID) -> None:
-        """Place an order, transitioning it from draft to placed state."""
+        """
+        Place an order, transitioning it from draft to placed state.
+
+        Requires the Orderer role (w129 phase B). This is the act that
+        commits the laboratory to the work; it belongs to whoever may create
+        the order, and gating creation while leaving placement open would
+        move the hole rather than close it.
+        """
+        self._require_role(session, "Orderer")
+
         order = self._query_one(
             "SELECT order_id, state FROM orders WHERE order_id = %s AND org_id = %s",
             (order_id, session.org_id),
@@ -1745,7 +1778,16 @@ class DataAccess:
     )
     @transactional
     def cancel_order(self, session: Session, order_id: uuid.UUID) -> None:
-        """Cancel an order."""
+        """
+        Cancel an order.
+
+        Requires the Orderer role (w129 phase B). Withdrawal is the third and
+        last of the ordering operations this file defines -- counted by
+        scanning every method definition, not by grepping for a word -- and
+        it moves `orders.state` exactly as the other two do.
+        """
+        self._require_role(session, "Orderer")
+
         order = self._query_one(
             "SELECT order_id, state FROM orders WHERE order_id = %s AND org_id = %s",
             (order_id, session.org_id),
@@ -1779,7 +1821,23 @@ class DataAccess:
         sample_type: str,
         condition_on_receipt: Optional[str] = None,
     ) -> uuid.UUID:
-        """Record receipt of a sample. Transitions order to sample_awaited state if needed."""
+        """
+        Record receipt of a sample. Transitions order to sample_awaited state if needed.
+
+        Requires the Lab technician role (w129 phase B). Receiving a specimen
+        is bench work, and this method stamps `received_by` and
+        `collected_by` from the session -- laboratory provenance, which is
+        exactly the claim a role qualifies. Until w129 `Lab technician`
+        occurred once in all non-test Python of clinical/ and geper/, inside
+        the ROLES tuple, and gated nothing.
+
+        The two operational roles do not overlap and neither subsumes the
+        other: an Orderer may order and may not receive, a Lab technician may
+        receive and may not order. Administrator is not a superuser over
+        either -- the ruling gives it organisation/staff administration.
+        """
+        self._require_role(session, "Lab technician")
+
         if sample_type not in ("blood", "saliva", "tissue", "dna"):
             raise ValueError(f"Sample type must be one of: blood, saliva, tissue, dna; not {sample_type!r}")
 
@@ -1844,7 +1902,17 @@ class DataAccess:
         qc_status: str,
         qc_reason: Optional[str] = None,
     ) -> None:
-        """Record QC result for a sample."""
+        """
+        Record QC result for a sample.
+
+        Requires the Lab technician role (w129 phase B). The QC verdict
+        decides whether a specimen is fit to sequence and is stamped with
+        `qc_recorded_by` from the session; it is the operation in this group
+        with the clearest patient-safety consequence, and before w129 any
+        authenticated session in the organisation could sign it.
+        """
+        self._require_role(session, "Lab technician")
+
         if qc_status not in ("passed", "failed"):
             raise ValueError(f"QC status must be 'passed' or 'failed', not {qc_status!r}")
 
@@ -2019,7 +2087,19 @@ class DataAccess:
         """
         Create a sequencing run for a sample.
         Validates that the sample exists in this organisation.
+
+        Requires the Lab technician role (w129 phase B): the run is
+        laboratory processing performed on a specimen, and `created_by` is
+        stamped from the session.
+
+        This does NOT gate the automatic pipeline. record_pipeline_result is
+        the System principal's path and does not call this method -- counted,
+        `self.create_sequencing_run(` occurs zero times in this file -- and
+        the ruling names System an internal principal that must not be
+        treated as a normal human staff role.
         """
+        self._require_role(session, "Lab technician")
+
         # Validate sample exists in this org
         sample = self._query_one(
             "SELECT sample_id FROM samples WHERE sample_id = %s AND org_id = %s",
@@ -2090,7 +2170,21 @@ class DataAccess:
         and clinical/retention.py's module docstring. Every downstream
         artefact (interpretation, report, amendment) inherits this same
         value at ITS OWN creation rather than recomputing it.
+
+        Requires the Lab technician role (w129 phase B): the VCF is the
+        artefact the sequencing run produced, registered against it with
+        `created_by` stamped from the session. Same exclusion as
+        create_sequencing_run -- the automatic path does not come through
+        here (`self.create_vcf(` occurs zero times in this file).
+
+        record_fastq_set and find_fastq_set_by_checksums are NOT gated, and
+        the reason is structural rather than a judgement: they take a raw
+        org_id and no session, so there is no session whose roles could be
+        consulted. That is reported as a gap in the model, not routed around
+        by minting a session for them.
         """
+        self._require_role(session, "Lab technician")
+
         # Validate sequencing_run exists in this org
         run = self._query_one(
             "SELECT id FROM sequencing_runs WHERE id = %s AND org_id = %s",

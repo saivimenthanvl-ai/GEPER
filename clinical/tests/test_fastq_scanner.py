@@ -84,7 +84,9 @@ def _seed_org_with_sample(dao, conn, label: str):
     org_id = dao.create_organisation(f"Scan Org {label}")
     admin_id = dao.create_user(org_id, f"admin@scan-{label}.test", "password")
     with conn.cursor() as cur:
-        for role in ("Administrator", "Interpreter"):
+        # w129 phase B: this fixture's account seeds an order and a sample, so it
+        # holds Orderer and Lab technician alongside the roles it already had.
+        for role in ("Administrator", "Interpreter", "Orderer", "Lab technician"):
             cur.execute(
                 "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                 "VALUES (%s, %s, %s, %s, %s)",

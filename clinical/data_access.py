@@ -2629,6 +2629,134 @@ class DataAccess:
         return patient_login_id
 
     @auditable(
+        # The pair mirrors user_disabled / user_enabled, keyed on the same
+        # parameter and for the same reason: the two are different events and
+        # an audit that spells them the same cannot answer "who turned it back
+        # on".
+        action=lambda params, result: "patient_login_disabled" if params.get("disabled") else "patient_login_enabled",
+        resource_type="patient_login",
+        # -> None, so the identifier cannot come from the return value. Without
+        # this the row records the literal '<none>' -- the w120 defect -- and
+        # test_w120_audit_resource_id.py refuses the method outright.
+        resource_id_param="target_patient_login_id",
+        requires_session=True,
+        # `params.get`, not attribute access: the builder runs on the DENIED
+        # and ERRORED paths too, with whatever the caller actually passed.
+        details_builder=lambda params, result: {
+            "target_patient_login_id": str(params.get("target_patient_login_id")),
+            "disabled": bool(params.get("disabled")),
+        },
+    )
+    @transactional
+    def set_patient_login_disabled(
+        self,
+        session: Session,
+        target_patient_login_id: uuid.UUID,
+        disabled: bool,
+    ) -> None:
+        """
+        Revoke (or restore) a patient's portal credential, AND END THE LIVE
+        SESSIONS IT HOLDS. Administrator only.
+
+        Never a DELETE, for the reason set_user_disabled gives: it would orphan
+        the audit chain, and nothing in this schema deletes.
+
+        WHY THE SESSION TERMINATION IS IN THIS BODY AND NOT A SECOND CALL.
+        @auditable commits after every audit row it writes. A revocation
+        assembled out of two decorated calls -- "disable the credential, then
+        end its sessions" -- would leave a committed audit row saying the
+        credential was revoked while the sessions ran on, which is the worst
+        of the three possible outcomes: the record says the thing happened.
+        So the role gate, the precondition read, the credential UPDATE and the
+        session UPDATE are one @transactional body inside exactly one
+        @auditable. A failure anywhere leaves NOTHING: the credential still
+        authenticates and no success-outcome row exists. Pinned by
+        test_w133_revocation.py::TestAtomicity.
+
+        THE UPDATE IS KEYED ON patient_login_id, AND THAT IS THE STATEMENT
+        terminate_my_patient_session DELIBERATELY REFUSED. The two are not in
+        conflict; they are opposites and both are deliberate:
+
+            logout      is SELF-SCOPED, takes no target, and ends ONE session.
+                        Keying it on the credential would sign a patient out
+                        of every device they have, under a button that says
+                        "log out".
+            revocation  is ADMINISTRATIVE, names a target, and withdraws THE
+                        CREDENTIAL. Every session that credential minted was
+                        minted by the thing being withdrawn, so ending only
+                        one of them would leave the revoked holder logged in
+                        on the other device -- which is the actor the
+                        revocation was invoked against.
+
+        `terminated_by` HOLDS THE ACTING ADMINISTRATOR'S user_id -- the column
+        names the actor and the actor is the Administrator, consistent with
+        terminate_session. It is expressible without a schema change only
+        because `terminated_by` has NO foreign key on either session table.
+        (Which of the two ids an administrative termination SHOULD record is
+        an open question, carded; this picks the actor and says so.)
+
+        `terminated_at IS NULL` makes a second revocation a no-op rather than
+        a rewrite: the recorded moment a session ended is the first one.
+
+        ONLY WHEN `disabled` IS TRUTHY. Re-enabling must not terminate
+        anything -- and it does not resurrect anything either: a session ended
+        by a revocation stays ended, and the restored credential must be used
+        to obtain a new one.
+
+        POINT-IN-TIME, NOT CONTINUOUS -- AND THE RESIDUE IS REAL. This method
+        ends the sessions that exist WHEN IT RUNS. Session validation is
+        unchanged: patient_session_valid still reads one row from
+        patient_sessions by primary key and never joins patient_logins. So a
+        `disabled` flag set by ANY OTHER ROUTE -- direct SQL, a restore, a
+        future bootstrap -- leaves that credential's live sessions valid until
+        their own idle or absolute window closes. Closing that residue means
+        teaching session validation to read the principal row on every
+        request, which is a different change to the hottest path in the layer.
+        It was not made here. The residue is proved, not merely described, by
+        test_w133_revocation.py::TestTheResidueIsReal.
+
+        THE WAY BACK IS NARROW, and a caller should know it before revoking: a
+        disabled credential cannot be deleted (nothing deletes), cannot be
+        replaced (patient_logins_one_per_patient, and enrol_patient_login
+        raises PatientAlreadyEnrolledError), and its password cannot be
+        changed (no principal in this repository has a password-change
+        method). Re-enabling the same credential, with the same hash, is the
+        only route back today.
+
+        Raises NotFoundError carrying PATIENT_NOT_FOUND -- the module
+        constant, never an f-string naming the id -- for a credential that
+        does not exist IN THIS ORGANISATION, which is byte for byte the
+        refusal for one that does not exist anywhere.
+        """
+        self._require_role(session, "Administrator")
+
+        # The org predicate is bound from the session and never from an
+        # argument, and it is here TWICE on purpose. Without this read a
+        # cross-organisation attempt would update zero rows and return
+        # successfully, and the caller could not tell a refusal from a
+        # no-op. With it the caller gets NotFoundError; the AND org_id on the
+        # statements below is what makes the layer being wrong insufficient.
+        existing = self._query_one(
+            "SELECT patient_login_id FROM patient_logins WHERE patient_login_id = %s AND org_id = %s",
+            (target_patient_login_id, session.org_id),
+        )
+        if existing is None:
+            raise NotFoundError(PATIENT_NOT_FOUND)
+
+        now = self._clock.now()
+        self._execute(
+            "UPDATE patient_logins SET disabled = %s, updated_at = %s WHERE patient_login_id = %s AND org_id = %s",
+            (disabled, now, target_patient_login_id, session.org_id),
+        )
+
+        if disabled:
+            self._execute(
+                "UPDATE patient_sessions SET terminated_at = %s, terminated_by = %s "
+                "WHERE patient_login_id = %s AND org_id = %s AND terminated_at IS NULL",
+                (now, session.user_id, target_patient_login_id, session.org_id),
+            )
+
+    @auditable(
         action="order_read",
         resource_type="order",
         requires_session=True,

@@ -197,26 +197,40 @@ _UNKNOWN_UUID = "00000000-0000-0000-0000-000000000000"
 
 def _authenticated_route_probes(client, credential):
     """
-    FIVE of the seven mounted routes that require a principal, exercised with
+    ALL SEVEN mounted routes that require a principal, exercised with
     `credential` (a dict of cookies, possibly empty).
 
-    ── CORRECTED IN w138. THIS USED TO SAY "Every mounted route that ───────
-    requires a principal". It was true when written and is FALSE at
-    a931869: `POST /auth/logout` and `POST /portal/logout` were added in the
-    same wave as this file, both require a principal, and NEITHER IS IN ANY
-    REFUSAL-PARITY SET IN THIS REPOSITORY. A logout route is an easy one to
-    omit precisely because its success is a 204 rather than a 200.
-
-    The patient half of that is closed by
+    ── THE HISTORY OF THIS DOCSTRING, KEPT BECAUSE IT IS THE FINDING. ──────
+    It originally said "Every mounted route that requires a principal". That
+    was true when written and became FALSE when `POST /auth/logout` and
+    `POST /portal/logout` were added in the same wave as this file: both
+    require a principal, both were omitted here, and at `a931869` NEITHER
+    WAS IN ANY REFUSAL-PARITY SET IN THIS REPOSITORY. A logout route is an
+    easy one to omit precisely because its success is a 204 rather than a
+    200, so "not the refusal" is a weaker statement about it than about the
+    others. w138 found it, narrowed the claim to "five of seven", closed the
+    patient half in
     `test_w138_patient_portal_api.py::TestEveryPortalRefusalIsOnePairOn
-    EveryRoute`, which collects eight credential states across all three
-    authenticated PORTAL routes -- `/portal/logout` included. The STAFF half
-    (`POST /auth/logout`) is still in no set; it is carded in
-    `w138-patient-portal-api-audit.md` as C-16 for the wave that owns the
-    remaining w132 items, because widening this dict changes the staff
-    refusal surface and that is not Wave 4's to change.
+    EveryRoute`, and carded the staff half as C-16 -- widening the STAFF
+    refusal surface was not Wave 4's to change.
 
-    DO NOT re-widen the claim above without adding the two routes.
+    ── w139 (Wave 5) CLOSES C-16 AND RESTORES THE CLAIM. ───────────────────
+    Both logout routes are in the dict below, so the sentence at the top is
+    true again -- COUNTED: seven mounted routes require a principal, seven
+    are probed. Every credential this function is ever called with is an
+    INVALID one (no cookie, a malformed id, an unknown id, the other
+    principal's session), so adding the logout routes terminates nothing and
+    cannot disturb the other rows.
+
+    THE SESSION-LIFECYCLE STATES ARE STILL NOT HERE, and they are the half
+    that matters most for a logout route: a session ended by logout, one
+    ended administratively, one past its absolute cap, one past its idle
+    window. They need fixtures this file's `seeded` does not build. They are
+    in `test_w139_remaining_w132_items.py::TestEveryStaffRefusalIsOnePairOn
+    EveryRouteIncludingLogout` (staff, eight cases x four routes) and in
+    w138's class named above (patient, eight cases x three routes). The three
+    files are meant to be read together; DO NOT narrow any of the three
+    without moving the probes.
     ────────────────────────────────────────────────────────────────────────
 
     `owner` is supplied on the worklist deliberately: whether a missing
@@ -234,6 +248,13 @@ def _authenticated_route_probes(client, credential):
         ),
         "GET /portal/me": client.get("/portal/me", cookies=credential),
         "GET /portal/me/tests": client.get("/portal/me/tests", cookies=credential),
+        # w139: the two that were missing. Safe here because every credential
+        # this function is called with is already invalid -- neither route can
+        # reach `terminate_my_session` / `terminate_my_patient_session` without
+        # first passing its principal's dependency, which is the thing under
+        # test.
+        "POST /auth/logout": client.post("/auth/logout", cookies=credential),
+        "POST /portal/logout": client.post("/portal/logout", cookies=credential),
     }
 
 

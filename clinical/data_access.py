@@ -1068,6 +1068,21 @@ class DataAccess:
         user_id, password_hash, failed_attempts, locked_until, disabled, totp_secret, is_system = row
 
         if locked_until is not None and locked_until > now:
+            # EQUALISE HERE TOO -- w139. This branch used to be the ONE failure
+            # path in either login method that spent no bcrypt work at all, so
+            # a locked-out address answered measurably faster than a wrong
+            # password against a live one. That is a timing oracle in the
+            # direction that helps: only an address that EXISTS can be locked,
+            # so "cheap" confirmed the address, and an attacker can create the
+            # state themselves with five wrong guesses.
+            #
+            # IT MUST NOT TOUCH THE COUNTER. `_equalise_password_work` verifies
+            # against the dummy hash and discards the result; it does not call
+            # `_register_failed_attempt`, so a locked account is not driven
+            # deeper and its `locked_until` is not extended. The lockout policy
+            # is unchanged -- this branch still refuses, before the real hash is
+            # ever consulted.
+            self._equalise_password_work(password)
             self.log_failed_login(email, org_id, ip_address, reason="locked_out")
             raise AuthenticationError()
 
@@ -2466,6 +2481,17 @@ class DataAccess:
         patient_login_id, patient_id, password_hash, failed_attempts, locked_until, disabled = row
 
         if locked_until is not None and locked_until > now:
+            # EQUALISE HERE TOO -- w139, and for the same reason as login()'s
+            # locked-out branch, which this mirrors line for line. The patient
+            # half had the identical shape and w138 recorded it rather than
+            # carding it precisely because login() did too; both are fixed
+            # together so the two methods cannot drift.
+            #
+            # The counter is NOT touched: `_equalise_password_work` spends the
+            # work and discards the result, so a locked patient credential is
+            # not driven deeper and `locked_until` is not extended. The lockout
+            # policy is unchanged.
+            self._equalise_password_work(password)
             self.log_failed_login(email, org_id, ip_address, reason="locked_out")
             raise AuthenticationError()
 

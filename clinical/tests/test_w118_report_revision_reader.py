@@ -107,6 +107,16 @@ def _admin_session(dao, conn, org_id, email, name):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, T0),
         )
+        # w129 phase B: create_amendment now requires Approver. This file's
+        # subject is the REVISION READER, not authority: it approves by raw
+        # UPDATE (see _approve below) and only needs amendments to exist.
+        # Granting the role it is exercising is the honest fix; weakening the
+        # gate to keep a reader test green would not be.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at, basis) "
+            "VALUES (%s, %s, 'Approver', %s, %s, %s)",
+            (user_id, org_id, user_id, T0, "w129 test fixture: amends its own reports"),
+        )
     conn.commit()
     return dao.login(email, org_id, "password")
 

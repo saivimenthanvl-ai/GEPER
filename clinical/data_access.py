@@ -5370,13 +5370,43 @@ class DataAccess:
         being handed to this consumer. The duplication onto release_events is
         still deliberate, per that table's own schema comment -- it lets a
         reader learn what was delivered without joining back to reports.
+
+        AUTHORITY (w129 phase B). Release is gated exactly the way approval is
+        gated, twice over and for the same reason:
+
+          - `_require_role(session, 'Approver')` gates the SESSION.
+          - the identity recorded in `release_events.released_by` -- actor_id
+            -- is separately checked to hold Approver itself.
+
+        Before w129 this method checked only that actor_id named a user IN
+        THIS ORGANISATION: membership, not authority. That is the identity
+        half of the `_approve_report` pattern with the authority half missing,
+        and it meant a session holding only Auditor -- a read-only role by
+        intent -- could hand an approved report to an arbitrary named consumer
+        and record any colleague as having released it. `released_by` is read
+        as an authority claim the same way `reports.approver_id` is, so it
+        gets the same check; see `_approve_report`'s docstring for the full
+        argument, which this method now shares rather than restates.
+
+        Approver, not a new Releaser role: the ruling of 2026-09-14 gives
+        Approver "review/approval", release acts only on an already-approved
+        report, and inventing an eighth role for one operation would be the
+        broad RBAC redesign the same ruling forbids.
         """
+        self._require_role(session, "Approver")
+
         actor = self._query_one(
             "SELECT 1 FROM users WHERE org_id = %s AND user_id = %s",
             (session.org_id, actor_id),
         )
         if actor is None:
             raise NotFoundError(f"No such user in this organisation: {actor_id}")
+
+        actor_roles = {a.role for a in self.get_user_roles(session, target_user_id=actor_id)}
+        if "Approver" not in actor_roles:
+            raise AuthorizationError(
+                f"User {actor_id} does not hold the Approver role and cannot be recorded as releasing this report."
+            )
 
         if consumer is None or not str(consumer).strip():
             raise ValueError("A release must name its consumer (spec 13.4).")
@@ -5433,7 +5463,26 @@ class DataAccess:
         first _release_report call could ever have succeeded), and a second
         consumer requesting the same already-released report is not a reason
         to refuse it.
+
+        AUTHORITY (w129 phase B). This gate is now an authority gate as well
+        as a state gate: the session must hold Approver. Before w129 it
+        answered only "is this report approved" and had no opinion about who
+        was asking, so the one gate every delivery path calls could be
+        satisfied by any authenticated session in the organisation.
+
+        The state refusal is NOT replaced by the role refusal. An Approver
+        asking about a draft report still gets the spec 13.4 ValueError; the
+        two conditions are independent and both are tested.
+
+        NOTE for whoever wires the first delivery path -- there is none today
+        (`require_release` has zero non-test callers at 36fe487, counted). A
+        delivery path driven by a principal that is not an Approver will fail
+        here, by design: the authority to hand a report to a consumer and the
+        authority to release it are the same authority, and splitting them
+        would be the second mechanism this wave is forbidden to build.
         """
+        self._require_role(session, "Approver")
+
         report = self._query_one(
             "SELECT state FROM reports WHERE id = %s AND org_id = %s",
             (report_id, session.org_id),
@@ -5487,6 +5536,7 @@ class DataAccess:
         the fact of the notification is recorded).
 
         Preconditions:
+          - Session holds Approver (w129 phase B; see below)
           - Original report must exist in this org
           - Original report must be approved or released (not in draft/under_review/returned)
           - Reason for amendment is NOT NULL
@@ -5498,8 +5548,29 @@ class DataAccess:
         reviewer_claims.supersedes chains. NULL means this is the first
         amendment of this original.
 
+        AUTHORITY (w129 phase B). The session must hold Approver. An
+        amendment is the one sanctioned corrective act on a record that has
+        ALREADY BEEN SIGNED -- this method refuses any original that is not
+        approved or released -- so its authority is the authority that signed
+        it. Before w129 it checked neither the session's roles nor anything
+        about the actor at all, so any authenticated session in the
+        organisation could open an amendment against a colleague's approved
+        report and notify the ordering clinician of it.
+
+        Only the session is checked, not a second recorded actor: unlike
+        `_approve_report` and `_release_report`, this method takes no
+        actor_id. `reports.created_by` on the amendment is written from
+        session.user_id, which the session gate has already qualified. The
+        amendment it creates is a DRAFT, and must still pass
+        `submit_for_review` (Interpreter) and `_approve_report` (Approver on
+        both session and recorded actor) before it can itself be released, so
+        the signing authority on the amended content is checked there, where
+        the signature is actually recorded.
+
         Returns: tuple of (amendment_report_id, notification_id)
         """
+        self._require_role(session, "Approver")
+
         # retention_days: INHERITED from the original report (which itself
         # inherited it from its interpretation, which inherited it from its
         # vcf) -- human ruling D2 (2026-09-09). An amendment IS a new report

@@ -114,6 +114,23 @@ def _admin_session(dao, conn, org_id, email):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
         )
+        # w129 phase B: create_amendment now requires Approver, the way
+        # _approve_report always has. This file's subject is RETENTION and
+        # tombstone cascade, not authority: it needs an amendment and its
+        # notification to exist so it can watch them cascade. This account
+        # does every job in its organisation, so it holds the role for the
+        # work it performs. Roles are additive -- still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at, basis) "
+            "VALUES (%s, %s, 'Approver', %s, %s, %s)",
+            (
+                user_id,
+                org_id,
+                user_id,
+                datetime.datetime(2026, 9, 1, tzinfo=timezone.utc),
+                "w129 test fixture: amends the reports it signs",
+            ),
+        )
     conn.commit()
     return dao.login(email, org_id, "password")
 

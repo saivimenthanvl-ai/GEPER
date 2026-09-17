@@ -93,6 +93,23 @@ def _admin_session(dao, conn, org_id, email):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
         )
+        # w129 phase B: create_amendment (and _release_report /
+        # require_release) now require Approver, the way _approve_report
+        # always has. This file's single staff account does every job in its
+        # organisation, amendment included, so it holds the role for the work
+        # it performs. Roles are additive -- it is still an Administrator, and
+        # nothing here asserts that it is not an Approver.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at, basis) "
+            "VALUES (%s, %s, 'Approver', %s, %s, %s)",
+            (
+                user_id,
+                org_id,
+                user_id,
+                datetime.datetime(2026, 9, 1, tzinfo=timezone.utc),
+                "w129 test fixture: amends the reports it signs",
+            ),
+        )
     conn.commit()
     return dao.login(email, org_id, "password")
 

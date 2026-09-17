@@ -204,7 +204,7 @@ class TestAmendmentDoesNotFalselyTamperTheOriginal:
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
         assert dao.verify_report_integrity(approver_a, original) is True
 
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
 
         # The amendment's own reviewer claim: the clinical reason it exists.
         dao._record_disagreement(
@@ -262,7 +262,7 @@ class TestAmendmentDoesNotFalselyTamperTheOriginal:
             cur.execute("SELECT content_hash FROM reports WHERE id = %s", (original,))
             before = cur.fetchone()[0]
 
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
         dao._record_accept(
             session_a,
             interpretation_id=interp_a,
@@ -295,7 +295,7 @@ class TestAReportCarriesItsOwnClaimsAndOnlyItsOwn:
         self, dao, conn, session_a, interpreter_a, approver_a, interp_a
     ):
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
         dao._record_disagreement(
             session_a,
             interpretation_id=interp_a,
@@ -329,7 +329,7 @@ class TestAReportCarriesItsOwnClaimsAndOnlyItsOwn:
         case the old interpretation-scoped model could not represent.
         """
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
         dao._record_accept(
             session_a,
             interpretation_id=interp_a,
@@ -354,7 +354,7 @@ class TestAReportCarriesItsOwnClaimsAndOnlyItsOwn:
         original's reviewer -- who never read it.
         """
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
 
         with pytest.raises(ValueError, match="no reviewer claim of its own"):
             dao.submit_for_review(interpreter_a, amendment)

@@ -435,6 +435,14 @@ ORG_SCOPED_TABLES = (
     "retention_policies",
     "exceptions",
     "exception_events",
+    # w130. The patient portal principal and its sessions. Both carry org_id,
+    # so NEITHER MAY BE EXEMPTED -- test_only_a_table_without_an_org_id_column_
+    # may_be_exempt permits an exemption only where the column genuinely does
+    # not exist. Every statement against either binds org_id, INCLUDING the
+    # patient login lookup, which is WHERE org_id = %s AND email = %s exactly
+    # as login()'s users lookup already is.
+    "patient_logins",
+    "patient_sessions",
 )
 
 

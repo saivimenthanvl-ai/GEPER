@@ -324,6 +324,149 @@ CREATE UNIQUE INDEX external_identifiers_unique
     ON external_identifiers (org_id, id_type, id_value);
 
 
+-- ─── patient portal identity (w130) ─────────────────────────────────────────
+--
+-- A PATIENT IS A PRINCIPAL, AND IT IS NOT A `users` ROW. Not because of roles
+-- -- a roleless `users` row is legal and is what create_user produces -- but
+-- because of what a `users` row is STRUCTURALLY ELIGIBLE for. Counted at
+-- ca183d3: `REFERENCES users` occurs 22 times in this file, and nineteen of
+-- those are clinical-record actor columns, including reports.created_by and
+-- reports.approver_id. A patient placed in `users` is a database-legal report
+-- approver, and the only thing refusing it would be a Python check -- the
+-- exact shape this schema records as a defect elsewhere (see the note on
+-- users_org_user_unique above, which spends seven lines explaining that a
+-- structural guarantee must not be downgraded to a remembered one).
+--
+-- A separate principal table makes "a patient cannot approve a report"
+-- INEXPRESSIBLE rather than merely unwritten. That is the guarantee shape
+-- this schema already uses for tenancy, applied to a second question.
+--
+-- NO ROLE IS ADDED. ROLES, role_assignments_role_known and _require_role are
+-- untouched by these two tables; a patient holds no role assignment and
+-- cannot, because role_assignments.user_id is a composite FK to `users`.
+
+CREATE TABLE patient_logins (
+    patient_login_id        UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    patient_id              UUID        NOT NULL,
+    org_id                  UUID        NOT NULL,
+
+    email                   TEXT        NOT NULL,
+    -- bcrypt, the same modular-crypt string users.password_hash holds, written
+    -- by the same hasher. No second credential format was introduced.
+    password_hash           TEXT        NOT NULL,
+    password_changed_at     TIMESTAMPTZ NOT NULL,
+    password_reset_required BOOLEAN     NOT NULL DEFAULT FALSE,
+
+    -- Same lockout policy as users: the counter and the ceiling are the same
+    -- columns under the same names, read by the same constants
+    -- (MAX_FAILED_LOGIN_ATTEMPTS, LOCKOUT_MINUTES).
+    failed_login_attempts   INTEGER     NOT NULL DEFAULT 0,
+    locked_until            TIMESTAMPTZ,
+
+    disabled                BOOLEAN     NOT NULL DEFAULT FALSE,
+
+    -- WHICH STAFF PRINCIPAL ISSUED THIS CREDENTIAL. Enrolment is a staff act
+    -- (no self-registration), so the record of who performed it belongs on the
+    -- row. Composite FK, so the enroller cannot be from another organisation.
+    enrolled_by             UUID        NOT NULL,
+
+    created_at              TIMESTAMPTZ NOT NULL,
+    updated_at              TIMESTAMPTZ NOT NULL,
+
+    -- The link to the clinical record, and the whole point of the table. The
+    -- composite FK makes a credential for a patient in ANOTHER organisation
+    -- inexpressible, exactly as role_assignments_user_fk does for staff.
+    CONSTRAINT patient_logins_patient_fk
+        FOREIGN KEY (patient_id, org_id) REFERENCES patients (patient_id, org_id),
+    CONSTRAINT patient_logins_enroller_fk
+        FOREIGN KEY (enrolled_by, org_id) REFERENCES users (user_id, org_id),
+
+    CONSTRAINT patient_logins_org_email_unique UNIQUE (org_id, email),
+
+    -- EXACTLY ONE PATIENT PER LOGIN, AND ONE LOGIN PER PATIENT. The second
+    -- half is a DECISION, not a default: proxy and guardian access (a child, an
+    -- adult without capacity) would relax it, and the schema already knows
+    -- minors exist (retention_days_minor). Relaxing it is a ruling, and until
+    -- one is made this constraint is what stops a second credential appearing
+    -- for a patient without anybody deciding that it should.
+    CONSTRAINT patient_logins_one_per_patient UNIQUE (org_id, patient_id),
+
+    -- DO NOT REMOVE THIS AS REDUNDANT -- the same reasoning as
+    -- users_org_user_unique above, and for the same reason. patient_sessions'
+    -- composite FK references (patient_login_id, org_id) and Postgres will only
+    -- accept a composite FOREIGN KEY against a matching UNIQUE constraint.
+    -- Drop this line and that foreign key fails to create, taking the
+    -- structural org isolation of every patient session with it.
+    CONSTRAINT patient_logins_org_login_unique UNIQUE (org_id, patient_login_id)
+);
+
+CREATE INDEX patient_logins_org_patient ON patient_logins (org_id, patient_id);
+
+
+-- Mirrors `sessions` column for column and policy for policy: the same 24-hour
+-- absolute cap that activity never extends, the same 30-minute idle window
+-- refreshed per validated request with the same inclusive boundary, the same
+-- server-side termination, the same ip_address/user_agent.
+--
+-- A SEPARATE TABLE RATHER THAN A NULLABLE COLUMN ON `sessions`, deliberately.
+-- The rejected alternative was patient_login_id nullable on sessions with an
+-- XOR check: it needs ALTER TABLE ... DROP NOT NULL on a live table whose
+-- composite FK is load-bearing, it makes Session.user_id optional in a layer
+-- that writes session.user_id as created_by/recorded_by in roughly thirty
+-- statements, and one table invites one session_valid() returning a union of
+-- two principal kinds -- which is the dependency-widening that this whole
+-- design exists to refuse.
+--
+-- THE TWO SESSION ID SPACES ARE DIFFERENT TABLES. A staff session id presented
+-- to the portal is simply not found, and a patient session id presented to the
+-- staff dependency is simply not found. That separation is structural, not
+-- checked.
+
+CREATE TABLE patient_sessions (
+    session_id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    patient_login_id     UUID        NOT NULL,
+    org_id               UUID        NOT NULL,
+
+    -- DENORMALISED ON PURPOSE, AND IT IS THE SECOND AXIS OF ISOLATION.
+    -- patient_id is derivable by joining patient_logins, but it is carried
+    -- here for the same reason sessions carries org_id: every patient-facing
+    -- statement binds it FROM THE SESSION and never from a caller argument,
+    -- and a value that has to be fetched before it can be bound is a value
+    -- somebody will eventually pass in instead. The composite FK below plus
+    -- patient_logins_one_per_patient keep it from disagreeing with the login.
+    patient_id           UUID        NOT NULL,
+
+    created_at           TIMESTAMPTZ NOT NULL,
+    expires_at           TIMESTAMPTZ NOT NULL,
+    last_activity_at     TIMESTAMPTZ NOT NULL,
+    idle_timeout_minutes INTEGER     NOT NULL DEFAULT 30,
+
+    terminated_at        TIMESTAMPTZ,
+    terminated_by        UUID,
+
+    ip_address           INET,
+    user_agent           TEXT,
+
+    CONSTRAINT patient_sessions_termination_complete CHECK (
+        (terminated_at IS NULL) = (terminated_by IS NULL)
+    ),
+    CONSTRAINT patient_sessions_login_fk
+        FOREIGN KEY (patient_login_id, org_id)
+        REFERENCES patient_logins (patient_login_id, org_id),
+    -- The carried patient_id is held to the patients table by the same
+    -- composite FK every other patient reference in this schema uses, so a
+    -- session cannot carry a patient from another organisation even if the
+    -- application tried to write one.
+    CONSTRAINT patient_sessions_patient_fk
+        FOREIGN KEY (patient_id, org_id) REFERENCES patients (patient_id, org_id)
+);
+
+CREATE INDEX patient_sessions_live
+    ON patient_sessions (org_id, patient_login_id)
+    WHERE terminated_at IS NULL;
+
+
+
 CREATE TABLE consents (
     consent_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     patient_id      UUID        NOT NULL,
@@ -1478,7 +1621,13 @@ GRANT  SELECT, INSERT, UPDATE
     ON organisations, users, totp_backup_codes, role_assignments, sessions,
        patients, external_identifiers, consents, tests, test_genes, orders, samples,
        sequencing_runs, reports,
-       exceptions, exception_events, retention_policies
+       exceptions, exception_events, retention_policies,
+       -- w130. EXACTLY the privileges users and sessions hold, and no more:
+       -- both are mutated in place (the lockout counter, the idle window, the
+       -- terminated_at stamp), so UPDATE is required and is not a widening.
+       -- DELETE is absent here as it is for every table above, under the same
+       -- D0b ruling: nothing deletes.
+       patient_logins, patient_sessions
     TO clinical_app;
 
 -- D0b, the free win (human ruling, 2026-09-04): interpretations and vcfs are

@@ -3863,9 +3863,9 @@ class DataAccess:
             events = self._query(
                 "SELECT id, action, actor, timestamp, action_note "
                 "FROM exception_events "
-                "WHERE exception_id = %s "
+                "WHERE exception_id = %s AND org_id = %s "
                 "ORDER BY timestamp ASC",
-                (exc_id,),
+                (exc_id, session.org_id),
             )
 
             event_dtos = [
@@ -3935,9 +3935,9 @@ class DataAccess:
             events = self._query(
                 "SELECT id, action, actor, timestamp, action_note "
                 "FROM exception_events "
-                "WHERE exception_id = %s "
+                "WHERE exception_id = %s AND org_id = %s "
                 "ORDER BY timestamp ASC",
-                (exc_id,),
+                (exc_id, session.org_id),
             )
 
             event_dtos = [
@@ -3990,8 +3990,50 @@ class DataAccess:
         resolution_note: str,
         actor: str,
     ) -> None:
-        """Resolve an exception, recording the resolution event and updating status."""
+        """
+        Resolve an exception, recording the resolution event and updating status.
+
+        w129 GAP-1. This method used to have an asymmetry inside its own body:
+        the UPDATE bound org_id, the INSERT did not. `_execute` returns None and
+        never inspects rowcount, so when the UPDATE matched zero rows -- which is
+        exactly what happens when the caller names another organisation's
+        exception -- nothing stopped execution falling through into an INSERT
+        that appended a 'resolve' row to the victim's append-only history. The
+        method RETURNED NORMALLY. Measured, not reasoned.
+
+        Two changes, and they are deliberately both here rather than either one
+        alone:
+
+          1. The exception is resolved org-scoped FIRST and a miss raises
+             NotFoundError. A zero-row UPDATE must not be a silent success, and
+             refusing here is also what makes the endpoint's two refusals
+             identical -- a foreign id and an invented id both arrive at this
+             same NotFoundError with the same message shape (w129 GAP-2).
+          2. The event INSERT binds org_id from the session, and the schema's
+             composite foreign key (exception_id, org_id) -> exceptions (id,
+             org_id) makes the cross-tenant row inexpressible rather than merely
+             unwritten. The guard above is the clean refusal; the key is the
+             guarantee that survives the next person editing this method.
+
+        ONE METHOD, NOT A COMPOSITION. The read, the UPDATE and the INSERT are
+        written inline rather than delegated to get_exception_by_id or any other
+        decorated method: @auditable commits after each audit row, so composing
+        transactional work out of decorated methods destroys atomicity silently
+        (the w128 lesson).
+        """
         now = self._clock.now()
+
+        # Org-scoped existence check. NOT get_exception_by_id -- see the
+        # docstring's note on composition.
+        target = self._query_one(
+            "SELECT id FROM exceptions WHERE id = %s AND org_id = %s",
+            (exception_id, session.org_id),
+        )
+        if target is None:
+            # Identical for an id belonging to another organisation and an id
+            # that exists nowhere. Telling them apart is a cross-tenant
+            # existence oracle; the endpoint's 404 carries this message for both.
+            raise NotFoundError(f"Exception {exception_id} not found")
 
         # Update exception status and resolution
         self._execute(
@@ -4004,10 +4046,11 @@ class DataAccess:
 
         # Record the resolution event (transactional with status update)
         self._execute(
-            "INSERT INTO exception_events (id, exception_id, actor, timestamp, action, action_note) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "INSERT INTO exception_events (id, org_id, exception_id, actor, timestamp, action, action_note) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 uuid.uuid4(),
+                session.org_id,
                 exception_id,
                 actor,
                 now,
@@ -4058,10 +4101,11 @@ class DataAccess:
             exc_id = existing[0]
             # Reopen: write REOPEN event
             self._execute(
-                "INSERT INTO exception_events (id, exception_id, actor, timestamp, action, action_note) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
+                "INSERT INTO exception_events (id, org_id, exception_id, actor, timestamp, action, action_note) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (
                     uuid.uuid4(),
+                    session.org_id,
                     exc_id,
                     actor,
                     now,
@@ -4092,10 +4136,11 @@ class DataAccess:
 
         # Write OPEN event
         self._execute(
-            "INSERT INTO exception_events (id, exception_id, actor, timestamp, action, action_note) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "INSERT INTO exception_events (id, org_id, exception_id, actor, timestamp, action, action_note) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 uuid.uuid4(),
+                session.org_id,
                 exc_id,
                 actor,
                 now,
@@ -4294,9 +4339,9 @@ class DataAccess:
         events = self._query(
             "SELECT id, action, actor, timestamp, action_note "
             "FROM exception_events "
-            "WHERE exception_id = %s "
+            "WHERE exception_id = %s AND org_id = %s "
             "ORDER BY timestamp ASC",
-            (exc_id,),
+            (exc_id, session.org_id),
         )
 
         event_dtos = [

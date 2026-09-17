@@ -1334,16 +1334,49 @@ CREATE INDEX idx_exceptions_retry_scheduler ON exceptions (org_id, next_retry_at
     WHERE status = 'open';
 
 
+-- w129 GAP-1 -- THE ONE TABLE IN THIS SCHEMA THAT WAS NOT ORG-SCOPED, AND THE
+-- ONLY PLACE A CROSS-TENANT WRITE WAS REACHABLE OVER AUTHENTICATED HTTP.
+--
+-- This table used to carry no org_id and to name `REFERENCES exceptions (id)`
+-- alone. The consequence was measured, not reasoned (w129 Phase A): an
+-- authenticated session in organisation B, issuing
+-- PATCH /exceptions/{id} against an exception id belonging to organisation A,
+-- left A's exception untouched -- the UPDATE is org-scoped and matched zero
+-- rows, silently, because _execute never inspects rowcount -- and then
+-- appended a 'resolve' row to A's APPEND-ONLY event history, carrying B's user
+-- id as actor and B's free text as action_note. A could see the row (its
+-- readers resolve the exception org-scoped first and then read events by the
+-- already-validated id) and could not explain it: the only audit record of who
+-- wrote it sat in B's audit partition, which A's Auditor cannot read.
+--
+-- The single-column FK was satisfied because the row existed GLOBALLY. That is
+-- the whole defect in one clause: a foreign key that does not carry the tenant
+-- asks "does this id exist?" when the question is "does this id exist HERE?".
+--
+-- The composite target it needed already existed, twelve lines above:
+-- exceptions_org_exception_unique UNIQUE (org_id, id). It was simply not used.
+-- With the FK composite, the contaminating row is not refused at runtime by
+-- code anyone has to remember to write -- it is INEXPRESSIBLE, which is the
+-- guarantee every other child table in this schema already had (see
+-- users_org_user_unique's comment for why that unique key is not redundant).
+--
+-- org_id is NOT NULL and references organisations directly as well, so a row
+-- cannot exist without naming its tenant even in the seconds before the
+-- composite FK is checked.
 CREATE TABLE exception_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    exception_id UUID NOT NULL REFERENCES exceptions (id),
+    org_id UUID NOT NULL REFERENCES organisations (org_id),
+    exception_id UUID NOT NULL,
     actor TEXT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('open', 'resolve', 'reopen')),
-    action_note TEXT
+    action_note TEXT,
+
+    CONSTRAINT exception_events_org_exception_fk
+        FOREIGN KEY (exception_id, org_id) REFERENCES exceptions (id, org_id)
 );
 
-CREATE INDEX idx_exception_events_exception ON exception_events (exception_id, timestamp);
+CREATE INDEX idx_exception_events_exception ON exception_events (org_id, exception_id, timestamp);
 
 
 -- ─── append-only enforcement ────────────────────────────────────────────────

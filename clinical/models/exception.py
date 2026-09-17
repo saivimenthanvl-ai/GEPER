@@ -27,11 +27,16 @@ Schema:
 
   CREATE TABLE exception_events (
     id UUID PRIMARY KEY,
-    exception_id UUID NOT NULL REFERENCES exceptions(id),
+    org_id UUID NOT NULL REFERENCES organisations(org_id),
+    exception_id UUID NOT NULL,
     actor TEXT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
     action TEXT NOT NULL,
-    action_note TEXT
+    action_note TEXT,
+    -- w129 GAP-1: composite, so a cross-tenant event row is inexpressible
+    -- rather than merely unwritten. The single-column FK it replaces was
+    -- satisfied by a row that existed in ANY organisation.
+    FOREIGN KEY (exception_id, org_id) REFERENCES exceptions(id, org_id)
   );
 
 Exception methods belong in clinical/data_access.py following the existing

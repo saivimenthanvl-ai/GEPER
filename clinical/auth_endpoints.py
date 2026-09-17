@@ -4,11 +4,7 @@ clinical/auth_endpoints.py
 THE HTTP AUTHENTICATION SURFACE (w132). Two login routes, one mechanism.
 
 `POST /auth/login`   -> DataAccess.login          -> `sessions`         (staff)
-
-`POST /portal/login` lands in the NEXT commit, in this same module. The
-cross-principal property it exists to satisfy can only be tested once both
-routes exist, and splitting them means the staff route is reviewable without
-the patient question attached.
+`POST /portal/login` -> DataAccess.patient_login  -> `patient_sessions` (patient)
 
 TWO ROUTES, AND THE ROUTE IS WHAT NAMES THE PRINCIPAL. Neither handler
 consults the other's store, and that is the whole reason there are two of
@@ -70,6 +66,7 @@ from clinical.data_access import (
     DataAccess,
 )
 from clinical.endpoints import _SESSION_COOKIE, _anonymous_refusal, _get_data_access
+from clinical.portal_endpoints import _PATIENT_SESSION_COOKIE
 
 router = APIRouter(tags=["authentication"])
 
@@ -106,6 +103,16 @@ class StaffLoginRequest(BaseModel):
     org_id: uuid.UUID
     password: str
     totp_code: Optional[str] = None
+
+
+class PatientLoginRequest(BaseModel):
+    """No second factor, and its absence is declared rather than forgotten —
+    `data_access.py`'s patient-authentication header explains why patient MFA
+    is a ruling and not an omission, and this wave does not make it."""
+
+    email: str
+    org_id: uuid.UUID
+    password: str
 
 
 # ─── the in-process login throttle ───────────────────────────────────────────
@@ -428,4 +435,50 @@ async def staff_login(
     )
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
     _set_session_cookie(response, _SESSION_COOKIE, session.session_id, path="/")
+    return response
+
+
+@router.post(
+    "/portal/login",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Authenticate a PATIENT and open a portal session",
+    responses={
+        204: {"description": "Authenticated; the patient session cookie is set"},
+        401: {"description": "Authentication failed"},
+        429: {"description": "Too many login attempts from this source"},
+    },
+)
+async def patient_login(
+    payload: PatientLoginRequest,
+    request: Request,
+    _throttle: None = Depends(_rate_limit_login),
+    dao: DataAccess = Depends(_get_data_access),
+) -> Response:
+    """
+    Authenticate against `patient_logins` and mint a `patient_sessions` row.
+
+    THE SAME MECHANISM OVER A SECOND PRINCIPAL TABLE: the same hasher, the
+    same dummy-hash equalisation, the same MAX_FAILED_LOGIN_ATTEMPTS and
+    LOCKOUT_MINUTES, the same GENERIC_AUTH_ERROR, the same session windows,
+    the same throttle and the same cookie helper. What differs is the table,
+    the cookie name and the cookie path — and that is the whole of the
+    difference, which is what "not a second authentication system" means.
+
+    THIS HANDLER CALLS `DataAccess.patient_login` AND NOTHING ELSE. It does
+    not, and must not, consult `users`. An address that is a staff address
+    and nothing else must be refused here exactly as an address that exists
+    nowhere is — same status, same body — and a handler that fell back to
+    `login()` would answer differently, in time if not in text.
+    """
+    session = _refuse_uniformly(
+        lambda: dao.patient_login(
+            payload.email,
+            payload.org_id,
+            payload.password,
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+    )
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _set_session_cookie(response, _PATIENT_SESSION_COOKIE, session.session_id, path="/portal")
     return response

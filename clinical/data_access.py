@@ -516,6 +516,44 @@ TABLES_EXEMPT_FROM_ORG_SCOPING = {
         "assumed. This exemption records a known structural asymmetry; it does not "
         "claim the table is not org-owned."
     ),
+    # w126m. THE ONE TABLE IN THIS SCHEMA THAT IS NOT ABOUT PATIENTS AT ALL.
+    #
+    # This exemption was WRITTEN BECAUSE THE GUARD DEMANDED IT: adding
+    # schema_migrations to schema.sql turned
+    # test_org_scoped_table_coverage_is_derived_from_the_schema red, which is
+    # the w129 GAP-3 derivation doing exactly the job it was built for -- a new
+    # table was covered the day it was created, and leaving it out required an
+    # argument in writing. That is recorded here rather than smoothed over,
+    # because the alternative (adding the name to ORG_SCOPED_TABLES) would have
+    # been the false answer: it would assert that every statement against this
+    # table binds org_id, and none could, because there is nothing to bind.
+    #
+    # WHY IT IS GENUINELY NOT ORG-OWNED, and not merely inconvenient to scope.
+    # Its rows are DEPLOYMENT FACTS about the database as a whole -- which
+    # migration ran, over which bytes, when, as whom. A schema is at one
+    # version; it is not at one version per organisation. There is no tenant
+    # dimension to carry, which is why the table has no org_id column and why
+    # test_only_a_table_without_an_org_id_column_may_be_exempt permits this
+    # entry at all: that interlock still binds, so this cannot become a hiding
+    # place the day someone adds the column.
+    #
+    # COUNTED, NOT ASSUMED: data_access.py issues ZERO statements against this
+    # table -- grep for the name in this file returns only this comment. It is
+    # written only by clinical/migrate.py, which runs as the administrative
+    # principal and never through DataAccess, and read there and by
+    # clinical/app.py's readiness probe. The application role is granted SELECT
+    # on it and REVOKEd INSERT, UPDATE and DELETE by
+    # clinical/migrations/0001_schema_migrations.sql, so clinical_app cannot
+    # write deployment state even by a route this list does not police.
+    "schema_migrations": (
+        "No org_id column exists on this table, and none could: its rows are deployment "
+        "facts about the database as a whole -- which migration ran, over which bytes, "
+        "when and as whom -- and a schema is at one version, not at one version per "
+        "organisation. data_access.py issues zero statements against it, counted, not "
+        "assumed; it is written only by clinical/migrate.py as the administrative "
+        "principal, and clinical_app holds SELECT on it with INSERT, UPDATE and DELETE "
+        "revoked, so the application cannot forge its own version."
+    ),
 }
 
 

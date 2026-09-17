@@ -124,12 +124,36 @@ def _staff_session(dao, conn, org_id, email, *, administrator=True):
     user_id = dao.create_user(org_id, email, "correct horse battery staple")
     if administrator:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-                "VALUES (%s, %s, 'Administrator', %s, %s)",
-                (user_id, org_id, user_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
-            )
+            for role in ("Administrator", "Orderer"):
+                cur.execute(
+                    "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (user_id, org_id, role, user_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+                )
     return dao.login(email, org_id, "correct horse battery staple")
+
+
+def _place_order(dao, conn, staff_session, patient_id, scope="genomic-testing"):
+    """A REAL order for a patient, placed through the real create_order.
+
+    The `tests` row is inserted directly because DataAccess has no creator for
+    it -- the same thing clinical/tests/test_clinical_domain.py does.
+    """
+    test_id = uuid.uuid4()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tests (test_id, org_id, name, assembly, status, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                test_id,
+                staff_session.org_id,
+                "Whole genome",
+                "GRCh38",
+                "active",
+                dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc),
+            ),
+        )
+    consent_id = dao.record_consent(staff_session, patient_id, scope)
+    return dao.create_order(staff_session, patient_id, test_id, scope, consent_id)
 
 
 @pytest.fixture()
@@ -647,6 +671,226 @@ class TestAPatientSessionIsRefusedByStaffOperations:
         it would be a patient issuing credentials."""
         with pytest.raises(AuthorizationError):
             dao.enrol_patient_login(alice_session, patient_a2, "hijack@portal.example", PASSWORD)
+
+
+def _my_record(dao, session, supplied_patient_id):
+    """
+    Ask for the session's patient record while SUPPLYING a patient id.
+
+    Written to work against both implementations on purpose. The wrong version
+    takes the id and binds it; the right version has no such parameter at all
+    and raises TypeError, so the call falls back to the argument-free form.
+    Either way the QUESTION is the same -- "can a supplied id change the
+    answer?" -- and only one of the two implementations answers it correctly.
+    """
+    try:
+        return dao.get_my_patient_record(session, supplied_patient_id)
+    except TypeError:
+        return dao.get_my_patient_record(session)
+
+
+@requires_db
+class TestPatientIdentityComesFromTheSession:
+    """
+    DECISION 6, AND THE REASON THIS WAVE EXISTS.
+
+    THE TEST THAT CATCHES IT IS THE MOST EASILY FAKED TEST HERE. Passing a
+    patient id that MATCHES the session proves nothing -- both the right and
+    the wrong implementation return the right record for it. Passing a
+    cross-ORGANISATION id proves nothing either -- the org predicate refuses
+    that in both implementations too.
+
+    It must pass a DIFFERENT, REAL, SAME-ORGANISATION patient's id, and assert
+    that the answer is about the SESSION's patient. Bob is that patient: he is
+    created by the same staff session in the same organisation as Alice, he has
+    a real row, and he is reachable by any staff session in org_a.
+    """
+
+    def test_a_supplied_patient_id_cannot_override_the_session(self, dao, alice_session, patient_a, patient_a2, conn):
+        """
+        Alice's session, Bob's real id. The answer must be ALICE.
+
+        The guards below make this test unfakeable by accident: Bob must
+        really exist, must be in the same organisation, and must not be Alice.
+        Without them a fixture change could quietly turn this into a test that
+        passes the session's own id back to itself.
+        """
+        assert patient_a != patient_a2
+        with conn.cursor() as cur:
+            cur.execute("SELECT org_id, name FROM patients WHERE patient_id = %s", (patient_a2,))
+            bob_org, bob_name = cur.fetchone()
+        assert bob_org == alice_session.org_id, "Bob must be in the SAME organisation or this proves nothing"
+        assert bob_name == "Bob Brown"
+
+        record = _my_record(dao, alice_session, patient_a2)
+
+        assert record["patient_id"] == patient_a, (
+            "the supplied patient id overrode the session -- the patient is being bound from the "
+            "caller's argument, which is the one failure this wave exists to prevent"
+        )
+        assert record["name"] == "Alice Anderson"
+
+    def test_the_method_takes_no_patient_identifier_at_all(self, dao):
+        """
+        The structural form of the same rule, and the stronger one: if the
+        parameter does not exist, the class of bug where it is passed through
+        unvalidated cannot exist.
+
+        Derived from the DECLARED signature rather than from a hand-written
+        list of method names, so a portal method added later is covered the day
+        it is written -- the same reasoning that made the org coverage guard
+        derive its census from schema.sql.
+
+        READ FROM THE AST, AND THAT IS NOT A STYLE CHOICE. The first version of
+        this test used inspect.signature, and it PASSED AGAINST THE WRONG
+        IMPLEMENTATION -- `auditable` does not apply functools.wraps, so its
+        wrapper reports `(self, *args, **kwargs)` and every parameter name is
+        invisible at run time. A cannot-fail test in exactly the shape the
+        Phase 5d incident recorded. The AST reads what is written.
+        """
+        import ast
+
+        source = (pathlib.Path(__file__).resolve().parent.parent / "data_access.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        portal = [
+            node
+            for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "DataAccess"]
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and (node.name.startswith("get_my_") or node.name.startswith("list_my_"))
+        ]
+        assert portal, "no portal methods found -- this guard would pass vacuously"
+
+        offenders = []
+        for node in portal:
+            names = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
+            leaked = [n for n in names if "patient" in n and n not in ("self", "patient_session")]
+            if leaked:
+                offenders.append(f"{node.name}{tuple(leaked)}")
+        assert not offenders, (
+            "patient-facing method(s) taking a patient identifier as an argument: "
+            f"{offenders}. A patient-facing method must bind the patient from the session."
+        )
+
+    def test_bob_reaches_his_own_record_from_his_own_session(self, dao, bob_session, patient_a2):
+        """
+        Rule 4's positive twin, and it is load-bearing here. Without it, a
+        get_my_patient_record that ALWAYS returned Alice -- or that always
+        returned nothing -- would satisfy the test above perfectly.
+        """
+        assert _my_record(dao, bob_session, patient_a2)["patient_id"] == patient_a2
+
+    def test_a_supplied_id_cannot_reach_across_organisations_either(self, dao, alice_session, patient_a, patient_b):
+        """
+        right patient + wrong organisation, and wrong patient + wrong
+        organisation collapse to the same thing under the portal surface: the
+        answer follows the session in both axes at once.
+        """
+        record = _my_record(dao, alice_session, patient_b)
+        assert record["patient_id"] == patient_a
+
+    def test_the_orders_list_follows_the_session_and_not_the_argument(
+        self, dao, conn, staff_a, alice_session, bob_session, patient_a, patient_a2
+    ):
+        """
+        The same rule on a JOINED read, with REAL orders on both sides.
+
+        The patient axis downstream is only available by anchoring on
+        `patients`: only four tables carry a patient_id column and `orders` is
+        one of them, but samples, runs, VCFs, interpretations and reports are
+        not.
+
+        THE ASSERTION IS ON CONTENT, NOT ON A COUNT (Rule 4). Alice must see
+        HER order id and must NOT see Bob's -- and Bob's must be a real order
+        that a staff session in the same organisation really can see, which is
+        what the last assertion checks. A count-only test is satisfied by a
+        query that returns one wrong row.
+        """
+        alice_order = _place_order(dao, conn, staff_a, patient_a)
+        bob_order = _place_order(dao, conn, staff_a, patient_a2)
+        assert alice_order != bob_order
+
+        def ids(session, supplied):
+            try:
+                rows = dao.list_my_test_orders(session, supplied)
+            except TypeError:
+                rows = dao.list_my_test_orders(session)
+            return {r["order_id"] for r in rows}
+
+        # Alice's session, asking with BOB'S id.
+        alice_view = ids(alice_session, patient_a2)
+        assert alice_order in alice_view
+        assert bob_order not in alice_view, (
+            "Bob's order reached Alice's portal view -- the supplied patient id overrode the session"
+        )
+
+        # The positive twin, twice over: Bob really does see his own order,
+        # and a staff session really can see both, so "absent" above means
+        # "scoped out" rather than "never written".
+        bob_view = ids(bob_session, patient_a2)
+        assert bob_view == {bob_order}
+        assert dao.get_order(staff_a, bob_order)["order_id"] == bob_order
+
+    def test_every_portal_statement_binds_the_patient_from_the_session(self):
+        """
+        THE DERIVED GUARD FOR THE NEW AXIS (the design's Q8 rule 4).
+
+        A hand-written tuple of method names here would reproduce w129's GAP-3
+        on the patient axis: the guard falls silent about the one method
+        somebody forgot to name. So the surface is derived from the class, and
+        every SQL statement a portal method issues must bind
+        patient_session.patient_id.
+        """
+        import ast
+
+        source = (pathlib.Path(__file__).resolve().parent.parent / "data_access.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        portal = [
+            node
+            for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "DataAccess"]
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and (node.name.startswith("get_my_") or node.name.startswith("list_my_"))
+        ]
+        assert portal, "no portal methods found -- this guard would pass vacuously"
+
+        offenders = []
+        for node in portal:
+            body = ast.unparse(node)
+            statements = [
+                " ".join(c.value.split())
+                for c in ast.walk(node)
+                if isinstance(c, ast.Constant)
+                and isinstance(c.value, str)
+                and any(kw in c.value for kw in ("SELECT ", "UPDATE ", "INSERT INTO", "DELETE FROM"))
+            ]
+            for sql in statements:
+                if "patient_id" not in sql:
+                    offenders.append(f"{node.name}: statement does not mention patient_id: {sql}")
+            if "patient_session.patient_id" not in body:
+                offenders.append(f"{node.name}: never binds patient_session.patient_id")
+        assert not offenders, "portal method(s) not bound to the session's patient:\n  " + "\n  ".join(offenders)
+
+
+@requires_db
+class TestAStaffSessionIsNotAPatientSession:
+    """DECISION 8: patient access is explicit. A staff session does not become
+    a patient session by being handed to a portal method."""
+
+    def test_a_staff_session_is_refused_by_the_portal_surface(self, dao, staff_a, patient_a):
+        with pytest.raises(AuthorizationError):
+            _my_record(dao, staff_a, patient_a)
+
+    def test_a_staff_session_is_refused_by_the_portal_orders_list(self, dao, staff_a, patient_a):
+        with pytest.raises(AuthorizationError):
+            try:
+                dao.list_my_test_orders(staff_a, patient_a)
+            except TypeError:
+                dao.list_my_test_orders(staff_a)
+
+    def test_the_positive_twin_a_patient_session_is_accepted(self, dao, alice_session, patient_a):
+        assert _my_record(dao, alice_session, patient_a)["patient_id"] == patient_a
 
 
 class TestTheGuardRailsCoverTheNewTables:

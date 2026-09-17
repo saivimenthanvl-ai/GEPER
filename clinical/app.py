@@ -54,6 +54,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from clinical.endpoints import router
+from clinical.portal_endpoints import router as portal_router
 
 _DSN_ENV = "CLINICAL_DSN"
 
@@ -75,6 +76,15 @@ app = FastAPI(
 )
 
 app.include_router(router)
+
+# w130. The patient portal, mounted ALONGSIDE the staff router and never
+# through it. Its routes depend on _get_patient_session, which is a separate
+# dependency reading a separate cookie and validating against a separate
+# session table -- clinical.endpoints._get_session is neither imported by it
+# nor widened. See clinical/portal_endpoints.py for why the alternative (one
+# dependency accepting either principal) is the cheap move that silently
+# destroys per-patient isolation.
+app.include_router(portal_router)
 
 
 @app.get("/healthz", tags=["health"], summary="Liveness probe")

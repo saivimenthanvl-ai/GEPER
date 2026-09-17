@@ -2068,6 +2068,134 @@ class DataAccess:
             "disabled": row[5],
         }
 
+    # ── the portal read surface: THE SECOND AXIS OF ISOLATION (w130) ─────────
+    #
+    # THE ONE RULE, AND EVERY METHOD BELOW OBEYS IT:
+    #
+    #     The patient is bound FROM THE SESSION. It is never an argument.
+    #
+    # NOT a comparison. Not `if requested_patient_id != session.patient_id:
+    # raise`. A value read from the session and never from a caller argument is
+    # STRUCTURAL; a comparison is REMEMBERED, and every tenancy property in
+    # this codebase was built the first way -- see Session's own docstring,
+    # which says org_id "is read from here and never from a caller argument,
+    # which is what makes the isolation structural rather than remembered".
+    #
+    # THE PARAMETER DOES NOT EXIST, which is the strong form of the rule: if a
+    # patient id cannot be passed in, the class of bug where it is passed in
+    # unvalidated cannot exist.
+    #
+    # MEASURED, NOT ARGUED. The version of these two methods that took
+    # `patient_id` as an argument and bound only org_id PASSED 41 OF 46 TESTS
+    # in this file. It passed every cross-organisation test, every
+    # authentication test, every enrolment test, every decision-7 test, and it
+    # returned the right record whenever the supplied id happened to match the
+    # session. The five it failed are the five that hand it a DIFFERENT, REAL,
+    # SAME-ORGANISATION patient's id.
+    #
+    # EVERY READ ANCHORS ON `patients`. Only four tables carry a patient_id
+    # column -- patients, external_identifiers, consents, orders -- so anything
+    # further downstream is reachable only by joining back up to `patients` and
+    # binding both org_id and patient_id at the anchor. patient_id is
+    # deliberately NOT denormalised onto samples, runs, VCFs, interpretations
+    # or reports.
+
+    def _require_patient_session(self, session: Any) -> None:
+        """
+        DECISION 8: a staff session does not automatically become a patient
+        session. Patient access is explicit.
+
+        A Session and a PatientSession both carry org_id, so a staff session
+        handed to a portal method would duck-type into the org predicate and
+        then fail on the missing patient_id attribute with an AttributeError --
+        an accident that looks like a bug rather than a refusal. This makes it
+        a refusal.
+        """
+        if not isinstance(session, PatientSession):
+            raise AuthorizationError(
+                "This is a patient portal operation and requires a patient session. A staff "
+                "session does not automatically become a patient session."
+            )
+
+    @auditable(
+        action="portal_patient_record_read",
+        resource_type="patient",
+        requires_session=False,
+        auditable=False,
+        reason="every patient-record reader in this layer is auditable=False, and whether a patient "
+        "portal changes that is an OPEN RULING -- it is one decision covering get_patient, get_order, "
+        "get_consent, get_sample and the held find_variant_trends_for_patient, and it changes the "
+        "trends endpoint's stated two-round-trip cost. Deciding it here, for one method, would settle "
+        "by accident a question that needs settling on purpose",
+    )
+    @transactional
+    def get_my_patient_record(self, patient_session: "PatientSession") -> dict[str, Any]:
+        """
+        The authenticated patient's own record. TAKES NO PATIENT IDENTIFIER.
+
+        Returns name, date of birth and sex, because that is the whole of what
+        a `patients` row holds. There is no contact detail on it and no report
+        content anywhere in this schema -- `reports` has no content column, so
+        "view my report" is not a route waiting to be written.
+        """
+        self._require_patient_session(patient_session)
+        row = self._query_one(
+            "SELECT patient_id, name, dob, sex, created_at FROM patients WHERE patient_id = %s AND org_id = %s",
+            # BOTH bound from the session. The org predicate answers "which
+            # organisation?" and the patient predicate answers "which patient?"
+            # -- in the same position, with the same status.
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        if row is None:
+            # Reachable only if the patient row was removed under a live
+            # session. The same constant every other patient-axis miss uses.
+            raise NotFoundError(PATIENT_NOT_FOUND)
+        return {
+            "patient_id": row[0],
+            "name": row[1],
+            "dob": row[2],
+            "sex": row[3],
+            "created_at": row[4],
+        }
+
+    @auditable(
+        action="portal_orders_read",
+        resource_type="order",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def list_my_test_orders(self, patient_session: "PatientSession") -> list[dict[str, Any]]:
+        """
+        The authenticated patient's own test orders. TAKES NO PATIENT
+        IDENTIFIER.
+
+        ANCHORED ON `patients`, not on `orders`. orders does carry patient_id,
+        so the join is not strictly required for this one table -- it is
+        written this way because it is the shape every deeper portal read will
+        need, and because the anchor is where both predicates are bound.
+
+        WHAT IS DELIBERATELY NOT RETURNED: `orders.state`. Three of its seven
+        declared values -- in_progress, reported, closed -- are written by no
+        code anywhere in this repository, so an order stalls at sample_awaited
+        however far the pipeline actually got. A patient progress indicator
+        driven off that column would show every completed case as "awaiting
+        sample". What a patient is shown for status is a ruling; returning the
+        column and letting a caller render it would be shipping the wrong
+        answer under a correct-looking field name.
+        """
+        self._require_patient_session(patient_session)
+        rows = self._query(
+            "SELECT o.order_id, o.created_at, o.placed_at, o.cancelled_at "
+            "FROM orders o "
+            "JOIN patients p ON p.patient_id = o.patient_id AND p.org_id = o.org_id "
+            "WHERE p.patient_id = %s AND p.org_id = %s "
+            "ORDER BY o.created_at",
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        return [{"order_id": r[0], "created_at": r[1], "placed_at": r[2], "cancelled_at": r[3]} for r in rows]
+
     # ── patient authentication and patient sessions (w130) ───────────────────
     #
     # THE SAME MECHANISM OVER A SECOND PRINCIPAL TABLE. Not a second

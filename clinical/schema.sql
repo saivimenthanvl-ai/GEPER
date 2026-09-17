@@ -329,8 +329,10 @@ CREATE UNIQUE INDEX external_identifiers_unique
 -- A PATIENT IS A PRINCIPAL, AND IT IS NOT A `users` ROW. Not because of roles
 -- -- a roleless `users` row is legal and is what create_user produces -- but
 -- because of what a `users` row is STRUCTURALLY ELIGIBLE for. Counted at
--- ca183d3: `REFERENCES users` occurs 22 times in this file, and nineteen of
--- those are clinical-record actor columns, including reports.created_by and
+-- ca183d3, BEFORE this table existed: `REFERENCES users` occurred 22 times in
+-- this file (patient_logins_enroller_fk below is the twenty-third, and it is
+-- correctly a staff reference -- the enroller IS staff). Nineteen of the
+-- twenty-two are clinical-record actor columns, including reports.created_by and
 -- reports.approver_id. A patient placed in `users` is a database-legal report
 -- approver, and the only thing refusing it would be a Python check -- the
 -- exact shape this schema records as a defect elsewhere (see the note on

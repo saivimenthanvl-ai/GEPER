@@ -59,7 +59,7 @@ from clinical.data_access import (
     NotFoundError,
     PatientSession,
 )
-from clinical.endpoints import _get_data_access
+from clinical.endpoints import _anonymous_refusal, _get_data_access
 
 router = APIRouter(prefix="/portal", tags=["portal"])
 
@@ -101,9 +101,38 @@ class PortalOrderItem(BaseModel):
     cancelled_at: Optional[str] = None
 
 
-def _get_patient_session(
+def _presented_patient_session_id(
     authorization: str = Header(default=""),
     clinical_patient_session: str = Cookie(default="", alias=_PATIENT_SESSION_COOKIE),
+) -> uuid.UUID:
+    """
+    The opaque patient session id the caller presented, or 401 — AND NOTHING
+    ELSE HAPPENS HERE. w132 fix B, the patient mirror of
+    `clinical.endpoints._presented_session_id`, and a mirror rather than an
+    import for the same reason the dependency below is one: the staff module's
+    version reads the staff cookie.
+
+    NO DATABASE IS TOUCHED. Declared first in the dependency below, so a
+    caller with no cookie and no bearer header is refused before a connection
+    is opened. A caller who presents a well-formed id cannot be refused
+    without a read, and for that caller the guarantee is that every refusal is
+    the same `_anonymous_refusal` — same status, same body — whatever the
+    database's state.
+    """
+    raw = clinical_patient_session
+    if not raw and authorization.lower().startswith("bearer "):
+        raw = authorization[len("bearer ") :].strip()
+    if not raw:
+        raise _anonymous_refusal()
+
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        raise _anonymous_refusal()
+
+
+def _get_patient_session(
+    session_id: uuid.UUID = Depends(_presented_patient_session_id),
     dao: DataAccess = Depends(_get_data_access),
 ) -> PatientSession:
     """
@@ -121,21 +150,10 @@ def _get_patient_session(
     `_get_session` IS NOT IMPORTED AND IS NOT WIDENED. This function exists so
     that it does not have to be.
     """
-    raw = clinical_patient_session
-    if not raw and authorization.lower().startswith("bearer "):
-        raw = authorization[len("bearer ") :].strip()
-    if not raw:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=GENERIC_AUTH_ERROR)
-
-    try:
-        session_id = uuid.UUID(raw)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=GENERIC_AUTH_ERROR)
-
     try:
         return dao.patient_session_valid(session_id)
     except AuthenticationError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=GENERIC_AUTH_ERROR)
+        raise _anonymous_refusal()
 
 
 @router.get("/me", response_model=PortalPatientResponse, summary="The authenticated patient's own record")

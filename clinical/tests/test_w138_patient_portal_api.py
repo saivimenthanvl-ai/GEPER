@@ -62,12 +62,30 @@ assert on CONTENT (the right patient's own id and name, not a bare 200), and
 each one's docstring names the wrong version it exists to catch. NEITHER HALF
 OF A PAIR MAY BE DELETED WITHOUT THE OTHER.
 
-WHAT THIS FILE DELIBERATELY DOES NOT TEST, because it does not exist at
-a931869 and inventing it is what the queue forbids: a patient report route
+WHAT THIS FILE DELIBERATELY DID NOT TEST AT a931869, because none of it existed
+there and inventing it is what the queue forbids: a patient report route
 (`reports` has no content column), a patient status field (`orders.state` has
 seven values and three have no writer anywhere), patient trends (held on
-w127-trends), and any administrative route (there are zero in this repository
-and the brief puts the first one out of scope).
+w127-trends), and any administrative route.
+
+TWO OF THOSE FOUR HAVE SINCE BEEN ANSWERED, AND THE PARAGRAPH IS CORRECTED
+RATHER THAN LEFT STANDING (Rule 3: fix the claim, not the code) -- because this
+is a file an implementer reads to learn what the portal surface is, and a stale
+"there is no report route" is how one gets written twice.
+
+  * w134 answered the STATUS question without widening the surface: the
+    `stages` list is a DERIVED field on an existing response body, and
+    `orders.state` is still returned nowhere.
+  * w135 answered the REPORT question by widening it, to
+    `GET /portal/me/reports` and `GET /portal/me/reports/{report_id}`. THE
+    PARENTHESIS ABOVE IS STILL TRUE AND IS THE REASON THOSE ROUTES ARE SAFE:
+    `reports` still has no content column, so what they carry is metadata and
+    release state. Both are in AUTHENTICATED_PORTAL_ROUTES below and so are in
+    this file's set of size one; their own behavioural rows are in
+    test_w135_patient_report_access.py.
+
+Patient trends and administrative routes remain absent, and both are still
+asserted to be absent below.
 """
 
 from __future__ import annotations
@@ -97,12 +115,21 @@ CLIENT_IP = "203.0.113.11"
 # the constant rather than from a string literal copied out of a response.
 THE_REFUSAL = (401, json.dumps({"detail": "Authentication failed."}, separators=(",", ":")).encode())
 
-# The three authenticated portal routes and how to call each. The logout route
+# The FIVE authenticated portal routes and how to call each. The logout route
 # is here ON PURPOSE: it is the one whose success is a 204 rather than a 200,
 # which is exactly the sort of route a refusal set quietly omits.
+#
+# w135 added the last two. `{report_id}` is filled with a fixed, real-shaped
+# UUID that names nothing: every case in this file is a REFUSED credential, so
+# the handler never runs and the id is never looked up. Its only job is to make
+# the path routable.
+A_REPORT_ID_THAT_NAMES_NOTHING = "1d1c51e4-9e31-4a0d-8a2f-0b6f4cbe7a51"
+
 AUTHENTICATED_PORTAL_ROUTES = (
     ("GET", "/portal/me"),
     ("GET", "/portal/me/tests"),
+    ("GET", "/portal/me/reports"),
+    ("GET", f"/portal/me/reports/{A_REPORT_ID_THAT_NAMES_NOTHING}"),
     ("POST", "/portal/logout"),
 )
 
@@ -669,7 +696,7 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
             "a session past its idle window": {PATIENT_COOKIE: idle},
         }
 
-    def test_eight_cases_on_three_routes_are_one_pair(self, client, dao, conn, world):
+    def test_eight_cases_on_five_routes_are_one_pair(self, client, dao, conn, world):
         """
         Catches: an oracle introduced on `/portal/me/tests` or
         `/portal/logout` -- the two routes in NO set at a931869. A
@@ -683,7 +710,7 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
         """
         cases = self._cases(client, dao, conn, world)
         assert len(cases) == 8, "the case list shrank -- this row would prove less than it claims"
-        assert len(AUTHENTICATED_PORTAL_ROUTES) == 3, "a portal route left the list without being probed"
+        assert len(AUTHENTICATED_PORTAL_ROUTES) == 5, "a portal route left the list without being probed"
 
         observed = {}
         for name, cookies in cases.items():
@@ -691,7 +718,10 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
                 response = _call(client, method, path, cookies)
                 observed[f"{name} | {method} {path}"] = (response.status_code, response.content)
 
-        assert len(observed) == 24, observed
+        # 8 x 5. Was 8 x 3 at 863f07e; w135 added the two report routes to the
+        # list, so the same eight credential states now collapse forty
+        # observations into one pair instead of twenty-four.
+        assert len(observed) == 40, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 
@@ -716,12 +746,13 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
     def test_the_positive_twin_a_live_session_is_not_in_that_set_on_any_route(self, client, world):
         """
         Without this, "everything is the one refusal" is satisfied perfectly by
-        a portal that refuses everything, on all three routes at once.
+        a portal that refuses everything, on every route at once.
 
         Catches exactly that, and asserts each route's OWN success shape --
-        /portal/me returns Alice's record, /portal/me/tests returns a list,
-        /portal/logout returns 204 -- because "not the refusal pair" alone
-        would be satisfied by three different 500s.
+        /portal/me returns Alice's record, /portal/me/tests and
+        /portal/me/reports return lists, /portal/logout returns 204 -- because
+        "not the refusal pair" alone would be satisfied by four different
+        500s.
 
         NEITHER THIS ROW NOR THE SET ROW MAY BE DELETED WITHOUT THE OTHER.
         """
@@ -737,6 +768,18 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
         assert tests.status_code == 200, tests.text
         assert tests.json() == []
 
+        reports = client.get("/portal/me/reports", cookies={PATIENT_COOKIE: cookie})
+        assert (reports.status_code, reports.content) != THE_REFUSAL
+        assert reports.status_code == 200, reports.text
+        assert reports.json() == []
+
+        # `GET /portal/me/reports/{report_id}` IS DELIBERATELY NOT TWINNED
+        # HERE, and the omission is the point rather than an oversight: for a
+        # live session asking after a report id that names nothing, THE
+        # REFUSAL IS THE CORRECT ANSWER -- that is exactly how w135 keeps a
+        # nonexistent report indistinguishable from another patient's. Its
+        # positive twin needs a really-released report, so it lives in
+        # test_w135_patient_report_access.py, where one can be built.
         logout = client.post("/portal/logout", cookies={PATIENT_COOKIE: cookie})
         assert (logout.status_code, logout.content) != THE_REFUSAL
         assert logout.status_code == 204, logout.text
@@ -745,7 +788,7 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
 # ─── 4. the surface itself: what is served, and what accepts an identifier ───
 
 
-class TestThePatientSurfaceIsFourRoutesAndAcceptsNoPatientIdentifier:
+class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
     """
     The census, as a test rather than as a sentence in a document.
 
@@ -764,11 +807,11 @@ class TestThePatientSurfaceIsFourRoutesAndAcceptsNoPatientIdentifier:
             children = getattr(route, "routes", None)
             if original is not None:
                 context = getattr(route, "include_context", None)
-                leaves += TestThePatientSurfaceIsFourRoutesAndAcceptsNoPatientIdentifier._walk(
+                leaves += TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier._walk(
                     original.routes, prefix + (getattr(context, "prefix", "") if context else "")
                 )
             elif children:
-                leaves += TestThePatientSurfaceIsFourRoutesAndAcceptsNoPatientIdentifier._walk(
+                leaves += TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier._walk(
                     children, prefix + getattr(route, "path", "")
                 )
             else:
@@ -803,16 +846,30 @@ class TestThePatientSurfaceIsFourRoutesAndAcceptsNoPatientIdentifier:
         offenders = [path for path, _ in self._leaves(clinical_dsn) if "{patient" in path]
         assert not offenders, f"served route(s) naming a patient in the path: {offenders}"
 
-    def test_the_patient_surface_is_exactly_these_four_routes(self, clinical_dsn):
+    def test_the_patient_surface_is_exactly_these_six_routes(self, clinical_dsn):
         """
         NOT a hard-coded total used as proof of future safety (the queue
         forbids that) -- an EXPLICIT SET, so the failure message names what
-        arrived or left. A fifth patient route is a thing somebody must look
-        at: it is either a report route, a status route or a trends route, and
-        all three are open product rulings at this SHA.
+        arrived or left. A SEVENTH patient route is a thing somebody must look
+        at: the report routes arrived in w135 and were counted here, the
+        status question was answered in w134 by widening a BODY rather than
+        the surface, and trends remains an open product ruling held on
+        w127-trends.
         """
         served = {path for path, _ in self._leaves(clinical_dsn) if path.startswith("/portal")}
-        assert served == {"/portal/login", "/portal/logout", "/portal/me", "/portal/me/tests"}, served
+        assert served == {
+            "/portal/login",
+            "/portal/logout",
+            "/portal/me",
+            "/portal/me/tests",
+            # w135. Metadata and release state only -- `reports` has no content
+            # column, so there is no document here to expose. The report id in
+            # the second is a RESOURCE identifier; the patient is still bound
+            # from the session and `{patient` still appears in no served path,
+            # which the row above asserts.
+            "/portal/me/reports",
+            "/portal/me/reports/{report_id}",
+        }, served
 
     def test_there_are_still_no_administrative_routes(self, clinical_dsn):
         """

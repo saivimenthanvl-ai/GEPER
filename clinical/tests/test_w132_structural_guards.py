@@ -413,6 +413,13 @@ class TestTheRouteCensus:
             ("/exceptions/{exception_id}", ("PATCH",)),
             ("/portal/me", ("GET",)),
             ("/portal/me/tests", ("GET",)),
+            # w135. The two patient report routes. They carry METADATA AND
+            # RELEASE STATE and nothing else, because `reports` has no content
+            # column — see clinical/portal_endpoints.py's header. The second is
+            # the only route on the patient surface that takes an identifier
+            # from the caller, and it is a RESOURCE id, never an identity one.
+            ("/portal/me/reports", ("GET",)),
+            ("/portal/me/reports/{report_id}", ("GET",)),
             ("/auth/login", ("POST",)),
             ("/portal/login", ("POST",)),
             # w132c. The two logout routes. They are NOT on the auth router:
@@ -438,7 +445,11 @@ class TestTheRouteCensus:
         from clinical.app import app
 
         census = served_routes(app)
-        assert len(census) == 11, census
+        # 11 at 863f07e; 13 from w135, which added the two patient report
+        # routes. The number is checked against the EXPECTED set above, which
+        # is what actually names them — this row exists only to refuse the
+        # empty and wrapper-shaped answers.
+        assert len(census) == 13, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

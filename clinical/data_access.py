@@ -113,6 +113,16 @@ GENERIC_AUTH_ERROR = "Authentication failed."
 # three are the same sentence, carrying no identifier.
 PATIENT_NOT_FOUND = "Patient not found."
 
+# w135. The one refusal the patient report surface produces, wherever it is
+# produced, for the same reason PATIENT_NOT_FOUND is one constant. FIVE
+# distinguishable conditions collapse onto this sentence: no such report, a
+# report belonging to another patient, a report in another organisation, and
+# the caller's OWN report in a state that has not been released -- draft,
+# under_review, approved-not-yet-released, or returned. The last of those is
+# the one worth naming: "your report exists but you may not have it yet" is a
+# clinical fact, and the release gate exists to withhold exactly that.
+REPORT_NOT_FOUND = "Report not found."
+
 
 # ─── w134: the patient-visible progress vocabulary, and what it refuses ──────
 #
@@ -2602,6 +2612,187 @@ class DataAccess:
             }
             for r in rows
         ]
+
+    # ── w135: the patient's own RELEASED reports ─────────────────────────────
+    #
+    # WHAT A RELEASED REPORT CONSISTS OF IN THIS MODEL, STATED AS A
+    # MEASUREMENT BEFORE ANYTHING IS RETURNED. `reports` carries org_id, id,
+    # interpretation_id, created_at, created_by, state, approver_id,
+    # approved_at, content_hash, tombstoned_at, tombstoned_by and
+    # retention_days -- and NO CONTENT COLUMN. A `reports` row is a governance
+    # record ABOUT a document, not the document. The document itself is
+    # rendered outside this schema, from `interpretations.run_document`, by
+    # geper/report/clinical_report_builder.py, and is not stored here in any
+    # form.
+    #
+    # SO THE TWO METHODS BELOW RETURN METADATA AND RELEASE STATE, AND THAT IS
+    # THE WHOLE OF WHAT THERE IS TO RETURN. This is not a reduced version of a
+    # richer surface: there is no richer surface in this schema, and inventing
+    # report-content storage to make one is the thing the brief forbids.
+    #
+    # WHY `run_document` IS NOT THE SUBSTITUTE, and this is the one edge a
+    # future implementer will be tempted by. `get_interpretation` returns the
+    # entire raw run_document with NO report-state check at all -- so routing a
+    # patient through it would hand out the unapproved pipeline output of a
+    # DRAFT report, which is precisely the "raw result data must not bypass
+    # report-release rules" failure. Neither method below reads
+    # `interpretations`, `vcfs`, `variants` or `run_document`, and neither
+    # returns `interpretation_id`: an interpretation id is the handle that
+    # addresses raw pipeline output, and handing it to a patient makes the
+    # bypass one route away instead of zero.
+    #
+    # THE RELEASE REQUIREMENT, AND WHY `require_release` IS NOT CALLED HERE.
+    # `require_release` is the gate every STAFF delivery path calls, and since
+    # w129 phase B it is an AUTHORITY gate as well as a state gate: its first
+    # line is `self._require_role(session, "Approver")`. A patient never holds
+    # Approver and never will, so calling it from a patient read would either
+    # refuse every patient or require weakening the gate -- and weakening it is
+    # forbidden. These methods do not re-implement it either. They read the
+    # RECORDED OUTCOME of a release that already happened: a `release_events`
+    # row, written by `_release_report` behind that same Approver gate, for a
+    # report whose own state says `released`. That is strictly NARROWER than
+    # `require_release` admits (it passes `approved` as well), and narrower is
+    # the safe direction.
+    #
+    # NOTHING IN THIS REPOSITORY CALLS `_release_report`. COUNTED at d6246cd,
+    # non-test callers: ZERO (the one grep hit is prose in
+    # geper/review/signoff.py). So in THIS deployment no report ever reaches
+    # `released` and both methods below return nothing for everybody, for ever.
+    # They are still correct, and they are tested by driving `_release_report`
+    # itself; what cannot be demonstrated is a production path that reaches
+    # them. Recorded here rather than implied.
+    #
+    # RETRACTION IS NOT FILTERED HERE BECAUSE THERE IS NOTHING TO FILTER.
+    # COUNTED at d6246cd: `report_retractions` does not exist in schema.sql,
+    # and `clinical/data_access.py` has no unapprove/retract/rescind method --
+    # enforce_content_immutability() FORBIDS walking an approved report back at
+    # the database. The retraction model is held, unmerged, on w122-retraction,
+    # and its human rulings settle the reader question in the opposite
+    # direction from hiding: E7 says a retracted report must NOT become
+    # unfindable, and E3 says retraction does not refuse at the release gate --
+    # the retraction TRAVELS with the document instead. So the forward-safe
+    # shape for this surface is exactly the one below: filter on RELEASE, never
+    # on retraction, and let whoever merges w122 add the flag. A hiding
+    # predicate added here now would have to be removed then.
+
+    @auditable(
+        action="portal_reports_read",
+        resource_type="report",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def list_my_released_reports(self, patient_session: "PatientSession") -> list[dict[str, Any]]:
+        """
+        Every RELEASED report belonging to the authenticated patient. TAKES NO
+        PATIENT IDENTIFIER, and takes no identifier of any other kind either.
+
+        ANCHORED ON `patients`, like every other portal read: both predicates
+        are bound at the anchor, from the session, and the chain
+        orders -> samples -> sequencing_runs -> vcfs -> interpretations ->
+        reports is walked with the composite (org_id, id) keys the schema
+        declares, so no hop can cross an organisation even if a bare id
+        repeated.
+
+        THE RELEASE PREDICATE IS TWO CONDITIONS, NOT ONE, and the second is
+        the load-bearing one. `reports.state = 'released'` is, by
+        `_release_report`'s own docstring, a DERIVED SUMMARY -- "has this
+        report been released at all" -- while `release_events` is the record of
+        who received what and when. A surface that trusted the summary alone
+        would show a report as delivered on the strength of a column the
+        application holds a column-scoped write grant on (schema.sql's
+        `GRANT` block, near the bottom, on `reports`). So the delivery record
+        is required to exist as well.
+
+        THE LATERAL AGGREGATE IS A CORRECTNESS REQUIREMENT, not a performance
+        choice, and it is the same hazard w134 hit one table over: a report
+        released to three consumers has THREE `release_events` rows, and a
+        plain JOIN would return that patient's one report three times.
+
+        `released_at` IS THE FIRST DELIVERY (`min`), which is also the anchor
+        the retention clock uses (ruling D3, clinical/retention.py): re-delivery
+        to a second consumer does not restart it and does not change what the
+        patient is told about when their report was issued.
+
+        WHAT IS DELIBERATELY NOT RETURNED, each with its reason:
+          * `interpretation_id` -- the handle to raw pipeline output (above).
+          * `approver_id` / any approver name -- ISO 15189 7.4.1.5 c) requires
+            the authoriser to be RETRIEVABLE, and it is, from `reports`, by a
+            staff reader. Naming a member of laboratory staff to a patient over
+            an unauthenticated-by-default internet surface is a separate
+            ruling nobody has made.
+          * `content_hash` -- a SHA-256 of content this surface does not carry.
+          * `state` -- every row returned is `released` by construction, so a
+            state field could only ever say one thing.
+          * `tombstoned_at` -- see the module note above and w135's card.
+        """
+        self._require_patient_session(patient_session)
+        rows = self._query(
+            self._MY_RELEASED_REPORTS_SQL + " ORDER BY rel.first_released_at, rep.id",
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        return [{"report_id": r[0], "order_id": r[1], "released_at": r[2]} for r in rows]
+
+    @auditable(
+        action="portal_report_read",
+        resource_type="report",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def get_my_released_report(self, patient_session: "PatientSession", report_id: uuid.UUID) -> dict[str, Any]:
+        """
+        ONE released report of the authenticated patient's, by its id.
+
+        `report_id` IS A RESOURCE IDENTIFIER AND NOT AN IDENTITY. The patient
+        is still bound from the session and is still never an argument: the id
+        below is an extra NARROWING predicate applied AFTER the anchor has
+        already restricted the rows to this patient, in this organisation. It
+        can only ever select from among the caller's own released reports, so
+        supplying somebody else's selects nothing. That is the structural form
+        -- the parameter that would matter, `patient_id`, does not exist here
+        either.
+
+        EVERY MISS RAISES THE SAME NotFoundError WITH THE SAME CONSTANT. A
+        report that does not exist, one belonging to another patient, one in
+        another organisation, and one of the caller's OWN that is still draft,
+        under_review, approved-but-never-released or returned are all one
+        answer. Distinguishing any of them would tell a caller which report ids
+        are real, and "my own unreleased report exists" is the one that leaks a
+        clinical fact the release gate exists to withhold.
+        """
+        self._require_patient_session(patient_session)
+        row = self._query_one(
+            self._MY_RELEASED_REPORTS_SQL + " AND rep.id = %s",
+            (patient_session.patient_id, patient_session.org_id, report_id),
+        )
+        if row is None:
+            raise NotFoundError(REPORT_NOT_FOUND)
+        return {"report_id": row[0], "order_id": row[1], "released_at": row[2]}
+
+    # ONE SQL TEXT, TWO CALLERS. The list and the single-report read must not be
+    # able to disagree about what "released" and "mine" mean: two copies of this
+    # join is two places for an org predicate to be dropped from, and only one
+    # of them is exercised by the isolation tests somebody remembers to write.
+    _MY_RELEASED_REPORTS_SQL = (
+        "SELECT rep.id, o.order_id, rel.first_released_at "
+        "FROM patients p "
+        "JOIN orders o          ON o.org_id = p.org_id  AND o.patient_id = p.patient_id "
+        "JOIN samples s         ON s.org_id = o.org_id  AND s.order_id = o.order_id "
+        "JOIN sequencing_runs r ON r.org_id = s.org_id  AND r.sample_id = s.sample_id "
+        "JOIN vcfs v            ON v.org_id = r.org_id  AND v.sequencing_run_id = r.id "
+        "JOIN interpretations i ON i.org_id = v.org_id  AND i.vcf_id = v.id "
+        "JOIN reports rep       ON rep.org_id = i.org_id AND rep.interpretation_id = i.id "
+        "JOIN LATERAL ("
+        "    SELECT min(re.released_at) AS first_released_at, count(*) AS deliveries "
+        "      FROM release_events re "
+        "     WHERE re.org_id = rep.org_id AND re.report_id = rep.id"
+        ") rel ON rel.deliveries > 0 "
+        "WHERE p.patient_id = %s AND p.org_id = %s "
+        "  AND rep.state = 'released'"
+    )
 
     # ── patient authentication and patient sessions (w130) ───────────────────
     #

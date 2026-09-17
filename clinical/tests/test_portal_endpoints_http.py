@@ -238,16 +238,43 @@ class TestASuppliedPatientIdCannotOverrideTheSession:
 
     def test_there_is_no_route_that_names_a_patient(self):
         """
-        The structural form: no path in the portal router carries a patient
-        parameter, so the URL-editing attack has no URL to edit. Derived from
-        the router rather than from a list of paths somebody maintains.
+        The structural form: no path in the portal router names a PATIENT, so
+        the URL-editing attack has no URL to edit. Derived from the router
+        rather than from a list of paths somebody maintains.
+
+        THIS ROW WAS NARROWED IN w135, AND THE NARROWING IS THE FINDING.
+        Until then it refused ANY path parameter (`"{" in p`) -- which is
+        broader than the sentence above it, and was a free over-approximation
+        for as long as the portal exposed no addressable resource at all. w135
+        added the first one, `GET /portal/me/reports/{report_id}`, and the gap
+        between the check and its own docstring is what showed up.
+
+        A REPORT ID IS NOT A PATIENT ID, and the difference is not a matter of
+        naming. The patient is still bound from the session alone; the report
+        id narrows rows that the session's patient and organisation predicates
+        have ALREADY selected, so it can only ever pick from among the caller's
+        own released reports. Supplying somebody else's selects nothing --
+        which test_w135_patient_report_access.py proves behaviourally, with
+        another patient's REAL released report, in a set of size one.
+
+        SO THE CHECK IS NARROWED TO WHAT IT SAYS, AND NOT WEAKENED TO NOTHING:
+        no portal path may name a patient, AND the paths that do take a
+        parameter are an EXPLICIT SET. A second parameterised route is a thing
+        somebody must look at, and the failure message names it.
         """
         from clinical.portal_endpoints import router
 
         paths = [route.path for route in router.routes]
         assert paths, "the portal router has no routes -- this guard would pass vacuously"
-        offenders = [p for p in paths if "{" in p]
-        assert not offenders, f"portal route(s) taking a path parameter: {offenders}"
+
+        naming_a_patient = [p for p in paths if "{patient" in p]
+        assert not naming_a_patient, f"portal route(s) naming a patient in the path: {naming_a_patient}"
+
+        parameterised = {p for p in paths if "{" in p}
+        assert parameterised == {"/portal/me/reports/{report_id}"}, (
+            f"the set of portal routes taking a path parameter changed: {parameterised}. "
+            "Each one is an addressable resource and needs its own isolation rows."
+        )
 
 
 class TestPortalAuthenticationRefusals:

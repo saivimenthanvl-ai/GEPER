@@ -840,31 +840,77 @@ class TestPatientIdentityComesFromTheSession:
         somebody forgot to name. So the surface is derived from the class, and
         every SQL statement a portal method issues must bind
         patient_session.patient_id.
+
+        WIDENED IN w135, AND WIDENING IT MADE IT STRONGER RATHER THAN WEAKER.
+        Until then every portal method carried its SQL as a literal in its own
+        body, so walking the function was enough. w135's two report readers
+        share ONE statement held in a class attribute -- deliberately, because
+        two copies of a six-table join is two places for an org predicate to be
+        dropped from -- and against that shape the original walk found NO SQL
+        in either method and would have passed them both **vacuously**. It did
+        not fail silently only because a docstring happened to contain the
+        substring it scans for; that was luck, not coverage.
+
+        So the guard now RESOLVES the class-level statements a portal method
+        references, and asserts that every portal method yields at least one
+        SQL statement. A future reader who moves a statement out of a method
+        cannot thereby remove it from this check.
+
+        Docstrings are excluded before scanning. They discuss SQL by nature --
+        the very method that exposed this explains why a write grant on
+        `reports.state` matters -- and a paragraph ABOUT a statement is not a
+        statement.
         """
         import ast
 
         source = (pathlib.Path(__file__).resolve().parent.parent / "data_access.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
 
+        classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "DataAccess"]
         portal = [
             node
-            for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "DataAccess"]
+            for cls in classes
             for node in cls.body
             if isinstance(node, ast.FunctionDef)
             and (node.name.startswith("get_my_") or node.name.startswith("list_my_"))
         ]
         assert portal, "no portal methods found -- this guard would pass vacuously"
 
-        offenders = []
-        for node in portal:
-            body = ast.unparse(node)
-            statements = [
+        # Class-level SQL held as a shared constant, by attribute name.
+        shared = {}
+        for cls in classes:
+            for node in cls.body:
+                if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Constant, ast.BinOp, ast.JoinedStr)):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            shared[target.id] = node.value
+
+        def sql_strings(node):
+            """Every SQL-looking string constant under `node`, docstrings excluded."""
+            skip = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    first = sub.body[0] if sub.body else None
+                    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                        skip.add(id(first.value))
+            return [
                 " ".join(c.value.split())
                 for c in ast.walk(node)
                 if isinstance(c, ast.Constant)
                 and isinstance(c.value, str)
+                and id(c) not in skip
                 and any(kw in c.value for kw in ("SELECT ", "UPDATE ", "INSERT INTO", "DELETE FROM"))
             ]
+
+        offenders = []
+        for node in portal:
+            body = ast.unparse(node)
+            statements = sql_strings(node)
+            for name, value in shared.items():
+                if name in body:
+                    statements += sql_strings(value)
+            if not statements:
+                offenders.append(f"{node.name}: issues no SQL this guard can see -- it would pass vacuously")
             for sql in statements:
                 if "patient_id" not in sql:
                     offenders.append(f"{node.name}: statement does not mention patient_id: {sql}")

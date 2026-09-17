@@ -42,13 +42,19 @@ import uuid
 import pytest
 
 from clinical.data_access import (
+    GENERIC_AUTH_ERROR,
+    MAX_FAILED_LOGIN_ATTEMPTS,
     ORG_SCOPED_TABLES,
     PATIENT_NOT_FOUND,
+    AuthenticationError,
     AuthorizationError,
     BcryptHasher,
     DataAccess,
     NotFoundError,
     PatientAlreadyEnrolledError,
+    PatientSession,
+    Session,
+    SessionExpired,
 )
 
 DSN = os.getenv("CLINICAL_TEST_DSN")
@@ -157,6 +163,25 @@ def patient_a2(dao, staff_a):
 def patient_b(dao, staff_b):
     """Carol, in the OTHER organisation."""
     return dao.create_patient(staff_b, "Carol Clark", dt.date(1990, 3, 3), "F")
+
+
+@pytest.fixture()
+def alice_session(dao, staff_a, patient_a, org_a):
+    """A REAL patient session, obtained through the REAL authentication path.
+
+    Not hand-built. A PatientSession constructed in the test would prove
+    nothing about whether patient_login puts the right patient on it, and the
+    whole suite hangs off that being true (Standing Rule 2a).
+    """
+    dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+    return dao.patient_login("alice@portal.example", org_a, PASSWORD, ip_address="10.0.0.9")
+
+
+@pytest.fixture()
+def bob_session(dao, staff_a, patient_a2, org_a):
+    """Bob's real session -- the same organisation as Alice, a different patient."""
+    dao.enrol_patient_login(staff_a, patient_a2, "bob@portal.example", OTHER_PASSWORD)
+    return dao.patient_login("bob@portal.example", org_a, OTHER_PASSWORD)
 
 
 # ─── the schema: the two tables, and what Postgres refuses ───────────────────
@@ -410,6 +435,220 @@ class TestStaffEnrolment:
             assert cur.fetchone()[0] == 1
 
 
+@requires_db
+class TestPatientAuthentication:
+    """
+    Decision 2: reuse the existing mechanism. These exercise the REAL
+    patient_login, not a constructed session.
+    """
+
+    def test_a_patient_authenticates_and_the_session_names_their_patient_record(self, dao, alice_session, patient_a):
+        assert isinstance(alice_session, PatientSession)
+        assert alice_session.patient_id == patient_a
+        assert not isinstance(alice_session, Session), "a PatientSession must not be a Session"
+        assert not hasattr(alice_session, "user_id"), (
+            "a PatientSession must carry no user_id: roughly thirty statements write session.user_id "
+            "into a staff actor column, and the absent attribute is the runtime backstop"
+        )
+
+    def test_every_authentication_failure_is_the_same_sentence(self, dao, org_a, org_b, staff_a, patient_a):
+        """
+        Standing Rule 2b at the method boundary. Asserted on equality with the
+        constant, not on the absence of a word: "Invalid account credentials"
+        would pass an absence check while a genuinely distinguishing message
+        could too.
+        """
+        dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+
+        messages = []
+        for email, org, password in [
+            ("alice@portal.example", org_a, "the wrong password entirely"),
+            ("nobody@portal.example", org_a, PASSWORD),
+            ("alice@portal.example", org_b, PASSWORD),
+            ("alice@portal.example", uuid.uuid4(), PASSWORD),
+        ]:
+            with pytest.raises(AuthenticationError) as caught:
+                dao.patient_login(email, org, password)
+            messages.append(str(caught.value))
+
+        assert messages == [GENERIC_AUTH_ERROR] * 4, messages
+
+    def test_a_patient_credential_does_not_authenticate_in_another_organisation(
+        self, dao, staff_a, patient_a, org_a, org_b
+    ):
+        """
+        right patient + wrong organisation. The credential is real and the
+        password is correct; only the organisation is wrong.
+        """
+        dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+        with pytest.raises(AuthenticationError):
+            dao.patient_login("alice@portal.example", org_b, PASSWORD)
+
+    def test_the_positive_twin_the_same_credential_in_its_own_organisation_works(self, dao, staff_a, patient_a, org_a):
+        dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+        assert dao.patient_login("alice@portal.example", org_a, PASSWORD).patient_id == patient_a
+
+    def test_a_patient_credential_is_not_a_staff_credential(self, dao, staff_a, patient_a, org_a):
+        """
+        The two principal tables are separate, so login() cannot find a
+        patient and patient_login() cannot find a staff user. Proved in both
+        directions, because one direction alone would be satisfied by an
+        implementation that simply refuses everything.
+        """
+        dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+
+        with pytest.raises(AuthenticationError):
+            dao.login("alice@portal.example", org_a, PASSWORD)
+        with pytest.raises(AuthenticationError):
+            dao.patient_login("admin@a.example", org_a, "correct horse battery staple")
+
+    def test_the_staff_lockout_policy_applies_unchanged(self, dao, staff_a, patient_a, org_a, conn):
+        """
+        Decision 2: the existing lockout policy is reused, not re-derived.
+        MAX_FAILED_LOGIN_ATTEMPTS failures lock the credential, and the
+        CORRECT password is then refused -- which is what distinguishes a
+        lockout from a simple wrong-password refusal.
+        """
+        dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+        for _ in range(MAX_FAILED_LOGIN_ATTEMPTS):
+            with pytest.raises(AuthenticationError):
+                dao.patient_login("alice@portal.example", org_a, "wrong")
+
+        with pytest.raises(AuthenticationError):
+            dao.patient_login("alice@portal.example", org_a, PASSWORD)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT failed_login_attempts, locked_until FROM patient_logins WHERE org_id = %s AND email = %s",
+                (org_a, "alice@portal.example"),
+            )
+            attempts, locked_until = cur.fetchone()
+        assert attempts >= MAX_FAILED_LOGIN_ATTEMPTS
+        assert locked_until is not None
+
+    def test_one_patients_failures_do_not_lock_another_patients_credential(
+        self, dao, staff_a, patient_a, patient_a2, org_a
+    ):
+        """
+        The counter is per credential. Same organisation, so this is the
+        patient axis and not the tenancy one.
+        """
+        dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+        dao.enrol_patient_login(staff_a, patient_a2, "bob@portal.example", OTHER_PASSWORD)
+        for _ in range(MAX_FAILED_LOGIN_ATTEMPTS):
+            with pytest.raises(AuthenticationError):
+                dao.patient_login("alice@portal.example", org_a, "wrong")
+
+        assert dao.patient_login("bob@portal.example", org_a, OTHER_PASSWORD).patient_id == patient_a2
+
+
+@requires_db
+class TestPatientSessionPolicy:
+    """The session policy is the staff policy, reused. Same windows, same
+    inclusive idle boundary, same server-side termination."""
+
+    def test_a_valid_session_validates_and_carries_the_patient(self, dao, alice_session, patient_a):
+        revalidated = dao.patient_session_valid(alice_session.session_id)
+        assert revalidated.patient_id == patient_a
+        assert revalidated.org_id == alice_session.org_id
+
+    def test_the_idle_window_expires_at_exactly_the_timeout(self, dao, clock, alice_session):
+        clock.advance(minutes=30)
+        with pytest.raises(SessionExpired):
+            dao.patient_session_valid(alice_session.session_id)
+
+    def test_the_positive_twin_one_minute_short_of_the_timeout_still_validates(self, dao, clock, alice_session):
+        clock.advance(minutes=29)
+        assert dao.patient_session_valid(alice_session.session_id).session_id == alice_session.session_id
+
+    def test_activity_never_extends_the_absolute_cap(self, dao, clock, alice_session):
+        # 29-minute steps keep the idle window alive indefinitely, so the only
+        # thing that can end this loop is SESSION_ABSOLUTE_HOURS. 60 steps is
+        # 29 hours, comfortably past the 24-hour cap; 48 steps (23.2 hours) is
+        # not, and the first version of this test failed for that reason
+        # rather than for a fault in the code.
+        for _ in range(60):
+            clock.advance(minutes=29)
+            try:
+                dao.patient_session_valid(alice_session.session_id)
+            except SessionExpired:
+                break
+        else:
+            pytest.fail("the absolute cap never fired -- activity extended it")
+
+    def test_a_staff_session_id_is_not_a_patient_session_id(self, dao, staff_a):
+        """
+        The two id spaces are DIFFERENT TABLES, which is why _get_session did
+        not need widening and must not be widened. A perfectly valid staff
+        session id is simply not found here.
+        """
+        with pytest.raises(SessionExpired):
+            dao.patient_session_valid(staff_a.session_id)
+
+    def test_a_patient_session_id_is_not_a_staff_session_id(self, dao, alice_session):
+        """The other direction. Decision 7's structural half: a patient session
+        id presented to the staff validator finds nothing."""
+        with pytest.raises(SessionExpired):
+            dao.session_valid(alice_session.session_id)
+
+    def test_the_positive_twin_each_id_validates_in_its_own_space(self, dao, staff_a, alice_session):
+        """Without this, both refusals above are satisfied by a
+        patient_session_valid that refuses every id ever presented to it."""
+        assert dao.session_valid(staff_a.session_id).user_id == staff_a.user_id
+        assert dao.patient_session_valid(alice_session.session_id).patient_id == alice_session.patient_id
+
+
+@requires_db
+class TestAPatientSessionIsRefusedByStaffOperations:
+    """
+    DECISION 7, and it is enforced rather than annotated.
+
+    Python annotations are not checked at run time and a PatientSession
+    carries org_id, so it duck-types into any staff method that touches only
+    session.org_id -- which is most of the twenty-nine ungated readers. The
+    refusal therefore lives in the @auditable decorator that every public
+    DataAccess method already carries, and fires whether or not the method is
+    audited.
+    """
+
+    def test_a_patient_session_cannot_read_a_patient_through_the_staff_reader(self, dao, alice_session, patient_a2):
+        """
+        get_patient is auditable=False and binds only session.org_id. It is
+        the single most duck-typeable method in the file, and handing it a
+        patient session must be refused rather than answered.
+
+        Note the argument: BOB, not Alice. If this were refused only for
+        another patient it would be the patient axis, not decision 7.
+        """
+        with pytest.raises(AuthorizationError):
+            dao.get_patient(alice_session, patient_a2)
+
+    def test_it_is_refused_for_the_patients_own_record_too(self, dao, alice_session, patient_a):
+        """
+        Decision 7 is about the OPERATION, not about the row. A staff method
+        refuses a patient session even when the row being asked for is the
+        session's own patient -- otherwise the refusal is really the patient
+        axis wearing decision 7's name.
+        """
+        with pytest.raises(AuthorizationError):
+            dao.get_patient(alice_session, patient_a)
+
+    def test_the_positive_twin_a_staff_session_reads_the_same_record(self, dao, staff_a, patient_a):
+        """Rule 4: without this, the refusals above are satisfied by a
+        get_patient that refuses everybody."""
+        assert dao.get_patient(staff_a, patient_a)["patient_id"] == patient_a
+
+    def test_a_patient_session_cannot_perform_a_staff_write(self, dao, alice_session):
+        with pytest.raises(AuthorizationError):
+            dao.create_patient(alice_session, "Injected Patient", dt.date(2000, 1, 1), "U")
+
+    def test_a_patient_session_cannot_enrol_another_patient(self, dao, alice_session, patient_a2):
+        """The enrolment method itself is staff-only. A patient session reaching
+        it would be a patient issuing credentials."""
+        with pytest.raises(AuthorizationError):
+            dao.enrol_patient_login(alice_session, patient_a2, "hijack@portal.example", PASSWORD)
+
+
 class TestTheGuardRailsCoverTheNewTables:
     """Source-reading; runs without a database."""
 
@@ -422,6 +661,32 @@ class TestTheGuardRailsCoverTheNewTables:
         """
         assert "patient_logins" in ORG_SCOPED_TABLES
         assert "patient_sessions" in ORG_SCOPED_TABLES
+
+    def test_the_patient_login_lookup_binds_org_id(self):
+        """
+        The statement the design named specifically. An email is unique only
+        WITHIN an organisation, so a login lookup keyed on the address alone
+        would authenticate one tenant's patient against another tenant's
+        credential.
+        """
+        source = (pathlib.Path(__file__).resolve().parent.parent / "data_access.py").read_text(encoding="utf-8")
+        assert "FROM patient_logins WHERE org_id = %s AND email = %s" in " ".join(source.split())
+
+    def test_no_new_system_session_call_site_was_added(self):
+        """
+        The brief's hard constraint, restated where this wave can see it. The
+        four sites are pinned by name in test_identity.py and that guard scans
+        the tree; this asserts the same thing about the modules w130 adds, so
+        the failure names w130 rather than arriving as a count mismatch.
+        """
+        clinical = pathlib.Path(__file__).resolve().parent.parent
+        for name in ("data_access.py", "endpoints.py", "app.py"):
+            source = (clinical / name).read_text(encoding="utf-8")
+            w130_region = source.split("w130")
+            for chunk in w130_region[1:]:
+                assert "_create_system_session" not in chunk[:4000], (
+                    f"a _create_system_session call site appears in w130 code in {name}"
+                )
 
     def test_nothing_clinical_may_name_a_patient_principal_as_an_actor(self):
         """

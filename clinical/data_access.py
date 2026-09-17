@@ -341,6 +341,39 @@ class SecretCipher(Protocol):
 
 
 @dataclass(frozen=True)
+class PatientSession:
+    """
+    The patient principal's session. DELIBERATELY NOT A `Session`, and not a
+    subclass of one (w130).
+
+    WHAT IT CARRIES AND WHY. `org_id` answers "which organisation?" exactly as
+    it does on Session. `patient_id` answers "WHICH PATIENT?" -- a second axis
+    that does not exist anywhere else in this codebase, and it is carried here
+    for precisely the reason Session's own docstring gives for org_id: it is
+    read from here and NEVER from a caller argument, which is what makes the
+    isolation structural rather than remembered.
+
+    WHAT IT DELIBERATELY DOES NOT CARRY: `user_id`. Roughly thirty statements
+    in this layer write `session.user_id` into a created_by / recorded_by /
+    actor column. A patient session that reached one of them would write a
+    patient id into a staff actor column. With no such attribute, it raises
+    AttributeError at the first use instead -- a runtime backstop UNDER the
+    real control, which is the @auditable refusal (decision 7).
+
+    HONEST LIMIT. Annotations are not enforced at run time and this object
+    carries org_id, so it would duck-type into any method that touches only
+    session.org_id. That is why the refusal is enforced in the decorator every
+    public DataAccess method already carries, and not left to the type
+    checker.
+    """
+
+    session_id: uuid.UUID
+    patient_login_id: uuid.UUID
+    patient_id: uuid.UUID
+    org_id: uuid.UUID
+
+
+@dataclass(frozen=True)
 class Session:
     """
     An authenticated session. `org_id` is the organisation scope for every
@@ -553,6 +586,33 @@ def auditable(
 
     def decorator(func):
         def wrapper(self, *args, **kwargs):
+            # ── w130, DECISION 7: a patient session is refused by every staff
+            # operation, and the refusal lives HERE rather than in the type
+            # annotations.
+            #
+            # WHY HERE AND NOWHERE ELSE. Python annotations are not enforced at
+            # run time, and a PatientSession carries org_id -- so it duck-types
+            # perfectly into any staff method that touches only session.org_id,
+            # which is most of the twenty-nine ungated readers. MEASURED, not
+            # argued: before this check existed, dao.get_patient(alice_session,
+            # bobs_patient_id) RETURNED BOB'S RECORD. Two tests failed with
+            # "DID NOT RAISE" and thirty-two passed.
+            #
+            # This decorator is the one thing every public DataAccess method
+            # carries -- test_every_public_method_has_auditable_decorator makes
+            # that structural -- so it is the only place a single check covers
+            # all of them. The check runs BEFORE the `auditable` early return
+            # on purpose: get_patient is auditable=False, and it is exactly the
+            # method that leaked.
+            #
+            # It NARROWS: it refuses a PatientSession where a Session is
+            # required, and changes nothing else about any existing call.
+            if requires_session and args and isinstance(args[0], PatientSession):
+                raise AuthorizationError(
+                    f"{func.__name__} is a staff operation and does not accept a patient session. "
+                    "Patient access is served by the portal surface, which binds the patient from "
+                    "the session rather than from an argument."
+                )
             if not auditable:
                 # Non-auditable method: just call it
                 return func(self, *args, **kwargs)
@@ -2007,6 +2067,208 @@ class DataAccess:
             "created_at": row[4],
             "disabled": row[5],
         }
+
+    # ── patient authentication and patient sessions (w130) ───────────────────
+    #
+    # THE SAME MECHANISM OVER A SECOND PRINCIPAL TABLE. Not a second
+    # authentication system: no new secret material, no new credential format,
+    # no new failure vocabulary, no new session policy, no new endpoint
+    # semantics. The same bcrypt hasher, the same dummy-hash timing
+    # equalisation, the same MAX_FAILED_LOGIN_ATTEMPTS / LOCKOUT_MINUTES, the
+    # same GENERIC_AUTH_ERROR, the same SESSION_ABSOLUTE_HOURS and
+    # SESSION_IDLE_MINUTES with the same inclusive idle boundary.
+    #
+    # WHY NOT REFACTOR login() INTO A SHARED HELPER PARAMETERISED BY PRINCIPAL
+    # TABLE: it is available and it was not done. It would edit the single
+    # authenticated path of a clinical system whose behaviour is pinned by
+    # existing tests, to save about sixty lines. The cost of the choice made
+    # instead is one duplicated validation method, stated rather than hidden.
+    #
+    # NO SECOND FACTOR, AND THIS IS A DECLARED GAP RATHER THAN AN OMISSION.
+    # users.totp_secret is enrolled by enrol_totp, which is Administrator-gated
+    # and presumes an administrator sitting with the account holder and a
+    # device the organisation controls. That assumption does not hold for a
+    # patient at home. Whether patient authentication is single-factor is a
+    # ruling; shipping a totp_secret column nothing ever enrols would be how
+    # external_identifiers came to exist.
+
+    @auditable(
+        action={
+            "success": "patient_login_succeeded",
+            "error": "patient_login_failed",
+            "denied": "patient_login_failed",
+        },
+        resource_type="patient_session",
+        requires_session=False,
+        details_builder=lambda params, result: {
+            "session_id": str(result.session_id) if result else None,
+            "patient_login_id": str(result.patient_login_id) if result else None,
+        },
+    )
+    @transactional
+    def patient_login(
+        self,
+        email: str,
+        org_id: uuid.UUID,
+        password: str,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> "PatientSession":
+        """
+        Authenticate a patient and open a server-side patient session.
+
+        Every failure path raises AuthenticationError carrying exactly
+        GENERIC_AUTH_ERROR -- the SAME constant staff authentication uses, so a
+        caller cannot tell "no such address" from "wrong password" from
+        "disabled" from "locked out", and cannot tell a patient address from a
+        staff one either.
+
+        The returned session carries patient_id. Nothing downstream asks the
+        caller which patient this is.
+        """
+        now = self._clock.now()
+
+        org = self._query_one("SELECT org_id, disabled FROM organisations WHERE org_id = %s", (org_id,))
+        if org is None:
+            self.log_failed_login(email, None, ip_address, reason="unknown_organisation")
+            self._equalise_password_work(password)
+            raise AuthenticationError()
+        if org[1]:
+            self.log_failed_login(email, org_id, ip_address, reason="organisation_disabled")
+            self._equalise_password_work(password)
+            raise AuthenticationError()
+
+        # BINDS org_id, exactly as login()'s users lookup does. An email is
+        # unique only WITHIN an organisation -- patient_logins_org_email_unique
+        # -- so a lookup keyed on the address alone would authenticate one
+        # tenant's patient against another tenant's credential.
+        row = self._query_one(
+            "SELECT patient_login_id, patient_id, password_hash, failed_login_attempts, locked_until, disabled "
+            "FROM patient_logins WHERE org_id = %s AND email = %s",
+            (org_id, email),
+        )
+        if row is None:
+            self._equalise_password_work(password)
+            self.log_failed_login(email, org_id, ip_address, reason="unknown_patient_login")
+            raise AuthenticationError()
+
+        patient_login_id, patient_id, password_hash, failed_attempts, locked_until, disabled = row
+
+        if locked_until is not None and locked_until > now:
+            self.log_failed_login(email, org_id, ip_address, reason="locked_out")
+            raise AuthenticationError()
+
+        if not self._hasher.verify(password, password_hash):
+            self._register_failed_patient_attempt(patient_login_id, org_id, failed_attempts, now)
+            self.log_failed_login(email, org_id, ip_address, reason="invalid_password")
+            raise AuthenticationError()
+
+        # AFTER the password, exactly as login() does it and for the same
+        # reason: checking first answers "is this account disabled?" to anyone
+        # who can guess an address.
+        if disabled:
+            self.log_failed_login(email, org_id, ip_address, reason="patient_login_disabled")
+            raise AuthenticationError()
+
+        self._execute(
+            "UPDATE patient_logins SET failed_login_attempts = 0, locked_until = NULL, updated_at = %s "
+            "WHERE patient_login_id = %s AND org_id = %s",
+            (now, patient_login_id, org_id),
+        )
+
+        session_id = uuid.uuid4()
+        self._execute(
+            "INSERT INTO patient_sessions (session_id, patient_login_id, patient_id, org_id, created_at, "
+            "                              expires_at, last_activity_at, idle_timeout_minutes, ip_address, "
+            "                              user_agent) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                session_id,
+                patient_login_id,
+                patient_id,
+                org_id,
+                now,
+                now + _datetime.timedelta(hours=SESSION_ABSOLUTE_HOURS),
+                now,
+                SESSION_IDLE_MINUTES,
+                ip_address,
+                user_agent,
+            ),
+        )
+        return PatientSession(
+            session_id=session_id,
+            patient_login_id=patient_login_id,
+            patient_id=patient_id,
+            org_id=org_id,
+        )
+
+    def _register_failed_patient_attempt(
+        self,
+        patient_login_id: uuid.UUID,
+        org_id: uuid.UUID,
+        current_attempts: int,
+        now: _datetime.datetime,
+    ) -> None:
+        """The staff lockout policy, unchanged, applied to the patient row."""
+        attempts = current_attempts + 1
+        locked_until = (
+            now + _datetime.timedelta(minutes=LOCKOUT_MINUTES) if attempts >= MAX_FAILED_LOGIN_ATTEMPTS else None
+        )
+        self._execute(
+            "UPDATE patient_logins SET failed_login_attempts = %s, locked_until = %s, updated_at = %s "
+            "WHERE patient_login_id = %s AND org_id = %s",
+            (attempts, locked_until, now, patient_login_id, org_id),
+        )
+
+    @auditable(
+        action="patient_session_validated",
+        resource_type="patient_session",
+        requires_session=False,
+        auditable=False,
+        reason="validation read on every request; the patient session audit trail records creation and "
+        "termination, not use -- the same decision session_valid already carries",
+    )
+    @transactional
+    def patient_session_valid(self, session_id: uuid.UUID) -> "PatientSession":
+        """
+        Validate a patient session id and refresh its idle window.
+
+        A DELIBERATE MIRROR of session_valid, against a different table. The
+        two session id spaces are therefore different tables: a STAFF session
+        id presented here is simply not found, and a patient session id
+        presented to session_valid is simply not found. That separation is
+        structural, not checked -- which is why _get_session was not widened
+        and must not be.
+        """
+        now = self._clock.now()
+        row = self._query_one(
+            "SELECT patient_login_id, patient_id, org_id, expires_at, last_activity_at, "
+            "       idle_timeout_minutes, terminated_at "
+            "FROM patient_sessions WHERE session_id = %s",
+            (session_id,),
+        )
+        if row is None:
+            raise SessionExpired()
+
+        patient_login_id, patient_id, org_id, expires_at, last_activity_at, idle_minutes, terminated_at = row
+
+        if terminated_at is not None:
+            raise SessionExpired()
+        if now >= expires_at:
+            raise SessionExpired()
+        if now >= last_activity_at + _datetime.timedelta(minutes=idle_minutes):
+            raise SessionExpired()
+
+        self._execute(
+            "UPDATE patient_sessions SET last_activity_at = %s WHERE session_id = %s AND org_id = %s",
+            (now, session_id, org_id),
+        )
+        return PatientSession(
+            session_id=session_id,
+            patient_login_id=patient_login_id,
+            patient_id=patient_id,
+            org_id=org_id,
+        )
 
     # ── patient portal identity (w130) ───────────────────────────────────────
     #

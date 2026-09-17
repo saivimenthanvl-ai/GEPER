@@ -1993,3 +1993,57 @@ CREATE TRIGGER trg_vcfs_content_immutability
 -- either table -- not even a narrowed one.
 REVOKE UPDATE ON reports, interpretations, vcfs FROM clinical_app;
 GRANT UPDATE (state, approver_id, approved_at, content_hash) ON reports TO clinical_app;
+
+
+-- ─── schema_migrations ───────────────────────────────────────────────────────
+--
+-- THE ONE OBJECT THIS FILE GAINS FOR THE MIGRATION MECHANISM (w126m), and the
+-- only schema change in that wave. Its DDL is not written out here: it is
+-- `clinical/migrations/0001_schema_migrations.sql`, reproduced below so that
+-- this file stays what it has always been -- the complete, self-contained
+-- description of a NEW database -- while the migration file stays what a
+-- migration has to be, the operation that reaches this state from the one
+-- before it. The two are kept in step by
+-- `clinical/tests/test_w126m_schema_equivalence.py`, which builds a database
+-- from THIS file and another from the migrations and fails on any catalog
+-- difference. That test, not a convention, is what stops them drifting.
+--
+-- Read `clinical/migrations/0001_schema_migrations.sql` for why the columns
+-- are what they are.
+CREATE TABLE schema_migrations (
+    version     INTEGER     PRIMARY KEY,
+    name        TEXT        NOT NULL,
+    checksum    TEXT        NOT NULL,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    applied_by  TEXT        NOT NULL DEFAULT current_user
+);
+
+REVOKE ALL                    ON schema_migrations FROM PUBLIC;
+GRANT  SELECT                 ON schema_migrations TO clinical_app;
+REVOKE INSERT, UPDATE, DELETE ON schema_migrations FROM clinical_app;
+
+-- A FRESH DATABASE IS ALREADY AT THE LATEST VERSION, AND SAYS SO.
+--
+-- This file creates the CURRENT state directly -- it does not replay the
+-- migrations -- so a database built from it has never run migration 1 or 2
+-- and yet holds exactly what they produce. Without these two rows it would
+-- report "2 pending" for ever, and the next deploy would try to run the
+-- baseline against a database that already has it.
+--
+-- They are INSERTed here rather than by the application, or by a later step,
+-- because `clinical/bootstrap.py --apply-schema` sends this whole file as one
+-- statement inside one transaction: the stamps land in the same transaction
+-- as the tables they describe, or neither lands. A stamp written afterwards
+-- could be lost while the schema survived, which is the falsely-ready
+-- database this mechanism exists to prevent.
+--
+-- THE CHECKSUMS ARE THE MIGRATION FILES' BYTES, SHA-256 OVER LF-NORMALISED
+-- CONTENT (clinical/migrate.py::checksum_of; the normalisation is why a
+-- Windows CRLF checkout and the Linux CI container agree). Adding a migration
+-- means adding its DDL above AND its stamp here;
+-- test_w126m_migration_mechanism.py::test_schema_sql_stamps_exactly_the_migration_set
+-- reads these rows back OUT OF A DATABASE and fails if they do not match the
+-- files on disk, so the pair cannot be half-done.
+INSERT INTO schema_migrations (version, name, checksum) VALUES
+    (1, 'schema_migrations', '00d8c90bb0eaba561d843cde7a45eca5af4d594aca6a3e230938aef27286f559'),
+    (2, 'baseline',          'cc842c3943b7aa1e5786d638eff742f63fd47ce5a5048d7321036234a5290af8');

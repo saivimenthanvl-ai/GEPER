@@ -43,8 +43,12 @@ import pytest
 
 from clinical.data_access import (
     ORG_SCOPED_TABLES,
+    PATIENT_NOT_FOUND,
+    AuthorizationError,
     BcryptHasher,
     DataAccess,
+    NotFoundError,
+    PatientAlreadyEnrolledError,
 )
 
 DSN = os.getenv("CLINICAL_TEST_DSN")
@@ -272,6 +276,138 @@ class TestTheTwoTablesAreStructural:
                 (uuid.uuid4(), staff_a.user_id, org_a, now, now + dt.timedelta(hours=24), now),
             )
         conn.commit()
+
+
+@requires_db
+class TestStaffEnrolment:
+    """
+    Decision 4: a staff principal provisions the portal identity and links it
+    to exactly one patient record. There is no self-registration route, and
+    the tests below exercise the real method rather than reading rows.
+    """
+
+    def test_a_staff_administrator_enrols_a_patient(self, dao, staff_a, patient_a, conn):
+        login_id = dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+        assert isinstance(login_id, uuid.UUID)
+
+        # Read back through SQL only to check the columns the METHOD is
+        # responsible for filling; the behaviour itself is proved by the login
+        # tests, which call patient_login().
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT patient_id, org_id, enrolled_by, password_hash FROM patient_logins WHERE patient_login_id = %s",
+                (login_id,),
+            )
+            patient_id, org_id, enrolled_by, password_hash = cur.fetchone()
+        assert patient_id == patient_a
+        assert org_id == staff_a.org_id
+        assert enrolled_by == staff_a.user_id, "the enroller is the acting staff principal, recorded on the row"
+        assert password_hash.startswith("$2"), "the same bcrypt format users.password_hash holds"
+        assert PASSWORD not in password_hash
+
+    def test_enrolment_requires_the_administrator_role(self, dao, conn, org_a, patient_a):
+        """
+        A roleless staff session -- the ordinary state, since create_user
+        assigns no role -- cannot issue a patient credential.
+        """
+        roleless = _staff_session(dao, conn, org_a, "nobody@a.example", administrator=False)
+        with pytest.raises(AuthorizationError):
+            dao.enrol_patient_login(roleless, patient_a, "alice@portal.example", PASSWORD)
+
+    def test_the_positive_twin_the_same_call_with_the_role_succeeds(self, dao, staff_a, patient_a):
+        """Rule 4: without this, the refusal above is satisfied by an enrolment
+        that is broken for every caller."""
+        assert dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+
+    def test_staff_cannot_enrol_a_patient_from_another_organisation(self, dao, staff_a, patient_b):
+        """
+        wrong patient + wrong organisation. patient_b is REAL -- it exists, in
+        org_b -- and org_a's administrator still cannot reach it.
+        """
+        with pytest.raises(NotFoundError):
+            dao.enrol_patient_login(staff_a, patient_b, "carol@portal.example", PASSWORD)
+
+    def test_a_cross_org_patient_and_an_invented_one_refuse_identically(self, dao, staff_a, patient_b):
+        """
+        Standing Rule 2b applied at the method boundary: the MESSAGE, not the
+        exception type. If a real-but-elsewhere patient refused differently
+        from a nonexistent one, the difference confirms the record exists.
+        """
+        with pytest.raises(NotFoundError) as real_elsewhere:
+            dao.enrol_patient_login(staff_a, patient_b, "carol@portal.example", PASSWORD)
+        with pytest.raises(NotFoundError) as invented:
+            dao.enrol_patient_login(staff_a, uuid.uuid4(), "nobody@portal.example", PASSWORD)
+
+        assert str(real_elsewhere.value) == str(invented.value)
+        assert str(real_elsewhere.value) == PATIENT_NOT_FOUND
+        assert str(patient_b) not in str(real_elsewhere.value)
+
+    def test_exactly_one_patient_record_per_credential(self, dao, staff_a, patient_a):
+        """Decision 4: linked to EXACTLY ONE patient record. A second
+        enrolment for the same patient is refused, not silently accepted as a
+        second credential."""
+        dao.enrol_patient_login(staff_a, patient_a, "alice@portal.example", PASSWORD)
+        with pytest.raises(PatientAlreadyEnrolledError):
+            dao.enrol_patient_login(staff_a, patient_a, "alice.again@portal.example", PASSWORD)
+
+    def test_enrolment_is_atomic_a_failure_in_the_write_leaves_nothing(self, dao, staff_a, patient_a, patient_a2, conn):
+        """
+        THE TEST THE BRIEF ASKED FOR, and it is the one a composed
+        implementation fails.
+
+        @auditable commits after each audit row. So an enrolment assembled out
+        of two decorated methods -- verify, then insert -- leaves the verify
+        step's audit row committed when the insert fails, and the audit log
+        then records a verification for an enrolment that never happened.
+
+        The failure is forced at the LAST step: the email is already taken in
+        this organisation, so every precondition passes and the INSERT is what
+        breaks. Nothing may survive it: no credential row for Bob, and no
+        audit row of any kind attributing enrolment work to Bob.
+        """
+        dao.enrol_patient_login(staff_a, patient_a, "taken@portal.example", PASSWORD)
+
+        with pytest.raises(Exception):
+            dao.enrol_patient_login(staff_a, patient_a2, "taken@portal.example", OTHER_PASSWORD)
+        conn.rollback()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM patient_logins WHERE patient_id = %s", (patient_a2,))
+            assert cur.fetchone()[0] == 0, "a credential row survived a failed enrolment"
+
+            # ENROLMENT rows only. `patient_created` is a legitimate success
+            # row for Bob -- the fixture really did create him -- and matching
+            # it would make this assertion fire for a reason that has nothing
+            # to do with atomicity.
+            cur.execute(
+                "SELECT action, outcome, resource_id, details FROM audit_log "
+                "WHERE outcome = 'success' AND action LIKE %s "
+                "AND (resource_id = %s OR details::text LIKE %s)",
+                ("%enrol%", str(patient_a2), f"%{patient_a2}%"),
+            )
+            survivors = cur.fetchall()
+        assert not survivors, (
+            "a SUCCESS-outcome audit row survived a failed enrolment, attributing work to a patient "
+            f"who was never enrolled: {survivors}"
+        )
+
+    def test_the_positive_twin_a_successful_enrolment_does_leave_both(self, dao, staff_a, patient_a2, conn):
+        """
+        Rule 4's twin for the absence assertion above. An implementation that
+        wrote NOTHING, ever, would satisfy the atomicity test perfectly. This
+        one fails unless the successful path really does leave both the
+        credential row and the success audit row.
+        """
+        login_id = dao.enrol_patient_login(staff_a, patient_a2, "bob@portal.example", PASSWORD)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM patient_logins WHERE patient_id = %s", (patient_a2,))
+            assert cur.fetchone()[0] == 1
+            cur.execute(
+                "SELECT count(*) FROM audit_log WHERE outcome = 'success' AND action = 'patient_login_enrolled' "
+                "AND resource_id = %s",
+                (str(login_id),),
+            )
+            assert cur.fetchone()[0] == 1
 
 
 class TestTheGuardRailsCoverTheNewTables:

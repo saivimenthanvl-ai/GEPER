@@ -105,6 +105,14 @@ ASSEMBLY_CANONICAL = {
 # genuinely distinguishing message could pass one too.
 GENERIC_AUTH_ERROR = "Authentication failed."
 
+# w130. The one refusal a patient-axis miss produces, wherever it is produced.
+# A MODULE CONSTANT AND NOT AN f-STRING, for the reason the org axis already
+# learned: a message that names the identifier, or that differs between "this
+# patient is in another organisation", "this patient is not yours" and "this
+# patient does not exist", tells the caller which of the three is true. All
+# three are the same sentence, carrying no identifier.
+PATIENT_NOT_FOUND = "Patient not found."
+
 
 # ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -127,6 +135,18 @@ class NotFoundError(Exception):
     Deliberately indistinguishable from "does not exist at all": a cross-org
     read must not be able to confirm that some other organisation holds a
     record with that id. Existence is itself information.
+    """
+
+
+class PatientAlreadyEnrolledError(Exception):
+    """
+    Raised when a patient already holds a portal credential (w130).
+
+    NOT an AuthenticationError and deliberately not folded into one: this is
+    raised to a STAFF principal performing enrolment, who is entitled to know
+    why the enrolment did not happen. The generic-error discipline applies to
+    the unauthenticated login surface, where a distinguishing message is an
+    enumeration oracle; it does not apply here.
     """
 
 
@@ -1987,6 +2007,115 @@ class DataAccess:
             "created_at": row[4],
             "disabled": row[5],
         }
+
+    # ── patient portal identity (w130) ───────────────────────────────────────
+    #
+    # A PATIENT IS A PRINCIPAL AND IT IS NOT A STAFF USER. The tables are
+    # separate (see the note above patient_logins in schema.sql), the session
+    # type is separate (PatientSession), the login method is separate, and the
+    # HTTP dependency is separate. What is NOT separate is the mechanism: the
+    # same bcrypt hasher, the same dummy-hash timing equalisation, the same
+    # lockout constants, the same GENERIC_AUTH_ERROR, the same absolute and
+    # idle session windows. No second security policy was invented here.
+
+    @auditable(
+        action="patient_login_enrolled",
+        resource_type="patient_login",
+        requires_session=True,
+        details_builder=lambda params, result: {
+            "patient_id": str(params.get("patient_id")),
+            "email": params.get("email"),
+        },
+    )
+    @transactional
+    def enrol_patient_login(
+        self,
+        session: Session,
+        patient_id: uuid.UUID,
+        email: str,
+        password: str,
+    ) -> uuid.UUID:
+        """
+        Issue a portal credential for one patient. STAFF ENROLMENT: a staff
+        principal chooses the patient record, and there is no self-registration
+        path of any kind.
+
+        That is what answers "how is a person matched to their patient record?"
+        -- a staff member who already knows which record this is picks it. It
+        is not answered by an external identifier vocabulary, and this method
+        deliberately does not consult external_identifiers.
+
+        WHY THIS IS ONE METHOD AND NOT A COMPOSITION. @auditable commits after
+        each audit row it writes. So a version assembled out of two decorated
+        calls -- "check the patient, then create the credential" -- would leave
+        the first call's audit row committed when the second failed, and the
+        audit would record an enrolment that did not happen. The precondition
+        reads, the uniqueness read and the INSERT are therefore all inside one
+        @transactional body with exactly one @auditable around the whole of it.
+        A failure anywhere leaves NOTHING: no credential row, and no
+        success-outcome audit row.
+
+        THE ROLE. Administrator, on the conservative default the design
+        recorded: issuing a credential is account administration, and
+        assign_role, enrol_totp and set_user_disabled are all Administrator
+        today. Which role SHOULD own patient credential issuance is a ruling
+        that has not been made; this picks the tightest existing gate rather
+        than inventing an eighth role or leaving the method ungated. Note that
+        it is strictly tighter than the surrounding patient lifecycle, where
+        create_patient and record_consent are gated by nothing at all -- this
+        does not weaken that; it declines to copy it.
+
+        Raises NotFoundError for a patient that does not exist IN THIS
+        ORGANISATION -- the same refusal, byte for byte, as for a patient that
+        does not exist anywhere, because which patients another tenant holds is
+        not a question this method answers.
+        """
+        self._require_role(session, "Administrator")
+
+        # The org predicate is bound from the session and never from an
+        # argument. A real patient in another organisation reads exactly like
+        # an invented one.
+        patient = self._query_one(
+            "SELECT patient_id FROM patients WHERE patient_id = %s AND org_id = %s",
+            (patient_id, session.org_id),
+        )
+        if patient is None:
+            raise NotFoundError(PATIENT_NOT_FOUND)
+
+        # One login per patient is a DECISION (proxy and guardian access would
+        # relax it and that is a ruling nobody has made), so it is refused here
+        # with a message that says so, as well as by the UNIQUE constraint.
+        existing = self._query_one(
+            "SELECT patient_login_id FROM patient_logins WHERE org_id = %s AND patient_id = %s",
+            (session.org_id, patient_id),
+        )
+        if existing is not None:
+            raise PatientAlreadyEnrolledError(
+                "This patient already has a portal credential. A second credential for the same "
+                "patient is a proxy-access decision, not a re-enrolment."
+            )
+
+        patient_login_id = uuid.uuid4()
+        now = self._clock.now()
+        self._execute(
+            "INSERT INTO patient_logins (patient_login_id, patient_id, org_id, email, password_hash, "
+            "                            password_changed_at, enrolled_by, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                patient_login_id,
+                patient_id,
+                session.org_id,
+                email,
+                # The same hasher that hashes staff passwords. Not a second
+                # credential format, and not a second cost parameter.
+                self._hasher.hash(password),
+                now,
+                session.user_id,
+                now,
+                now,
+            ),
+        )
+        return patient_login_id
 
     @auditable(
         action="order_read",

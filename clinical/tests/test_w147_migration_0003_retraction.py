@@ -153,6 +153,27 @@ def _the_migration() -> migrate.Migration:
     return by_version[RETRACTION_VERSION]
 
 
+def _on_disk_versions() -> list:
+    """
+    The migration set, DERIVED (w149).
+
+    This file was written when 0003 was the last migration and wrote `[1, 2,
+    RETRACTION_VERSION]` in nine places. That is the exact defect w146 swept
+    the suite for and w147 re-introduced in its own file: a hard-coded set that
+    every later wave must re-author. 0004 is the wave that had to. Every such
+    literal below now derives from `discover()`, which is STRICTLY STRONGER --
+    it asserts the history matches the files on disk rather than matching a
+    number somebody typed -- and the facts that are genuinely ABOUT 0003
+    (that it is on disk, that it is version 3, that it is named
+    `report_retraction`) are asserted directly and are unchanged.
+    """
+    return [m.version for m in migrate.discover()]
+
+
+def _versions_after_baseline() -> tuple:
+    return tuple(v for v in _on_disk_versions() if v > migrate.BASELINE_VERSION)
+
+
 @pytest.fixture()
 def client():
     pytest.importorskip("fastapi", reason="fastapi not installed")
@@ -187,8 +208,13 @@ class TestTheMigrationIsOnDiskAndTheSetStillOrders:
         `test_0003_before_0002_raises_rather_than_producing_a_wrong_schema`.
         """
         discovered = migrate.discover()
-        assert [m.version for m in discovered] == [1, 2, RETRACTION_VERSION]
-        assert [m.name for m in discovered] == ["schema_migrations", "baseline", RETRACTION_NAME]
+        versions = [m.version for m in discovered]
+        assert versions == sorted(versions)
+        assert versions == list(range(1, len(versions) + 1)), versions
+        names = {m.version: m.name for m in discovered}
+        assert names[1] == "schema_migrations"
+        assert names[migrate.BASELINE_VERSION] == "baseline"
+        assert names[RETRACTION_VERSION] == RETRACTION_NAME
 
     def test_the_frozen_baseline_and_its_stamp_are_untouched(self):
         """
@@ -312,11 +338,11 @@ class TestAFreshDatabaseHasTheRetractionObjectsAndSaysItIsAtThree:
             for name in RETRACTION_TABLES + RETRACTION_INDEXES:
                 assert _regclass(connection, name) is not None, name
 
-            assert [row[0] for row in _history(connection)] == [1, 2, RETRACTION_VERSION]
+            assert [row[0] for row in _history(connection)] == _on_disk_versions()
             state = migrate.inspect_state(connection)
             assert state.ok is True, state.detail
             assert state.pending == ()
-            assert state.current_version == RETRACTION_VERSION
+            assert state.current_version == max(_on_disk_versions())
 
             assert migrate.migrate(connection) == ()
 
@@ -360,7 +386,7 @@ class TestARealHistoricalDatabaseIsUpgradedRatherThanRebuilt:
                 assert _regclass(connection, name) is None, f"{name} exists BEFORE the upgrade"
 
             assert migrate.adopt_existing(connection) == (1, migrate.BASELINE_VERSION)
-            assert migrate.migrate(connection) == (RETRACTION_VERSION,)
+            assert migrate.migrate(connection) == _versions_after_baseline()
 
             # the sentinel, by content -- a rebuild loses both halves
             assert read_sentinel(connection) == ((SENTINEL_NOTE,), (SENTINEL_ORG,))
@@ -369,10 +395,10 @@ class TestARealHistoricalDatabaseIsUpgradedRatherThanRebuilt:
             for name in RETRACTION_TABLES + RETRACTION_INDEXES:
                 assert _regclass(connection, name) is not None, name
 
-            assert [row[0] for row in _history(connection)] == [1, 2, RETRACTION_VERSION]
+            assert [row[0] for row in _history(connection)] == _on_disk_versions()
             state = migrate.inspect_state(connection)
             assert state.ok is True, state.detail
-            assert state.current_version == RETRACTION_VERSION
+            assert state.current_version == max(_on_disk_versions())
 
     def test_the_sentinel_really_does_die_in_a_rebuild(self):
         """
@@ -435,7 +461,7 @@ class TestFreshCreationAndHistoricalUpgradeConverge:
 
                 _build_historical_baseline_generation(upgraded)
                 migrate.adopt_existing(upgraded)
-                assert migrate.migrate(upgraded) == (RETRACTION_VERSION,)
+                assert migrate.migrate(upgraded) == _versions_after_baseline()
 
                 left = catalog_of(fresh)
                 right = catalog_of(upgraded)
@@ -699,8 +725,8 @@ class TestOrderingIsDeterministicAndOutOfOrderIsNotSilent:
         the versions it applied, in order, and the history agrees.
         """
         with scratch_database("w147_order2") as dsn, connect(dsn) as connection:
-            assert migrate.migrate(connection) == (1, 2, RETRACTION_VERSION)
-            assert [row[0] for row in _history(connection)] == [1, 2, RETRACTION_VERSION]
+            assert list(migrate.migrate(connection)) == _on_disk_versions()
+            assert [row[0] for row in _history(connection)] == _on_disk_versions()
             assert migrate.inspect_state(connection).ok is True
 
     def test_a_wrong_generation_database_never_reaches_0003_at_all(self):
@@ -762,7 +788,7 @@ class TestConcurrentMigrationIsStillSafeWithThreeMigrations:
                     migrate._release(holder)
 
                 # and once the lock is free the same connection completes
-                assert migrate.migrate(blocked) == (1, 2, RETRACTION_VERSION)
+                assert list(migrate.migrate(blocked)) == _on_disk_versions()
 
     def test_two_runners_racing_apply_each_migration_exactly_once(self):
         """
@@ -801,8 +827,8 @@ class TestConcurrentMigrationIsStillSafeWithThreeMigrations:
         assert len(results) == 2, results
         for outcome in results:
             assert not isinstance(outcome, Exception), outcome
-        assert sorted(results) == [(), (1, 2, RETRACTION_VERSION)], results
-        assert [row[0] for row in history] == [1, 2, RETRACTION_VERSION]
+        assert sorted(results) == [(), tuple(_on_disk_versions())], results
+        assert [row[0] for row in history] == _on_disk_versions()
         assert state.ok is True, state.detail
 
 

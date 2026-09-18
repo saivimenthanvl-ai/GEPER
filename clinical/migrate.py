@@ -319,9 +319,77 @@ RETRACTION_GENERATION_INVARIANTS: Tuple[CatalogInvariant, ...] = (
     _constraint_invariant("retraction_notifications", "fk_retraction_notification_retraction"),
 )
 
+# What separates the AMENDMENT generation (migration 0004) from the retraction
+# one. Same rule and the same evidence: MEASURED by building a database each
+# way and diffing pg_catalog, not by reading the migration file.
+#
+# THE MEASURED DIFF, before -> after. Two real databases on PostgreSQL 16.15,
+# one with 0001+0002+0003 applied and one with 0001+0002+0003+0004, diffed row
+# by row across pg_class, pg_attribute, pg_constraint, pg_trigger, pg_proc and
+# the two privilege views (2026-09-18):
+#
+#    0 pg_class relkind 'r'   no new table (31 -> 31). 0004 alters one.
+#   +1 pg_class relkind 'i'   exception_events_org_event_unique, the index
+#                             PostgreSQL builds for the UNIQUE constraint
+#                             (92 -> 93)
+#   +1 pg_attribute row       exception_events.amends_event_id, uuid,
+#                             attnotnull = false (298 -> 299)
+#   +2 pg_constraint rows     exception_events_org_event_unique (contype 'u',
+#                             UNIQUE (org_id, id)) and
+#                             exception_events_amends_event_fk (contype 'f',
+#                             FOREIGN KEY (amends_event_id, org_id) REFERENCES
+#                             exception_events(id, org_id))  (155 -> 157)
+#    0 pg_trigger rows        (3 -> 3)
+#    0 pg_proc rows           (37 -> 37)
+#    0 role_table_grants      (95 -> 95) -- 0004 contains NO privilege
+#                             statement at all.
+#   +3 column_privileges      clinical_app SELECT/INSERT/UPDATE on the new
+#                             column (948 -> 951). NOT a grant this file makes:
+#                             PostgreSQL expands the PRE-EXISTING table-level
+#                             `GRANT SELECT, INSERT, UPDATE ... ON ...
+#                             exception_events ... TO clinical_app` to every
+#                             column of the table. Recorded because it is a
+#                             surprise, not because it is new: that table-level
+#                             UPDATE predates this wave and is unchanged by it.
+#    0 rows REMOVED in any section, and no definition changed -- which is the
+#      measurement "additive" actually means here.
+#
+# WHAT IS CHOSEN OUT OF THAT DIFF. Two probes, and NOT a table probe: unlike
+# 0003, this migration creates no table, so `exception_events` existing says
+# nothing -- it exists in every generation back to the pre-security one, which
+# is exactly the trap w143 measured. The column is the weaker of the two and
+# the composite foreign key is the strong one:
+#
+#   * the COLUMN `exception_events.amends_event_id` -- a fact a database at the
+#     retraction generation demonstrably lacks.
+#   * the named COMPOSITE SELF-FOREIGN KEY
+#     `exception_events_amends_event_fk`, which is the point of the whole
+#     migration and cannot exist unless `exception_events` ALSO carries
+#     `exception_events_org_event_unique UNIQUE (org_id, id)`. That is why the
+#     unique key is not separately probed here and its absence is still caught:
+#     PostgreSQL refuses to create the foreign key without it (SQLSTATE 42830),
+#     so the constraint invariant covers both objects. The wrong version that
+#     adds the unique key and leaves the FK single-column -- where the
+#     catalogue LOOKS right -- is caught because a single-column self-FK on
+#     `(amends_event_id)` is a DIFFERENT constraint definition under the same
+#     name, and `test_w149_migration_0004_amendment.py` asserts the definition,
+#     not just the name.
+#
+# DELIBERATELY ABSENT: `'amend_resolution'` in the action CHECK, and the CHECK
+# tying the action to the column. Those are the held branch's VOCABULARY, they
+# are not in migration 0004 (widening an inline CHECK is DROP-then-ADD, which
+# is destructive), and an invariant asserting them would reject a database that
+# is correctly at this generation -- the same defect, in the other direction,
+# that the baseline list avoids by not asserting `amends_event_id` itself.
+AMENDMENT_GENERATION_INVARIANTS: Tuple[CatalogInvariant, ...] = (
+    _column_invariant("exception_events", "amends_event_id"),
+    _constraint_invariant("exception_events", "exception_events_amends_event_fk"),
+)
+
 _GENERATION_INVARIANTS: Dict[Tuple[int, str], Tuple[CatalogInvariant, ...]] = {
     (BASELINE_VERSION, "baseline"): BASELINE_GENERATION_INVARIANTS,
     (3, "report_retraction"): RETRACTION_GENERATION_INVARIANTS,
+    (4, "exception_amendment"): AMENDMENT_GENERATION_INVARIANTS,
 }
 
 

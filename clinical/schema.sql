@@ -1693,8 +1693,45 @@ CREATE TABLE exception_events (
     action TEXT NOT NULL CHECK (action IN ('open', 'resolve', 'reopen')),
     action_note TEXT,
 
+    -- w149 (migration 0004): THE AMENDMENT RELATIONSHIP, AND IT CARRIES THE
+    -- TENANT. The event this row amends -- always another row of this same
+    -- table. NULLABLE: an `open`, `resolve` or `reopen` amends nothing, and
+    -- being NULL on every one of them is what makes it mean something when set.
+    --
+    -- THE HELD BRANCH w126 WROTE `amends_event_id UUID REFERENCES
+    -- exception_events (id)` AND THAT SHAPE IS FORBIDDEN HERE. It is the exact
+    -- defect the comment above this table describes: a single-column foreign
+    -- key is satisfied because the row exists GLOBALLY, so an amendment could
+    -- name an event belonging to another organisation and the database would
+    -- accept it. The composite form below asks "does this id exist HERE?".
+    --
+    -- MATCH SIMPLE (the default) is correct and is a real difference from
+    -- exception_events_org_exception_fk, whose two referencing columns are both
+    -- NOT NULL. Here amends_event_id is nullable, so a NULL skips the check --
+    -- which is the intent. When it is SET, org_id is NOT NULL, so both
+    -- referencing columns are non-null and the check runs in full. The only way
+    -- to evade MATCH SIMPLE is to null a referencing column, and nulling
+    -- amends_event_id is nulling the amendment itself.
+    --
+    -- WHAT IS NOT HERE. The held branch also adds 'amend_resolution' to the
+    -- action CHECK and a CHECK tying the two together. Widening an inline CHECK
+    -- is DROP-then-ADD, which is destructive, and migration 0004 drops nothing;
+    -- the vocabulary and its CHECK are the next authorisation's. Until then no
+    -- action value denotes an amendment, so nothing in this platform writes one.
+    amends_event_id UUID,
+
     CONSTRAINT exception_events_org_exception_fk
-        FOREIGN KEY (exception_id, org_id) REFERENCES exceptions (id, org_id)
+        FOREIGN KEY (exception_id, org_id) REFERENCES exceptions (id, org_id),
+
+    -- The FOREIGN KEY TARGET for the self-reference below, derived from
+    -- exceptions_org_exception_unique. Not redundant with the primary key: the
+    -- primary key already enforces uniqueness, and this exists so that a
+    -- foreign key can name (id, org_id) at all -- without it PostgreSQL answers
+    -- 42830, "there is no unique constraint matching the given keys".
+    CONSTRAINT exception_events_org_event_unique UNIQUE (org_id, id),
+
+    CONSTRAINT exception_events_amends_event_fk
+        FOREIGN KEY (amends_event_id, org_id) REFERENCES exception_events (id, org_id)
 );
 
 CREATE INDEX idx_exception_events_exception ON exception_events (org_id, exception_id, timestamp);
@@ -2251,4 +2288,5 @@ REVOKE INSERT, UPDATE, DELETE ON schema_migrations FROM clinical_app;
 INSERT INTO schema_migrations (version, name, checksum) VALUES
     (1, 'schema_migrations', '00d8c90bb0eaba561d843cde7a45eca5af4d594aca6a3e230938aef27286f559'),
     (2, 'baseline',          'cc842c3943b7aa1e5786d638eff742f63fd47ce5a5048d7321036234a5290af8'),
-    (3, 'report_retraction', 'd0e0ae8d149aa20aea64e18e47424f48efb63d0a7ccdd5cbfd9b3f8016202204');
+    (3, 'report_retraction', 'd0e0ae8d149aa20aea64e18e47424f48efb63d0a7ccdd5cbfd9b3f8016202204'),
+    (4, 'exception_amendment', 'a379abc3cf0a81da3af438f4bc092648ab196d1c53e5039cef106a02200743a0');

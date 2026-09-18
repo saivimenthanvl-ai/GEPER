@@ -57,8 +57,23 @@ def _fresh_from_schema_sql(connection) -> None:
 
 
 def _pre_mechanism(connection) -> None:
-    """A database as it existed BEFORE this wave: the baseline schema, no
-    history table. This is what every deployed clinical database is."""
+    """
+    A database at the BASELINE GENERATION with no history table.
+
+    THE DOCSTRING HERE USED TO SAY "this is what every deployed clinical
+    database is", AND THAT SENTENCE WAS FALSE -- Standing Rule 3, and it cost
+    a real defect. A deployed database may be an EARLIER generation than the
+    baseline, and this helper cannot produce one: it applies the baseline
+    itself, so every adoption row that uses it exercises adoption against a
+    database already at the baseline. That is why all four rows below were
+    green while `adopt_existing` stamped a real pre-security database as
+    current.
+
+    The earlier generation is exercised by
+    `test_w143_adoption_proves_the_generation.py`, which starts from a
+    committed byte copy of `7b034e5:clinical/schema.sql`. Do not add an
+    adoption row here that means to test an older database; it cannot.
+    """
     baseline = {m.version: m for m in migrate.discover()}[migrate.BASELINE_VERSION]
     _apply_sql(connection, baseline.sql)
 
@@ -699,7 +714,7 @@ def test_the_migration_tests_never_call_the_drop_and_recreate_fixture():
     test files.
     """
     here = pathlib.Path(__file__).resolve().parent
-    files = sorted(here.glob("test_w126m_*.py")) + [here / "migration_db.py"]
+    files = sorted(here.glob("test_w126m_*.py")) + sorted(here.glob("test_w143_*.py")) + [here / "migration_db.py"]
     # Non-vacuity: a glob that matched nothing would make this pass by
     # checking no files at all, which is the exact shape of the failure it
     # exists to catch.

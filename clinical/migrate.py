@@ -128,6 +128,142 @@ _FILENAME = re.compile(r"^(\d{4})_([a-z0-9][a-z0-9_]*)\.sql$")
 _ASSERT = re.compile(r"^--\s*MIGRATION-ASSERT:\s*(.+?)\s*$", re.MULTILINE)
 
 
+# ─── GENERATION INVARIANTS ──────────────────────────────────────────────────
+#
+# WHY THESE EXIST AT ALL, AND WHY THEY ARE NOT IN THE MIGRATION FILE.
+#
+# Every `MIGRATION-ASSERT` line in `migrations/0002_baseline.sql` is a bare
+# `to_regclass('<table>') IS NOT NULL` probe, and that vocabulary is
+# STRUCTURALLY INCAPABLE of separating this schema generation from the one
+# before it: every security change in this stack is a COLUMN ADDED TO A TABLE
+# THAT ALREADY EXISTED. `exception_events` exists in both generations; only
+# `exception_events.org_id` -- the tenant-isolation column -- does not.
+# Measured, not assumed: a database built from `7b034e5:clinical/schema.sql`
+# (blob da97f847), the real pre-security schema, satisfies all five of the
+# baseline's own post-conditions, so `adopt_existing` stamped it as the
+# baseline and `/readyz` then answered 200 ready on a database with no
+# tenant-isolation column and no patient credential table.
+#
+# THE INVARIANTS LIVE HERE AND NOT IN THE MIGRATION FILE, DELIBERATELY.
+# `0002_baseline.sql` is frozen and `checksum_of` hashes the WHOLE file,
+# comments included; its checksum is the value `clinical/schema.sql`'s
+# stamping INSERT records. Adding assertion comments to it would change that
+# checksum, break the stamp, force a `schema.sql` edit, and make every
+# already-adopted database raise MigrationChecksumMismatch. The cost of
+# keeping them here instead is that the post-conditions of a migration are no
+# longer all in one file: a future migration that wants generation invariants
+# must add them to this table as well as its own header. That cost is paid
+# knowingly and the non-vacuity test below pins it.
+#
+# KEYED BY (version, name), NOT BY VERSION ALONE: the test suite discovers
+# throwaway migration sets from tmp_path that also number their files 0001 and
+# 0002, and those must not inherit the real baseline's invariants.
+
+
+@dataclasses.dataclass(frozen=True)
+class CatalogInvariant:
+    """
+    ONE FACT ABOUT THE CATALOG, with the words to say what it was.
+
+    `expression` is a boolean SQL expression evaluated exactly the way a
+    `MIGRATION-ASSERT` line is -- same `_failed_assertions` loop, same
+    inside-the-transaction timing, same refuse-and-roll-back path. What is new
+    is the VOCABULARY: `kind` is "column" or "constraint" or "table", and
+    only the first two can see the change this stack actually makes.
+
+    Read from `pg_catalog`, NOT from `information_schema`.
+    `information_schema.columns` is privilege-filtered -- it shows a role only
+    the columns of relations that role has some privilege on -- and `/readyz`
+    evaluates these as `clinical_app`, which is deliberately denied privileges
+    on parts of this schema. A privilege-filtered answer would report a
+    present column as absent and fail readiness for the wrong reason.
+    `pg_attribute`/`pg_constraint` are readable by every role.
+    """
+
+    kind: str
+    description: str
+    expression: str
+
+
+def _table_invariant(table: str) -> CatalogInvariant:
+    """A relation exists AND is an ordinary table. Weakest of the three: use
+    it only alongside a column or constraint invariant."""
+    return CatalogInvariant(
+        kind="table",
+        description=f"table {table!r} exists",
+        expression=(f"EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass('{table}') AND relkind = 'r')"),
+    )
+
+
+def _column_invariant(table: str, column: str) -> CatalogInvariant:
+    """
+    A COLUMN exists on a table. `to_regclass` rather than a literal schema
+    name so this follows the same `search_path` every other probe in this
+    module follows; an absent table makes `attrelid = NULL`, which matches no
+    row, so the invariant is false rather than an error.
+    """
+    return CatalogInvariant(
+        kind="column",
+        description=f"column {table}.{column} exists",
+        expression=(
+            "EXISTS (SELECT 1 FROM pg_attribute "
+            f"WHERE attrelid = to_regclass('{table}') AND attname = '{column}' "
+            "AND attnum > 0 AND NOT attisdropped)"
+        ),
+    )
+
+
+def _constraint_invariant(table: str, constraint: str, contype: str = "f") -> CatalogInvariant:
+    """A named CONSTRAINT of a given type exists on a table. Stronger than a
+    column probe: a column can be added back by hand, a composite foreign key
+    cannot be satisfied by a database whose rows do not support it."""
+    return CatalogInvariant(
+        kind="constraint",
+        description=f"constraint {constraint!r} on {table} exists",
+        expression=(
+            "EXISTS (SELECT 1 FROM pg_constraint "
+            f"WHERE conrelid = to_regclass('{table}') AND conname = '{constraint}' "
+            f"AND contype = '{contype}')"
+        ),
+    )
+
+
+# What separates the baseline generation from every earlier one. Each line is
+# a real change made by a real wave, chosen because a database of the earlier
+# generation DEMONSTRABLY lacks it -- verified by building both schemas and
+# diffing pg_catalog, not by reading a changelog:
+#
+#   exception_events.org_id + the composite FK  -- w129b tenant isolation
+#   reviewer_claims.report_id + fk_claim_report -- a claim belongs to a report
+#   users.registration_number                   -- clinician identity
+#   patient_logins / patient_sessions           -- w130 patient credentials
+#
+# NOTE WHAT IS DELIBERATELY ABSENT: `exception_events.amends_event_id`. It
+# belongs to w126, which is HELD and NOT merged, so it is not in this
+# baseline. Asserting it -- as one audit proposed -- would reject a genuinely
+# current database, which is the opposite defect.
+BASELINE_GENERATION_INVARIANTS: Tuple[CatalogInvariant, ...] = (
+    _column_invariant("exception_events", "org_id"),
+    _constraint_invariant("exception_events", "exception_events_org_exception_fk"),
+    _column_invariant("reviewer_claims", "report_id"),
+    _constraint_invariant("reviewer_claims", "fk_claim_report"),
+    _column_invariant("users", "registration_number"),
+    _table_invariant("patient_logins"),
+    _column_invariant("patient_logins", "password_hash"),
+    _table_invariant("patient_sessions"),
+    _column_invariant("patient_sessions", "patient_id"),
+)
+
+_GENERATION_INVARIANTS: Dict[Tuple[int, str], Tuple[CatalogInvariant, ...]] = {
+    (BASELINE_VERSION, "baseline"): BASELINE_GENERATION_INVARIANTS,
+}
+
+
+def generation_invariants(migration: "Migration") -> Tuple[CatalogInvariant, ...]:
+    """The invariants that apply to this migration, or none."""
+    return _GENERATION_INVARIANTS.get((migration.version, migration.name), ())
+
+
 class MigrationError(Exception):
     """Base for every refusal this module makes."""
 
@@ -287,15 +423,31 @@ def read_history(connection) -> Tuple[AppliedMigration, ...]:
     return tuple(AppliedMigration(version=r[0], name=r[1], checksum=r[2]) for r in rows)
 
 
+def _evaluate(connection, expression: str) -> bool:
+    with connection.cursor() as cur:
+        cur.execute(f"SELECT ({expression})")  # noqa: S608 -- from the repo's own files
+        row = cur.fetchone()
+    return bool(row and row[0] is True)
+
+
 def _failed_assertions(connection, migration: Migration) -> Tuple[str, ...]:
-    """Which of this migration's catalog post-conditions are NOT true."""
-    failed = []
-    for expression in migration.assertions:
-        with connection.cursor() as cur:
-            cur.execute(f"SELECT ({expression})")  # noqa: S608 -- from the repo's own files
-            row = cur.fetchone()
-        if not (row and row[0] is True):
-            failed.append(expression)
+    """
+    Which of this migration's catalog post-conditions are NOT true.
+
+    TWO SOURCES, ONE LOOP, AND THAT IS THE POINT. The migration file's own
+    `MIGRATION-ASSERT` lines come first, unchanged; then the generation
+    invariants held in this module for that migration. Putting both here --
+    rather than only in `adopt_existing` -- is what makes the fix reach
+    `/readyz`: `inspect_state` calls this for every applied migration on every
+    call, so a database that was stamped by an older build of this runner, or
+    by a hand-written history row, is reported `schema_drift` instead of ready.
+    """
+    failed = [expression for expression in migration.assertions if not _evaluate(connection, expression)]
+    failed.extend(
+        invariant.description
+        for invariant in generation_invariants(migration)
+        if not _evaluate(connection, invariant.expression)
+    )
     return tuple(failed)
 
 
@@ -556,8 +708,16 @@ def adopt_existing(
         the baseline should actually run. Use --migrate.
       * a history table already exists -- adoption has happened, or this
         database is further along than the caller thinks.
-      * the baseline's own catalog post-conditions do not hold -- the sentinel
-        table exists but this is not the baseline schema.
+      * the baseline's post-conditions do not hold -- the sentinel table
+        exists but this is not the baseline GENERATION. This is the refusal
+        the false-positive defeated: the file's own five post-conditions are
+        table probes over tables that predate every security change, so a
+        real pre-security database satisfied all five and was stamped as
+        current. `_failed_assertions` now also evaluates
+        `BASELINE_GENERATION_INVARIANTS` -- column- and constraint-level facts
+        that a database of the earlier generation cannot have -- so adoption
+        proves the database IS this generation rather than merely holding
+        tables of the right names.
     """
     on_disk = tuple(migrations) if migrations is not None else discover()
     by_version = {m.version: m for m in on_disk}
@@ -592,9 +752,11 @@ def adopt_existing(
             connection.rollback()
             raise MigrationStateError(
                 f"refusing to stamp the baseline: table {SENTINEL_TABLE!r} exists but this "
-                "database does not satisfy the baseline's own post-conditions: "
+                "database is not at the baseline schema generation -- it does not satisfy: "
                 + "; ".join(failed)
-                + ". Nothing was changed."
+                + ". This database is an EARLIER generation than the code expects; stamping "
+                "it would record a version it does not hold and every later migration would "
+                "compound the lie. Nothing was changed."
             )
         connection.commit()
         return (1, BASELINE_VERSION)

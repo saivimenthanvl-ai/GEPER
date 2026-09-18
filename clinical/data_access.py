@@ -1746,6 +1746,163 @@ class DataAccess:
         )
         return user_id
 
+    # ── w153 (WAVE 3): the third bootstrap step, which never had a ──────────
+    #    session-free form. Built to the human's w128 ruling
+    #    (`hive/agents/god/briefs/w128-provisioning.md`), which specifies this
+    #    operation exactly: "organisation row -> first user -> first
+    #    Administrator role assignment, in one transaction", session-free
+    #    "because it is called before any session can exist", operator-run,
+    #    and with NO HTTP ROUTE.
+    #
+    # WHY IT IS NEEDED, COUNTED AT fd9d63b RATHER THAN ASSERTED. `INSERT INTO
+    # role_assignments` occurs at exactly TWO production sites in this
+    # repository -- one inside `assign_role`, which requires an existing
+    # Administrator, and one inside `_create_system_session`, which only ever
+    # writes 'System' and which w141 made unassignable to a person. So a fresh
+    # deployment could not produce its first Administrator by any code path,
+    # and the four administrative routes `clinical/admin_endpoints.py` mounted
+    # were correct, tested and unreachable because of it.
+    #
+    # `clinical/bootstrap.py` IS NOT THIS AND NEVER WAS. Read rather than
+    # inferred from its name, it creates the two POSTGRES LOGIN ROLES that
+    # `schema.sql` grants to and optionally applies the schema. It writes no
+    # application row of any kind. It is a DATABASE bootstrap; this is an
+    # IDENTITY one, and they are not substitutes.
+    #
+    # THE THREE WRITES ARE DELIBERATELY OPEN-CODED, and this is the single
+    # most important thing about the method. Composing it out of the existing
+    # `create_organisation` and `create_user` would be the obvious
+    # implementation and it would be silently WRONG: `@auditable` calls
+    # `commit()` ITSELF after writing each audit row, OUTSIDE `@transactional`'s
+    # `_in_transaction` re-entrancy guard, so each inner call would commit
+    # mid-way. A failure at the role step would then leave a committed
+    # organisation and a committed user with NO ADMINISTRATOR -- the exact
+    # unusable state this method exists to prevent.
+    #
+    # THE TRANSACTION BOUNDARY is `@transactional` on this method. `@auditable`
+    # is the OUTER decorator, so on an unexpected exception `@transactional`
+    # has already ROLLED BACK before `@auditable`'s error branch writes and
+    # commits its row: the data goes, the evidence stays.
+    #
+    # WHAT MAKES IT INERT ONCE AN ADMINISTRATOR EXISTS -- and it is not a
+    # flag, because a flag is something a caller supplies:
+    #   * `org_id` is generated HERE, by `uuid.uuid4()`. There is no parameter
+    #     of any kind by which a caller could name an existing organisation,
+    #     so this method can never add an Administrator to a tenant that
+    #     already has one. The wrong version is UNWRITABLE, not merely
+    #     refused -- the same defence-by-absent-parameter shape as
+    #     `terminate_my_session` and `list_my_report_trend`.
+    #   * the role is a SQL LITERAL, not a parameter, so 'System' cannot be
+    #     reached through it either.
+    #   * it is on no served surface, and the only caller is an operator who
+    #     already holds the database credential and could therefore already
+    #     write these three rows by hand. It grants nobody a capability they
+    #     did not already have; it makes an out-of-band raw INSERT into one
+    #     audited atomic act.
+    # A SECOND CALL IS NOT REFUSED. It creates a SECOND organisation with that
+    # organisation's own first Administrator, which is spec 4.2's
+    # single-instance multi-organisation tenancy, not a bypass.
+    #
+    # THE ACTOR IS NULL AND THAT IS NOT AN OVERSIGHT. There is no session, so
+    # the audit row's `user_id` and `actor_role` are NULL: the creator is an
+    # operator outside the tenancy model and no principal exists to name. An
+    # `organisations.created_by` column was considered in the w128 ruling and
+    # recommended AGAINST for exactly that reason -- it could not be populated
+    # truthfully. What CAN be recorded truthfully is the operating context,
+    # which is why `operating_context` is a REQUIRED parameter rather than a
+    # convenience, and it goes in the existing `details` JSONB.
+    #
+    # NO SCHEMA CHANGE. Every column written already exists and `clinical_app`
+    # already holds INSERT on organisations, users and role_assignments.
+    @auditable(
+        action={
+            "success": "organisation_provisioned",
+            "error": "organisation_provisioning_failed",
+            "denied": "organisation_provisioning_denied",
+        },
+        resource_type="organisation",
+        requires_session=False,
+        reason="provisioning: called before any session exists -- this method is what makes the first session possible",
+        details_builder=lambda params, result: {
+            "name": params.get("name"),
+            "admin_email": params.get("admin_email"),
+            "operating_context": params.get("operating_context"),
+        },
+    )
+    @transactional
+    def provision_organisation(
+        self,
+        name: str,
+        admin_email: str,
+        admin_password: str,
+        operating_context: str,
+        full_name: Optional[str] = None,
+        registration_number: Optional[str] = None,
+        hospital: Optional[str] = None,
+    ) -> uuid.UUID:
+        """
+        Organisation row -> first user -> first Administrator role assignment,
+        in ONE transaction. Returns the new org_id, which is what `login`
+        needs (there is no lookup by name, by design).
+
+        Session-free, like `create_organisation` and `create_user`, and for
+        the same reason. NOT an administrator action: an operator with a
+        database credential and a Python interpreter runs it out of band.
+
+        `operating_context` is REQUIRED, not optional. The audit row this
+        method writes can carry no actor, so a free-text statement of who ran
+        it and why is the only accountability available; making it defaultable
+        would mean it was NULL on every row in practice.
+
+        WHAT THIS METHOD DELIBERATELY DOES NOT DO:
+          * It does not grant Approver. An Approver signs reports and the
+            grant needs a qualification basis (ISO 15189 7.4.1.5 c);
+            inventing one here would collapse the separation `assign_role`
+            exists to state.
+          * It does not seed retention policies. `_resolve_vcf_retention_days`
+            LEFT JOINs and falls back to the code default, so their absence is
+            a valid and already-tested state.
+          * It does not enable or disable the organisation. `disabled` takes
+            its schema default of FALSE.
+
+        `assigned_by` is the new user's own id. The column is NOT NULL and
+        there is no earlier principal in this organisation to name -- the same
+        self-granted shape `_create_system_session` already uses for 'System'.
+        """
+        now = self._clock.now()
+        org_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        assignment_id = uuid.uuid4()
+
+        self._execute(
+            "INSERT INTO organisations (org_id, name, created_at) VALUES (%s, %s, %s)",
+            (org_id, name, now),
+        )
+        self._execute(
+            "INSERT INTO users (user_id, org_id, email, password_hash, password_changed_at, "
+            "                   full_name, registration_number, hospital, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                user_id,
+                org_id,
+                admin_email,
+                self._hasher.hash(admin_password),
+                now,
+                _clean_identity_value(full_name, "full_name", allow_none=True),
+                _clean_identity_value(registration_number, "registration_number", allow_none=True),
+                _clean_identity_value(hospital, "hospital", allow_none=True),
+                now,
+                now,
+            ),
+        )
+        self._execute(
+            "INSERT INTO role_assignments (assignment_id, user_id, org_id, role, "
+            "                              assigned_by, assigned_at) "
+            "VALUES (%s, %s, %s, 'Administrator', %s, %s)",
+            (assignment_id, user_id, org_id, user_id, now),
+        )
+        return org_id
+
     @auditable(
         action="clinician_identity_set",
         resource_type="user",

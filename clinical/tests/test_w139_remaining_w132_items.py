@@ -105,15 +105,36 @@ _UNKNOWN_UUID = "00000000-0000-0000-0000-000000000000"
 # means.
 THE_REFUSAL = (401, json.dumps({"detail": "Authentication failed."}, separators=(",", ":")).encode())
 
-# The FOUR authenticated STAFF routes. `POST /auth/logout` is in this tuple and
+# The EIGHT authenticated STAFF routes. `POST /auth/logout` is in this tuple and
 # that is the entire point of §4 — it is the one that was in no set anywhere in
 # this repository, and it is easy to omit precisely because its success is a
 # 204 rather than a 200.
+#
+# ── WIDENED IN w152, AND THE WIDENING IS THIS FILE'S OWN LESSON APPLIED. ─────
+# It said FOUR, and four was every authenticated staff route when it was
+# written. w152 mounted the administrative surface — four more routes, all
+# staff-authenticated by the same `_get_session`. A refusal-parity set that
+# names "every authenticated staff route" and silently means "the four that
+# existed in 2026-09" is exactly the defect §4 exists to have closed: the
+# docstring of `test_w132_login_refusal_parity.py::_authenticated_route_probes`
+# records the same thing happening to it when the two logout routes landed.
+#
+# All eight are probed with the same eight INVALID credentials, so the
+# administrative routes can reach neither their role gate nor their domain
+# method here — the subject is the authentication refusal and nothing else.
 AUTHENTICATED_STAFF_ROUTES = (
     ("GET", "/exceptions/worklist?owner=someone", None),
     ("GET", f"/exceptions/orders/{_UNKNOWN_UUID}", None),
     ("PATCH", f"/exceptions/{_UNKNOWN_UUID}", {"resolution_action": "retry_check", "resolution_note": "x"}),
     ("POST", "/auth/logout", None),
+    # w152. The administrative surface. MEASURED, not assumed: the session
+    # dependency is solved before the request body is validated, so these
+    # answer the authentication refusal even with no body at all — which is
+    # what `_call` sends for a POST.
+    ("POST", f"/admin/users/{_UNKNOWN_UUID}/roles", {"role": "Orderer"}),
+    ("POST", f"/admin/users/{_UNKNOWN_UUID}/disabled", {"disabled": True}),
+    ("POST", f"/admin/patient-logins/{_UNKNOWN_UUID}/disabled", {"disabled": True}),
+    ("GET", "/admin/audit", None),
 )
 
 
@@ -299,7 +320,78 @@ def _call(client, method, path, cookies, body=None):
         return client.get(path, cookies=cookies)
     if method == "PATCH":
         return client.patch(path, json=body, cookies=cookies)
-    return client.post(path, cookies=cookies)
+    # w152: a POST with a declared body is now in the set, so the body is sent
+    # when there is one. `None` stays a bodyless POST rather than becoming a
+    # JSON `null`, because `/auth/logout` declares no body and a body it did
+    # not ask for is a different request from the one this set has been
+    # probing since w139.
+    if body is None:
+        return client.post(path, cookies=cookies)
+    return client.post(path, json=body, cookies=cookies)
+
+
+def _staff_authenticated_paths():
+    """
+    Every path the app SERVES whose dependant carries the staff session
+    dependency. w152.
+
+    DERIVED FROM THE APP, which is the whole point: `AUTHENTICATED_STAFF_ROUTES`
+    is a hand-written list, and a hand-written list of "every authenticated
+    staff route" has now fallen behind the surface twice in this repository
+    (the two logout routes at w138, the four administrative routes at w152).
+    Walking `app.routes` is Standing Rule 9 in its corrected form -- descend
+    into the wrapper `include_router` leaves, or the walk reports two.
+    """
+    from clinical.app import app
+    from clinical.endpoints import _get_session
+
+    found = set()
+
+    def walk(routes):
+        for route in routes:
+            inner = getattr(route, "original_router", None)
+            if inner is not None:
+                walk(inner.routes)
+                continue
+            children = getattr(route, "routes", None)
+            if children:
+                walk(children)
+                continue
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            if _get_session in [d.call for d in dependant.dependencies]:
+                found.add(route.path)
+
+    walk(app.routes)
+    assert found, "no staff-authenticated route was found -- this comparison would be vacuous"
+    return found
+
+
+def _shapes(paths):
+    """
+    A path reduced to its SHAPE: every `{param}` segment and every segment
+    that is a UUID becomes `*`.
+
+    So `/exceptions/orders/{order_id}` (what the app declares) and
+    `/exceptions/orders/00000000-...` (what a probe sends) are the same route,
+    which is what a coverage comparison needs to be about.
+    """
+    reduced = set()
+    for path in paths:
+        segments = []
+        for segment in path.split("/"):
+            if segment.startswith("{") and segment.endswith("}"):
+                segments.append("*")
+                continue
+            try:
+                uuid.UUID(segment)
+            except (ValueError, AttributeError):
+                segments.append(segment)
+            else:
+                segments.append("*")
+        reduced.add("/".join(segments))
+    return reduced
 
 
 def _age_the_staff_session(conn, session_id, *, past_absolute_cap=False, past_idle_window=False):
@@ -1399,7 +1491,10 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
     listed — which for this route is every session-lifecycle state, none of
     which was listed.
 
-    Eight cases x four routes = 32 observations, ONE pair.
+    Eight cases x eight routes = 64 observations, ONE pair. (Four routes and
+    32 observations until w152 mounted the administrative surface; the route
+    list is now derived from the app rather than trusted -- see
+    `_staff_authenticated_paths`.)
     """
 
     def _cases(self, client, dao, conn, world):
@@ -1429,7 +1524,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
             "a session past its idle window": {STAFF_COOKIE: idle},
         }
 
-    def test_eight_cases_on_four_routes_are_one_pair(self, client, dao, conn, world):
+    def test_eight_cases_on_every_authenticated_staff_route_are_one_pair(self, client, dao, conn, world):
         """
         Catches: an oracle introduced on `POST /auth/logout` — the route in no
         set at `863f07e`. A logout that answered 204 to an unknown session id
@@ -1443,10 +1538,25 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         """
         cases = self._cases(client, dao, conn, world)
         assert len(cases) == 8, "the case list shrank -- this row would prove less than it claims"
-        assert len(AUTHENTICATED_STAFF_ROUTES) == 4, "a staff route left the list without being probed"
+        # w152: four, then eight. The number is a non-vacuity floor, not the
+        # property -- the property is that the list matches what the app
+        # serves, which the assertion below checks against the route census.
+        assert len(AUTHENTICATED_STAFF_ROUTES) == 8, "a staff route left the list without being probed"
         assert any(path.startswith("/auth/logout") for _, path, _ in AUTHENTICATED_STAFF_ROUTES), (
             "the logout route left the list -- it is the entire reason this class exists"
         )
+
+        # w152. THE LIST IS NOW CHECKED AGAINST THE APP, NOT AGAINST ITSELF.
+        # A count and a landmark are both satisfied by a list that has fallen
+        # behind the surface -- which is precisely how this tuple came to say
+        # FOUR while the app served eight. The staff-authenticated set is
+        # DERIVED from the app: every served route whose dependant carries
+        # `clinical.endpoints._get_session`. Both sides are reduced to their
+        # SHAPE, so a concrete probe UUID and a `{param}` segment compare
+        # equal and the comparison is about coverage, not spelling.
+        assert _shapes(_staff_authenticated_paths()) == _shapes(
+            path.split("?")[0] for _, path, _ in AUTHENTICATED_STAFF_ROUTES
+        ), (sorted(_staff_authenticated_paths()), [p for _, p, _ in AUTHENTICATED_STAFF_ROUTES])
 
         observed = {}
         for name, cookies in cases.items():
@@ -1454,7 +1564,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
                 response = _call(client, method, path, cookies, body)
                 observed[f"{name} | {method} {path}"] = (response.status_code, response.content)
 
-        assert len(observed) == 32, observed
+        assert len(observed) == 64, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 
@@ -1484,7 +1594,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
     def test_the_positive_twin_a_live_staff_session_is_not_in_that_set_on_any_route(self, client, world):
         """
         Without this, "everything is the one refusal" is satisfied perfectly by
-        a service that refuses everything, on all four routes at once.
+        a service that refuses everything, on all eight routes at once.
 
         Each route's OWN success shape is asserted, not merely "not the refusal
         pair", because three different 500s would satisfy that. The logout is
@@ -1517,6 +1627,34 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         )
         assert (patch.status_code, patch.content) != THE_REFUSAL
         assert patch.status_code == 404, patch.text
+
+        # w152. THE FOUR ADMINISTRATIVE ROUTES, each with its OWN shape and
+        # none of them the authentication refusal. `admin@a.example` holds
+        # Administrator in this fixture and does NOT hold Auditor, so the
+        # three Administrator routes answer 404 (an authenticated caller,
+        # naming a target that does not exist in its organisation) and the
+        # audit route answers 403 (authenticated, wrong role). Both are
+        # distinguishable from the 401 an anonymous caller gets, which is what
+        # makes the set above meaningful — and neither varies with anything
+        # the caller is not entitled to know (that is proved in
+        # test_w152_admin_surface.py::TestTheRefusalsCarryNoOracle).
+        from clinical.admin_endpoints import ADMIN_FORBIDDEN, ADMIN_NOT_FOUND
+
+        for method, path, body in AUTHENTICATED_STAFF_ROUTES:
+            if not path.startswith("/admin/"):
+                continue
+            response = _call(client, method, path, credential, body)
+            assert (response.status_code, response.content) != THE_REFUSAL, (path, response.text)
+            if path == "/admin/audit":
+                assert response.status_code == 403, response.text
+                assert response.json() == {"detail": ADMIN_FORBIDDEN}, response.text
+            else:
+                assert response.status_code == 404, (path, response.text)
+                assert response.json() == {"detail": ADMIN_NOT_FOUND}, response.text
+                assert _UNKNOWN_UUID not in response.text, (
+                    "the administrative 404 echoes the identifier it was asked about -- that is the "
+                    "oracle the exception routes are allowed and this surface is not"
+                )
 
         logout = client.post("/auth/logout", cookies=credential)
         assert (logout.status_code, logout.content) != THE_REFUSAL

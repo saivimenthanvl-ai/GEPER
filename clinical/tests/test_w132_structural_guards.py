@@ -71,6 +71,11 @@ _LANDMARKS = (
     "clinical/endpoints.py",
     "clinical/portal_endpoints.py",
     "clinical/auth_endpoints.py",
+    # w152. The administrative surface joins the landmark list because every
+    # absence-shaped guard in this file (no CORS, no second cookie setter) is
+    # vacuous over a tree that does not contain it, and it is now one of the
+    # four route modules.
+    "clinical/admin_endpoints.py",
     "clinical/data_access.py",
     "clinical/schema.sql",
     "geper/api/main.py",
@@ -238,6 +243,7 @@ class TestTheGuardsReadTheCodeThatRuns:
     """
 
     def test_each_module_these_guards_read_is_the_module_python_imports(self):
+        import clinical.admin_endpoints
         import clinical.app
         import clinical.auth_endpoints
         import clinical.data_access
@@ -247,6 +253,7 @@ class TestTheGuardsReadTheCodeThatRuns:
         for module, relative in (
             (clinical.app, "clinical/app.py"),
             (clinical.endpoints, "clinical/endpoints.py"),
+            (clinical.admin_endpoints, "clinical/admin_endpoints.py"),
             (clinical.portal_endpoints, "clinical/portal_endpoints.py"),
             (clinical.auth_endpoints, "clinical/auth_endpoints.py"),
             (clinical.data_access, "clinical/data_access.py"),
@@ -353,7 +360,13 @@ class TestThePerimeterIsStillEmpty:
             assert "CORSMiddleware" not in source, path
 
         names = {path.name for path in scanned}
-        assert {"app.py", "endpoints.py", "portal_endpoints.py", "auth_endpoints.py"} <= names, (
+        assert {
+            "app.py",
+            "endpoints.py",
+            "portal_endpoints.py",
+            "auth_endpoints.py",
+            "admin_endpoints.py",
+        } <= names, (
             f"the scan opened {sorted(names)} -- it is not reading the clinical package, "
             "so finding no CORS import proves nothing"
         )
@@ -434,6 +447,24 @@ class TestTheRouteCensus:
             # router in endpoints.py, /portal/logout on the portal router.
             ("/auth/logout", ("POST",)),
             ("/portal/logout", ("POST",)),
+            # w152 (WAVE 2). THE FIRST ADMINISTRATIVE ROUTES THIS SERVICE HAS
+            # EVER SERVED. Before them the surface was seventeen production
+            # routes and ZERO administrative ones, which is the single reason
+            # thirteen of fourteen unreachable capabilities were unreachable.
+            #
+            # Each is ONE existing domain method: assign_role,
+            # set_user_disabled, set_patient_login_disabled, read_audit. Each
+            # authenticates with the STAFF dependency out of endpoints.py and
+            # authorises through _require_role inside the domain method.
+            #
+            # NONE OF THEM IS REACHABLE BY A REAL DEPLOYMENT until Wave 3
+            # resolves the first-administrator deadlock; they are tested with
+            # a fixture-provisioned Administrator, which is a fixture and not
+            # a bootstrap.
+            ("/admin/users/{user_id}/roles", ("POST",)),
+            ("/admin/users/{user_id}/disabled", ("POST",)),
+            ("/admin/patient-logins/{patient_login_id}/disabled", ("POST",)),
+            ("/admin/audit", ("GET",)),
         }
     )
 
@@ -452,11 +483,12 @@ class TestTheRouteCensus:
 
         census = served_routes(app)
         # 11 at 863f07e; 13 from w135, which added the two patient report
-        # routes; 14 from w136, which added the patient report series. The
-        # number is checked against the EXPECTED set above, which is what
-        # actually names them — this row exists only to refuse the empty and
-        # wrapper-shaped answers.
-        assert len(census) == 14, census
+        # routes; 14 from w136, which added the patient report series; 18 from
+        # w152, which added the four administrative routes. The number is
+        # checked against the EXPECTED set above, which is what actually names
+        # them — this row exists only to refuse the empty and wrapper-shaped
+        # answers.
+        assert len(census) == 18, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

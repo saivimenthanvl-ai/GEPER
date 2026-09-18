@@ -197,8 +197,14 @@ _UNKNOWN_UUID = "00000000-0000-0000-0000-000000000000"
 
 def _authenticated_route_probes(client, credential):
     """
-    ALL SEVEN mounted routes that require a principal, exercised with
+    ALL ELEVEN mounted routes that require a principal, exercised with
     `credential` (a dict of cookies, possibly empty).
+
+    ── w152 MAKES IT ELEVEN, AND THE COUNT IS THE POINT. ───────────────────
+    Seven until the administrative surface landed. The paragraph below
+    records this exact sentence going false once already; it is written to be
+    re-read every time a route is mounted, and this is the second time it
+    had to be.
 
     ── THE HISTORY OF THIS DOCSTRING, KEPT BECAUSE IT IS THE FINDING. ──────
     It originally said "Every mounted route that requires a principal". That
@@ -216,8 +222,9 @@ def _authenticated_route_probes(client, credential):
 
     ── w139 (Wave 5) CLOSES C-16 AND RESTORES THE CLAIM. ───────────────────
     Both logout routes are in the dict below, so the sentence at the top is
-    true again -- COUNTED: seven mounted routes require a principal, seven
-    are probed. Every credential this function is ever called with is an
+    true again -- COUNTED AT THE TIME: seven mounted routes required a
+    principal, seven were probed. (w152 made it eleven; see the paragraph
+    above this one.) Every credential this function is ever called with is an
     INVALID one (no cookie, a malformed id, an unknown id, the other
     principal's session), so adding the logout routes terminates nothing and
     cannot disturb the other rows.
@@ -255,6 +262,29 @@ def _authenticated_route_probes(client, credential):
         # test.
         "POST /auth/logout": client.post("/auth/logout", cookies=credential),
         "POST /portal/logout": client.post("/portal/logout", cookies=credential),
+        # w152. THE ADMINISTRATIVE SURFACE, and adding it here is this
+        # docstring's own history repeating and being caught this time. Four
+        # routes that require a principal landed with the administrative
+        # surface; the sentence at the top of this function would have gone
+        # false again, silently, exactly as it did when the two logout routes
+        # landed. COUNTED: eleven mounted routes require a principal, eleven
+        # are probed.
+        #
+        # Every credential this function is called with is INVALID, so none of
+        # these reaches its role gate or its domain method — they are here for
+        # the authentication refusal and nothing else. Their role-authorisation
+        # and cross-organisation behaviour is
+        # `test_w152_admin_surface.py`'s subject.
+        "POST /admin/users/{id}/roles": client.post(
+            f"/admin/users/{_UNKNOWN_UUID}/roles", json={"role": "Orderer"}, cookies=credential
+        ),
+        "POST /admin/users/{id}/disabled": client.post(
+            f"/admin/users/{_UNKNOWN_UUID}/disabled", json={"disabled": True}, cookies=credential
+        ),
+        "POST /admin/patient-logins/{id}/disabled": client.post(
+            f"/admin/patient-logins/{_UNKNOWN_UUID}/disabled", json={"disabled": True}, cookies=credential
+        ),
+        "GET /admin/audit": client.get("/admin/audit", cookies=credential),
     }
 
 

@@ -69,6 +69,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from clinical import migrate
+from clinical.admin_endpoints import router as admin_router
 from clinical.auth_endpoints import router as auth_router
 from clinical.endpoints import router, session_router
 from clinical.portal_endpoints import router as portal_router
@@ -134,6 +135,27 @@ app.include_router(auth_router)
 # either session dependency. `POST /portal/logout` is on `portal_router`
 # above for the mirror reason: `_get_patient_session` lives in that file.
 app.include_router(session_router)
+
+# w152 (WAVE 2). THE ADMINISTRATIVE SURFACE, and it is the first one this
+# service has ever had: at e1be7ab the seventeen production routes contained
+# ZERO administrative ones, which is why fourteen domain capabilities were
+# unreachable for the SAME reason — no route.
+#
+# Mounted ALONGSIDE, never through, exactly as the portal and auth routers
+# are. It adds no dependency to any router above and none of them imports it.
+# What it DOES import, deliberately, is `clinical.endpoints`'s `_get_session`
+# and `_get_data_access`: the administrative routes authenticate with the
+# SAME staff dependency as the exception routes and authorise through the
+# SAME `DataAccess._require_role` inside the same domain methods. A second
+# copy of either would be a second security policy, and the weaker one would
+# be the one nobody reads.
+#
+# NOTHING HERE IS REACHABLE BY A REAL DEPLOYMENT YET. Every administrative
+# route requires an Administrator or an Auditor, and no production path makes
+# the first one — `assign_role` requires an existing Administrator and is the
+# only human-role writer. That deadlock is Wave 3's. Until it lands these
+# routes are IMPLEMENTED + UNREACHABLE and are classified that way.
+app.include_router(admin_router)
 
 
 @app.get("/healthz", tags=["health"], summary="Liveness probe")

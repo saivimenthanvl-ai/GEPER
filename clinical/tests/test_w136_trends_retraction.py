@@ -437,22 +437,54 @@ def _served_leaves():
     """Every path the application actually serves, walking INTO the wrapper
     objects `include_router` leaves in `app.routes` (Standing Rule 9 as
     corrected: neither the decorator count nor the naive `app.routes` count is
-    the answer)."""
+    the answer).
+
+    ── THIS FUNCTION DID NOT DO WHAT THIS DOCSTRING SAID. FIXED IN w152. ────
+    It descended `route.routes` only. On this stack (FastAPI 0.141.1 /
+    starlette 1.6.0) `include_router` leaves an `_IncludedRouter` wrapper
+    whose sub-routes hang off `original_router`, NOT off `routes` — so this
+    walk returned exactly TWO leaves, `/healthz` and `/readyz`, and the rows
+    built on it have been vacuous since they were written: "no served path
+    names a patient" was true of a surface that contained no patient route at
+    all. MEASURED at `e1be7ab` before the change: `len(_served_leaves())` was
+    2 on an application serving 14.
+
+    It was found because w152 asserted that a specific administrative path
+    WAS among the leaves, which is the positive-membership check Standing
+    Rule 4 asks for and which this file's absence rows never had. The three
+    assertions below are that check made permanent: refuse the empty answer,
+    refuse the wrapper-shaped answer, and require the landmark routes from
+    all three mounted routers to be present.
+    """
     from clinical.app import app
 
     found = []
 
     def walk(routes):
         for route in routes:
+            wrapped = getattr(route, "original_router", None)
+            if wrapped is not None:
+                walk(getattr(wrapped, "routes", []))
+                continue
             inner = getattr(route, "routes", None)
             if inner:
                 walk(inner)
+                continue
             path = getattr(route, "path", None)
             methods = getattr(route, "methods", None)
-            if path and methods and not inner:
+            if path and methods:
                 found.append((path, tuple(sorted(methods - {"HEAD", "OPTIONS"}))))
 
     walk(app.routes)
+
+    assert found, "the route walk found nothing"
+    assert all(path and path.startswith("/") for path, _ in found), found
+    assert all(methods for _, methods in found), found
+    landmarks = {"/portal/me", "/exceptions/worklist", "/auth/login", "/healthz"}
+    assert landmarks <= {path for path, _ in found}, (
+        f"the walk returned {sorted(path for path, _ in found)} -- it is not descending into the "
+        "routers the app includes, and every absence row built on it is vacuous"
+    )
     return found
 
 
@@ -476,11 +508,33 @@ class TestTheHeldTrendsWorkIsNotServedHere:
 
         Vacuous against: a patient identifier arriving in a QUERY STRING or a
         BODY — which §3's three-channel row covers instead.
+
+        THE EXEMPTION, w152. This class's own docstring states the property:
+        a staff route naming a patient "is not a breach of the
+        patient-identity ruling until a patient session reaches it. These
+        rows assert that no patient session can." Until w152 no staff route
+        named anything patient-shaped, so the ban could be blanket and was.
+
+        `POST /admin/patient-logins/{patient_login_id}/disabled` names a
+        CREDENTIAL — the distinction w133 made load-bearing — on the STAFF
+        router, behind the STAFF session dependency. The exemption is proved
+        rather than asserted: the path must actually be served, and the
+        behavioural half (a live patient session id is refused on it) is
+        `test_w152_admin_surface.py::TestTheUnauthenticatedCallIsRefused::
+        test_a_patient_session_id_is_not_a_staff_credential`.
         """
         leaves = _served_leaves()
         assert leaves, "the route walk found nothing — this row would pass vacuously"
         assert all(path.startswith("/") for path, _ in leaves), leaves
-        offenders = [path for path, _ in leaves if "{patient" in path]
+
+        exempt = {"/admin/patient-logins/{patient_login_id}/disabled"}
+        served = {path for path, _ in leaves}
+        assert exempt <= served, (
+            f"the exemption names {sorted(exempt - served)}, which this app does not serve — "
+            "a stale exemption silently widens the filter below"
+        )
+
+        offenders = [path for path, _ in leaves if "{patient" in path and path not in exempt]
         assert not offenders, f"served route(s) naming a patient in the path: {offenders}"
 
     def test_none_of_the_held_trends_modules_is_importable(self):

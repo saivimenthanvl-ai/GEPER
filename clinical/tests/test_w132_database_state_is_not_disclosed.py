@@ -139,8 +139,24 @@ def client(clinical_dsn):
 
 def authenticated_route_probes(client, credential):
     """
-    EVERY mounted route that requires a principal, exercised with
-    `credential` (a cookie dict, possibly empty).
+    NINE mounted routes that require a principal, exercised with `credential`
+    (a cookie dict, possibly empty).
+
+    ── RULE 3 APPLIED TO THIS DOCSTRING (w152): IT USED TO SAY "EVERY". ────
+    It was true when written and had already gone false twice before anybody
+    edited it — `POST /auth/logout` and `POST /portal/logout` landed in w132c
+    and were never added here (the same omission
+    `test_w132_login_refusal_parity.py::_authenticated_route_probes` records
+    finding in itself), and w152 added four administrative routes. The four
+    administrative ones are added below because the DATABASE-STATE channel is
+    exactly the one a new surface reopens: a route that let an anonymous
+    caller tell "DSN unset" from "database down" would be the w132 defect
+    back again, on a surface w132 never saw.
+    The two logout routes are still deliberately NOT here — they consume a
+    session, and their refusal parity is proved over eight session-lifecycle
+    cases in `test_w139_remaining_w132_items.py` and
+    `test_w138_patient_portal_api.py`, which is a stronger set than this one.
+    So the honest count is NINE, and which nine is written out.
 
     `owner` is supplied on the worklist here deliberately; whether a MISSING
     required query parameter yields 422 before the 401 is settled in its own
@@ -156,15 +172,29 @@ def authenticated_route_probes(client, credential):
         ),
         "GET /portal/me": client.get("/portal/me", cookies=credential),
         "GET /portal/me/tests": client.get("/portal/me/tests", cookies=credential),
+        # w152. The administrative surface, on the database-state channel.
+        "POST /admin/users/{id}/roles": client.post(
+            f"/admin/users/{_UNKNOWN_UUID}/roles", json={"role": "Orderer"}, cookies=credential
+        ),
+        "POST /admin/users/{id}/disabled": client.post(
+            f"/admin/users/{_UNKNOWN_UUID}/disabled", json={"disabled": True}, cookies=credential
+        ),
+        "POST /admin/patient-logins/{id}/disabled": client.post(
+            f"/admin/patient-logins/{_UNKNOWN_UUID}/disabled", json={"disabled": True}, cookies=credential
+        ),
+        "GET /admin/audit": client.get("/admin/audit", cookies=credential),
     }
 
 
 class TestEveryRefusalIsOneAnswer:
     def test_the_three_database_states_and_every_credential_state_are_one_answer(self, client, seeded, monkeypatch):
         """
-        THE ROW THIS WAVE EXISTS FOR. Seven refusal situations across five
-        routes — thirty-five responses — collapsed into a set that must have
-        exactly one member, in BOTH channels at once.
+        THE ROW THIS WAVE EXISTS FOR. Eight refusal situations across nine
+        routes — seventy-two responses — collapsed into a set that must have
+        exactly one member, in BOTH channels at once. (Seven situations across
+        five routes until w152 added the administrative surface to the probe
+        set; the count is stated so that a route silently leaving the set is
+        visible rather than invisible.)
 
         Before w132 this set had three members: (503, "...CLINICAL_DSN is not
         configured..."), (500, an uncaught exception) and (401, the generic

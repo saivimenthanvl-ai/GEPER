@@ -847,8 +847,50 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
         mounted as-is (w127-trends), which is the exact shape Wave 8 was warned
         about. Vacuous against: an identifier arriving in a query string or a
         body -- covered by test_portal_endpoints_http.py's three-channel rows.
+
+        THE EXEMPTION, w152, AND WHY IT IS NOT A WEAKENING. The property this
+        guard stands for is the one this file's own class docstring states:
+        "the principal there is STAFF, so it is not a breach of the
+        patient-identity ruling until a patient session reaches it. These
+        rows assert that no patient session can." Until w152 there was no
+        staff route naming anything patient-shaped, so the blanket form of
+        the ban was free and was taken.
+
+        `POST /admin/patient-logins/{patient_login_id}/disabled` is the first
+        one. It names a CREDENTIAL, not a patient -- w133 made that
+        distinction load-bearing in `set_patient_login_disabled`'s own
+        docstring -- and it is on the STAFF router with the STAFF dependency,
+        so a patient session presented to it is refused as the anonymous
+        refusal.
+
+        SO THE EXEMPTION CARRIES ITS OWN PROOF, three ways, rather than being
+        a hole: the exempt path must actually be SERVED (a stale exemption
+        fails here rather than quietly widening the filter), it must carry
+        `clinical.endpoints._get_session`, and the behavioural half -- that a
+        real live patient session id is refused on it -- is
+        `test_w152_admin_surface.py::TestTheUnauthenticatedCallIsRefused::
+        test_a_patient_session_id_is_not_a_staff_credential`.
         """
-        offenders = [path for path, _ in self._leaves(clinical_dsn) if "{patient" in path]
+        leaves = self._leaves(clinical_dsn)
+        served = {path for path, _ in leaves}
+
+        exempt = {"/admin/patient-logins/{patient_login_id}/disabled"}
+        assert exempt <= served, (
+            f"the exemption names {sorted(exempt - served)}, which this app does not serve -- "
+            "a stale exemption silently widens the filter below"
+        )
+
+        from clinical.endpoints import _get_session
+
+        for path, route in leaves:
+            if path in exempt:
+                dependencies = [d.call for d in getattr(route, "dependant").dependencies]
+                assert _get_session in dependencies, (
+                    f"{path} is exempted from the patient-identifier ban because it is a STAFF route, "
+                    f"and it does not carry the staff session dependency: {dependencies}"
+                )
+
+        offenders = [path for path, _ in leaves if "{patient" in path and path not in exempt]
         assert not offenders, f"served route(s) naming a patient in the path: {offenders}"
 
     def test_the_patient_surface_is_exactly_these_seven_routes(self, clinical_dsn):
@@ -889,18 +931,34 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
             "/portal/me/trends",
         }, served
 
-    def test_there_are_still_no_administrative_routes(self, clinical_dsn):
+    def test_no_administrative_operation_is_reachable_from_a_NON_administrative_module(self, clinical_dsn):
         """
-        The brief puts the first administrative HTTP route out of scope for
-        this wave. This asserts that none arrived -- including by accident,
-        which is the only way one could have.
+        RULE 3 APPLIED TO THIS DOCSTRING — fix the claim, not the code.
 
-        Catches: `enrol_patient_login` or `set_patient_login_disabled` wired to
-        a handler. Those are the two Administrator-gated patient-credential
-        operations, they have zero production callers at a931869, and a route
-        for either is a decision about the whole service's administrative
-        surface.
+        It used to read "the brief puts the first administrative HTTP route
+        out of scope for this wave" and was named
+        `test_there_are_still_no_administrative_routes`. That sentence was
+        true of w138's brief and is FALSE of w152's, which is the wave that
+        builds the administrative surface: `clinical/admin_endpoints.py` now
+        serves four administrative routes and the human's own dispatch asks
+        for them. Leaving the old name in place would have made this row read
+        as a standing prohibition that the tree contradicts.
+
+        WHAT THE ROW ACTUALLY PROVED, AND STILL PROVES, IS NARROWER AND IS
+        NOT WEAKENED: the three NON-administrative route modules must not
+        grow an administrative call. That was always the mechanism — the scan
+        never opened any other file — and it is the property that matters
+        now that an administrative module exists: an Administrator-gated
+        operation invoked from the patient portal's module, or from the login
+        module, would inherit that module's dependency rather than the staff
+        one, and no route census would notice.
+
+        AND IT IS NO LONGER AN ABSENCE OVER AN EMPTY SUBJECT. The positive
+        twin below requires that `clinical/admin_endpoints.py` DOES call
+        them; without it, a rename of every method in `DataAccess` would
+        leave this row green while proving nothing at all.
         """
+        import clinical.admin_endpoints
         import clinical.auth_endpoints
         import clinical.endpoints
         import clinical.portal_endpoints
@@ -913,8 +971,58 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
             "terminate_session",
             "enrol_totp",
         )
+
+        def _body(module):
+            source = pathlib.Path(inspect.getfile(module)).read_text(encoding="utf-8")
+            return source.split('"""', 2)[-1] if source.lstrip().startswith('"""') else source
+
         for module in (clinical.endpoints, clinical.auth_endpoints, clinical.portal_endpoints):
+            body = _body(module)
+            for name in administrative:
+                assert f"dao.{name}" not in body, (
+                    f"{module.__name__} now calls {name} -- an administrative operation belongs on the "
+                    "administrative router, with the staff dependency, or it is not administered at all"
+                )
+
+        # THE POSITIVE TWIN. w152 wired three of the six; the other three are
+        # carded and stopped (see hive/agents/god/w152-decision-cards.md:
+        # patient credential ISSUANCE is held on spec 16, TOTP enrolment on
+        # who supplies the secret). At least one must be present or the scan
+        # above is an absence over a vocabulary that no longer exists.
+        admin_body = _body(clinical.admin_endpoints)
+        wired = [name for name in administrative if f"dao.{name}" in admin_body]
+        assert wired == ["set_patient_login_disabled", "set_user_disabled", "assign_role"], wired
+
+    def test_patient_credential_ISSUANCE_is_still_not_wired_anywhere(self, clinical_dsn):
+        """
+        THE HALF THAT IS STILL HELD, and it is held on a product ruling
+        rather than on effort. `GEPER_CLINICAL_PLATFORM_SPEC.md` 16 reads
+        "Recommendation: no patient access in v1", and 33 still lists
+        "Patient portal access" as a decision required. `enrol_patient_login`
+        is the ONLY way a portal credential can come to exist -- its own
+        docstring says there is "no self-registration path of any kind" --
+        so wiring it is the act that would settle that ruling by
+        implementation. w152 wired the REVOCATION half, which only ever
+        contracts patient access, and stopped the issuance half.
+
+        This row is what makes that stop durable: it is the one
+        administrative patient-credential operation that must stay
+        unreachable until somebody answers 16.
+        """
+        import clinical.admin_endpoints
+        import clinical.auth_endpoints
+        import clinical.endpoints
+        import clinical.portal_endpoints
+
+        for module in (
+            clinical.endpoints,
+            clinical.auth_endpoints,
+            clinical.portal_endpoints,
+            clinical.admin_endpoints,
+        ):
             source = pathlib.Path(inspect.getfile(module)).read_text(encoding="utf-8")
             body = source.split('"""', 2)[-1] if source.lstrip().startswith('"""') else source
-            for name in administrative:
-                assert f"dao.{name}" not in body, f"{module.__name__} now calls {name} -- an administrative route"
+            assert "dao.enrol_patient_login" not in body, (
+                f"{module.__name__} now issues a patient portal credential. That is the act spec 16 "
+                "speaks to and it needs a ruling, not a route -- see w152-decision-cards.md Card 6"
+            )

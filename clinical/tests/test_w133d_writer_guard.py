@@ -522,6 +522,13 @@ _LANDMARK_STUBS = (
     "clinical/endpoints.py",
     "clinical/portal_endpoints.py",
     "clinical/auth_endpoints.py",
+    # w152. This list must track w132's `_LANDMARKS`, because `_anchor()` is
+    # the SAME helper (imported above) and a synthetic root that does not
+    # satisfy it is refused — which is the anchor doing its job. Adding the
+    # administrative module there without adding the stub here made sixteen
+    # rows in this file fail with "THE GUARDS ARE NOT ANCHORED", which is the
+    # correct failure and is why the anchor is shared rather than copied.
+    "clinical/admin_endpoints.py",
     "clinical/data_access.py",
     "geper/api/main.py",
 )

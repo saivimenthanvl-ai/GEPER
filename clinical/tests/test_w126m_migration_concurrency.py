@@ -88,6 +88,24 @@ class TestOnlyOneRunnerAtATime:
         Same connection, same call, same database; the only thing that changed
         is that A released the lock. The assertions are the opposite of the
         ones above, and they are about the database.
+
+        RE-AUTHORED IN w147, AND THE REASON IS A FINDING ABOUT w146's REPAIR
+        RATHER THAN ABOUT THIS ROW'S SUBJECT. w146 swept the suite for rows
+        that asserted THE SIZE OF `clinical/migrations` while meaning something
+        else, and repaired three files. This row was not one of them, and it
+        was the same defect: line 106 already derived the applied versions from
+        `migrate.discover()`, and the line below it then hard-coded
+        `((1, "schema_migrations"), (2, "baseline"))` -- the history of a
+        two-migration set. `0003_report_retraction.sql` is the first real third
+        migration and this is the row it went red on, in the file w146 did not
+        open.
+
+        The replacement is STRONGER, not weaker: it compares version AND name
+        for every migration on disk, so a runner that recorded the right count
+        of rows with the wrong names now fails here too. What it deliberately
+        does NOT do is re-derive the expectation from the same call the
+        assertion above uses -- `_history` reads the DATABASE, `discover`
+        reads the FILES, and the row is the claim that those two agree.
         """
         with scratch_database() as dsn:
             with connect(dsn, autocommit=True) as a, connect(dsn) as b:
@@ -104,7 +122,7 @@ class TestOnlyOneRunnerAtATime:
                 applied = migrate.migrate(b, lock_timeout=BLOCKED_TIMEOUT)
 
                 assert applied == tuple(m.version for m in migrate.discover())
-                assert _history(b) == ((1, "schema_migrations"), (2, "baseline"))
+                assert _history(b) == tuple((m.version, m.name) for m in migrate.discover())
                 assert "organisations" in _tables(b)
 
     def test_a_second_runner_arriving_after_the_first_finished_applies_nothing_twice(self):

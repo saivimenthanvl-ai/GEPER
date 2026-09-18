@@ -254,8 +254,74 @@ BASELINE_GENERATION_INVARIANTS: Tuple[CatalogInvariant, ...] = (
     _column_invariant("patient_sessions", "patient_id"),
 )
 
+# What separates the RETRACTION generation (migration 0003) from the baseline
+# one. Same rule as above and the same evidence: MEASURED by building a
+# database each way and diffing pg_catalog, not by reading the migration file.
+#
+# THE MEASURED DIFF, before -> after. Two real databases on PostgreSQL 16, one
+# with `0002_baseline.sql` applied and one with `0002` then `0003`, diffed row
+# by row across pg_class, pg_attribute, pg_constraint, pg_trigger, pg_proc and
+# the two privilege views (2026-09-18):
+#
+#   +2  pg_class relkind 'r'   report_retractions, retraction_notifications
+#                              (28 -> 30)
+#   +7  pg_class relkind 'i'   the two named indexes --
+#                              idx_retraction_org_report and
+#                              idx_retraction_notification_org_retraction --
+#                              plus the five Postgres builds for the two
+#                              primary keys and the three UNIQUE constraints
+#                              (84 -> 91)
+#   +20 pg_attribute rows      the two tables' own columns, 10 each
+#                              (273 -> 293)
+#   +17 pg_constraint rows     report_retractions: 4 FK, 3 CHECK, 1 PK,
+#                              1 UNIQUE. retraction_notifications: 3 FK,
+#                              2 CHECK, 1 PK, 2 UNIQUE. (137 -> 154)
+#   +6  role_table_grants      clinical_app SELECT/INSERT on both tables,
+#       rows for the two        clinical_retention SELECT on both -- from the
+#       granted roles           six privilege statements. (+72 column_privilege
+#                               rows, of which 4 are the column-scoped
+#                               tombstone UPDATE ruling E8 asks for.)
+#    0 pg_trigger rows         (3 -> 3)
+#    0 pg_proc rows            (37 -> 37)
+#    0 rows REMOVED in any section, and no definition changed -- which is the
+#      measurement "additive" actually means here.
+#
+# WHAT IS CHOSEN OUT OF THAT DIFF, AND WHY NOT ALL OF IT. A generation
+# invariant is evaluated on EVERY `/readyz`, so it is a cost per request and
+# the list is a sample, not a census. Three probes per table, one of each
+# strength, in the order that makes the next meaningful:
+#
+#   * the TABLE probe alone is the one a pre-security database defeated in
+#     w143 -- a name can exist in an older generation. It is here only to make
+#     the two below readable when they fail.
+#   * a COLUMN that a hand-rebuilt table would have to know about:
+#     `report_retractions.retracted_from_state` (human ruling E1, the stored
+#     rather than inferred state) and `retraction_notifications.status`
+#     (ruling E6's one-value debt vocabulary).
+#   * a named COMPOSITE FOREIGN KEY, which is the strongest of the three: it
+#     cannot exist unless `reports (org_id, id)` and
+#     `report_retractions (org_id, id)` carry the composite unique keys the
+#     tenant-isolation generation introduced. A database that merely has two
+#     tables of the right names cannot satisfy it.
+#
+# DELIBERATELY ABSENT: anything from the rest of the held stack. `w122`'s
+# `retract_report` verb, `w123`'s reader matcher and `w124`'s report-builder
+# changes are NOT in this repository, and an invariant asserting a column they
+# would add would reject a database that is correctly at this generation --
+# the same defect, in the other direction, that the baseline list avoids by
+# not asserting `exception_events.amends_event_id`.
+RETRACTION_GENERATION_INVARIANTS: Tuple[CatalogInvariant, ...] = (
+    _table_invariant("report_retractions"),
+    _column_invariant("report_retractions", "retracted_from_state"),
+    _constraint_invariant("report_retractions", "fk_retraction_report"),
+    _table_invariant("retraction_notifications"),
+    _column_invariant("retraction_notifications", "status"),
+    _constraint_invariant("retraction_notifications", "fk_retraction_notification_retraction"),
+)
+
 _GENERATION_INVARIANTS: Dict[Tuple[int, str], Tuple[CatalogInvariant, ...]] = {
     (BASELINE_VERSION, "baseline"): BASELINE_GENERATION_INVARIANTS,
+    (3, "report_retraction"): RETRACTION_GENERATION_INVARIANTS,
 }
 
 

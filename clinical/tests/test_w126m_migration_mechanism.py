@@ -78,6 +78,27 @@ def _pre_mechanism(connection) -> None:
     _apply_sql(connection, baseline.sql)
 
 
+def _the_set_adoption_covers() -> tuple:
+    """
+    THE MIGRATIONS `adopt_existing` ACTUALLY ACCOUNTS FOR -- 1 and the
+    baseline, and nothing above them.
+
+    Adoption applies 1 for real and stamps the baseline; its own docstring
+    says the rest is somebody else's job -- "Everything above the baseline
+    runs normally, by `migrate`" (clinical/migrate.py, `adopt_existing`). So
+    "this database is adopted" and "this database is at the newest migration
+    on disk" are the same state ONLY while the baseline is the newest file.
+    An adoption row that asserts the second is asserting the SIZE OF
+    `clinical/migrations`, not the behaviour of adoption, and it changes its
+    meaning the day a migration is added -- which is precisely what happened.
+
+    Pinning here is not a relaxation: the verdict asserted against this set is
+    the full four-question one, generation invariants included. What is
+    excluded is only the question adoption never claimed to answer.
+    """
+    return tuple(m for m in migrate.discover() if m.version <= migrate.BASELINE_VERSION)
+
+
 def _write_migrations(directory: pathlib.Path, files: dict) -> pathlib.Path:
     directory.mkdir(parents=True, exist_ok=True)
     for name, body in files.items():
@@ -346,6 +367,25 @@ class TestUpgradingADatabaseThatAlreadyExists:
         THE NEW-OBJECT HALF: `schema_migrations` did not exist before and does
         afterwards, with both versions recorded. Without this half the test
         passes against a runner that does nothing at all.
+
+        THE VERDICT HALF, RE-AUTHORED IN w146. This row used to end
+        `assert migrate.inspect_state(connection).ok is True`, which was a
+        claim about `adopt_existing` only by coincidence: the baseline was the
+        newest file on disk, so "adopted" and "fully current" named one state.
+        They are two states and the mechanism always said so. The row now
+        asserts them separately -- adoption's contract against the set
+        adoption covers, THEN readiness after the rest of the set has run.
+
+        CATCHES, as re-authored: an `adopt_existing` that records the versions
+        without proving the generation (the pinned verdict still evaluates
+        `BASELINE_GENERATION_INVARIANTS`), and an `adopt_existing` that leaves
+        a database the subsequent `migrate` cannot complete.
+
+        VACUOUS AGAINST: the generation question on an EARLIER-generation
+        database -- this helper cannot build one, as `_pre_mechanism` says at
+        length. That is `test_w143_adoption_proves_the_generation.py`. It is
+        also vacuous against a reordering of `inspect_state`'s questions --
+        that is `test_w146_generation_survives_a_third_migration.py`.
         """
         with scratch_database() as dsn, connect(dsn) as connection:
             _pre_mechanism(connection)
@@ -359,7 +399,25 @@ class TestUpgradingADatabaseThatAlreadyExists:
             assert orgs == (SENTINEL_ORG,)
             assert _catalog_has_table(connection, "schema_migrations")
             assert [row[0] for row in _history(connection)] == [1, 2]
-            assert migrate.inspect_state(connection).ok is True
+
+            # ADOPTION'S OWN CONTRACT, against the set adoption covers. Pinned
+            # rather than relaxed: `ok` here still means all four questions,
+            # the catalog one included.
+            adopted = migrate.inspect_state(connection, _the_set_adoption_covers())
+            assert adopted.ok is True, adopted.detail
+            assert adopted.pending == ()
+            assert adopted.current_version == migrate.BASELINE_VERSION
+
+            # AND THEN THE REST OF THE SET -- the other half of the contract,
+            # asserted as its own step with its own verdict. Two claims, two
+            # ways for this row to go red. Today `migrate` applies nothing
+            # here because the baseline IS the newest file; the assertion is
+            # written so that stays true when it no longer is.
+            migrate.migrate(connection)
+            full = migrate.inspect_state(connection)
+            assert full.ok is True, full.detail
+            assert full.pending == ()
+            assert [row[0] for row in _history(connection)] == [m.version for m in migrate.discover()]
 
     def test_migrate_refuses_a_pre_mechanism_database_rather_than_guessing(self):
         """

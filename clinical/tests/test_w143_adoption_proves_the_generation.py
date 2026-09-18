@@ -36,6 +36,30 @@ seven wrong versions the brief enumerates:
 These tests create their own databases (clinical/tests/migration_db.py) and
 never touch the package's drop-and-recreate fixtures -- a fixture that rebuilds
 from the CURRENT schema.sql would destroy the one property under test.
+
+w146 RE-AUTHORED THREE THINGS HERE AND NOTHING IN THE RUNNER. Every row in
+this file was written while `clinical/migrations/` held exactly two files, so
+"adopted", "at the newest migration" and "of the current generation" named one
+state and the rows could not say which of the three they were asserting. They
+are three states. `inspect_state` returns the FIRST refusal it finds and the
+generation verdict is the LAST one it reaches, so a third migration makes
+every database that has not applied it answer `schema_migrations_pending` --
+including the forged pre-security database this file exists to catch, whose
+real fault the probe would then never look for. The changes:
+
+  * `_stamp_history_without_proving_anything` stamps the WHOLE discovered set,
+    because a forgery claiming to be CURRENT must claim every migration there
+    is. This is what keeps the catalog verdict reachable through `/readyz`,
+    which calls `discover()` itself and cannot be handed a pinned set.
+  * the forged-history row states the precedence it depends on -- `pending` is
+    empty -- instead of relying on it silently.
+  * the adoption row asserts adoption's contract against the set ADOPTION
+    COVERS, and readiness separately, after the rest of the set has run.
+
+The twin this file never had -- a database refused for being BEHIND whose
+generation invariants are shown to HOLD -- is in
+`test_w146_generation_survives_a_third_migration.py`, together with the
+six-state discrimination and the proof that the vacuity is real.
 """
 
 from __future__ import annotations
@@ -102,19 +126,49 @@ def _build_fresh_from_schema_sql(connection) -> None:
     _apply(connection, SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
+def _the_set_adoption_covers() -> tuple:
+    """
+    The migrations `adopt_existing` accounts for: 1 and the baseline. See the
+    twin of this helper in `test_w126m_migration_mechanism.py` for why the
+    distinction is structural rather than tidy -- `adopt_existing`'s own
+    docstring ends "Everything above the baseline runs normally, by
+    `migrate`".
+    """
+    return tuple(m for m in migrate.discover() if m.version <= migrate.BASELINE_VERSION)
+
+
 def _stamp_history_without_proving_anything(connection) -> None:
     """
     WRONG VERSION C, BUILT ON PURPOSE. Create the history table and write
-    rows saying 1 and 2 are applied, with the REAL checksums, against a
-    database that is not at that generation. This is exactly the state the
-    broken `adopt_existing` produced, and it is what readiness has to see
-    through.
+    rows saying EVERY migration on disk is applied, with the REAL checksums,
+    against a database that is not at that generation. This is exactly the
+    state the broken `adopt_existing` produced, and it is what readiness has
+    to see through.
+
+    IT STAMPS `migrate.discover()`, NOT THE LITERAL `(1, BASELINE_VERSION)` IT
+    USED TO, AND THE CHANGE IS THE WHOLE POINT OF w146. The forgery's claim is
+    "this database is CURRENT". In a world where the baseline is the newest
+    file those are the same sentence; add a third migration and a history that
+    stops at the baseline is no longer claiming to be current -- it is
+    claiming to be BEHIND, which is a different and much cheaper lie.
+    `inspect_state` would catch that one at its second question
+    (`schema_migrations_pending`) and return before it ever reaches the fourth
+    (`schema_drift`), which is the only question this file is about. The row
+    below would still go red, but it would go red on the cheap refusal and,
+    once "repaired" to accept it, would stay green with
+    `BASELINE_GENERATION_INVARIANTS` emptied entirely.
+
+    Stamping the whole discovered set keeps `pending` EMPTY BY CONSTRUCTION.
+    That is what makes the catalog verdict reachable -- through
+    `inspect_state` AND through `/readyz`, which calls `discover()` itself and
+    cannot be handed a pinned set. The ordering inside `inspect_state` is
+    correct and is not touched; what changed is the forgery, which now forges
+    the thing it was always supposed to be forging.
     """
-    by_version = {m.version: m for m in migrate.discover()}
-    _apply(connection, by_version[1].sql)
+    on_disk = migrate.discover()
+    _apply(connection, {m.version: m for m in on_disk}[1].sql)
     with connection.cursor() as cur:
-        for version in (1, migrate.BASELINE_VERSION):
-            migration = by_version[version]
+        for migration in on_disk:
             cur.execute(
                 "INSERT INTO schema_migrations (version, name, checksum) VALUES (%s, %s, %s)",
                 (migration.version, migration.name, migration.checksum),
@@ -360,15 +414,21 @@ class TestARealPreSecurityDatabaseIsRefused:
         because every table the history's migrations mention is present.
 
         VACUOUS AGAINST: A and B at the adoption path -- this row never calls
-        `adopt_existing`.
+        `adopt_existing`. Also vacuous against a database that is merely
+        BEHIND: that is the cheaper refusal this row is built to stay clear
+        of, and its positive twin is
+        `test_w146_generation_survives_a_third_migration.py`'s
+        current-generation-but-behind row, which must answer
+        `schema_migrations_pending` with the generation invariants HOLDING.
         """
+        on_disk = migrate.discover()
         with scratch_database() as dsn, connect(dsn) as connection:
             _build_pre_security(connection)
             _stamp_history_without_proving_anything(connection)
 
             with connection.cursor() as cur:
                 cur.execute("SELECT version FROM schema_migrations ORDER BY version")
-                assert [r[0] for r in cur.fetchall()] == [1, migrate.BASELINE_VERSION]
+                assert [r[0] for r in cur.fetchall()] == [m.version for m in on_disk]
 
             state = migrate.inspect_state(connection)
             status, reason, text = _probe(client, monkeypatch, dsn)
@@ -376,8 +436,16 @@ class TestARealPreSecurityDatabaseIsRefused:
             # the lying rows are still there, which is the point
             with connection.cursor() as cur:
                 cur.execute("SELECT count(*) FROM schema_migrations")
-                assert cur.fetchone()[0] == 2
+                assert cur.fetchone()[0] == len(on_disk)
 
+        # THE PRECEDENCE THIS ROW DEPENDS ON, STATED INSTEAD OF ASSUMED.
+        # `schema_migrations_pending` is a cheaper refusal that `inspect_state`
+        # returns BEFORE it reads the catalog. If this database were behind,
+        # the reason below would be that one and this row would be certifying
+        # nothing about schema generations. It is not behind -- asserted, from
+        # the verdict's own `pending` field, in both the library call and
+        # (through the identical `reason`) the probe.
+        assert state.pending == ()
         assert state.ok is False
         assert state.reason == "schema_drift"
         assert "exception_events.org_id" in state.detail
@@ -399,6 +467,19 @@ class TestAGenuinelyCurrentDatabaseStillWorks:
         would break every real adoption.
 
         The sentinel proves the adoption did not drop and rebuild.
+
+        RE-AUTHORED IN w146, for the same reason as its twin in
+        `test_w126m_migration_mechanism.py`. `assert state.ok is True`
+        immediately after adoption was never a claim about generations; it was
+        a claim that the baseline is the newest migration on disk, which is a
+        fact about a directory listing. The generation claim is now asserted
+        against the set adoption covers -- where `ok` still means all four of
+        `inspect_state`'s questions, including the catalog one that IS this
+        file's subject -- and readiness is asserted after the rest of the set
+        has been applied.
+
+        VACUOUS AGAINST: C and D. It never forges a history and never builds
+        an earlier generation.
         """
         with scratch_database() as dsn, connect(dsn) as connection:
             _build_current_generation(connection)
@@ -408,9 +489,24 @@ class TestAGenuinelyCurrentDatabaseStillWorks:
 
             assert read_sentinel(connection) == ((SENTINEL_NOTE,), (SENTINEL_ORG,))
             assert _has_table(connection, "schema_migrations")
+
+            # E and F, which is what this row is for: the generation
+            # invariants must all HOLD on a genuinely current database. Pinned
+            # to adoption's set so the verdict cannot be pre-empted by a
+            # migration adoption never promised to apply.
+            adopted = migrate.inspect_state(connection, _the_set_adoption_covers())
+            assert adopted.ok is True, adopted.detail
+            assert adopted.pending == ()
+            assert adopted.current_version == migrate.BASELINE_VERSION
+
+            # ... and the rest of the set then runs normally, which is the
+            # other half of `adopt_existing`'s stated contract.
+            migrate.migrate(connection)
             state = migrate.inspect_state(connection)
-            assert state.ok is True
-            assert state.current_version == migrate.BASELINE_VERSION
+            assert state.ok is True, state.detail
+            assert state.pending == ()
+            assert state.current_version == max(m.version for m in migrate.discover())
+            assert read_sentinel(connection) == ((SENTINEL_NOTE,), (SENTINEL_ORG,))
 
     def test_a_fresh_database_from_schema_sql_is_ready(self, client, monkeypatch):
         """

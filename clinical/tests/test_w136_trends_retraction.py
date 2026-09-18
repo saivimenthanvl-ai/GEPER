@@ -30,15 +30,25 @@ taken the benefit of that bargain without paying it.
 AND NOTHING IS HIDDEN, which is the other half. E7: a retracted report must
 not become UNFINDABLE. E3: retraction does not refuse at the release gate. So
 the series applies NO retraction predicate and NO tombstone predicate — only
-release — and §6 pins that, with two rows that fail the moment
-`report_retractions` appears so that whoever merges w122 is told.
+release — and §5 pins that.
+
+w148: THE TABLE ARRIVED AND THE DECISION WAS MADE. Migration 0003 (2de2fef)
+brought `report_retractions` into the schema; §5's measurement row fired,
+naming the work it owed; and the human ruled DECISION 2 — "a trend point
+originating from a retracted report REMAINS in the patient's longitudinal data
+but carries an `is_retracted` flag. Do NOT expose `replacement_report_id` or
+other internal retraction details." §7 is that decision, tested. No filter was
+added anywhere. E4's optional replacement edge, which §5's row named as a
+possibility, was refused.
 
 WHAT THIS FILE DELIBERATELY DOES NOT TEST, AND WHY EACH IS ABSENT:
-  * A RETRACTED REPORT IN THE SERIES. Not constructible at 3a482f1:
-    `report_retractions` does not exist, there is no retract verb, and
-    `enforce_content_immutability` refuses to walk an approved report back at
-    the database. §6 asserts the measurement instead of pretending.
-  * A VARIANT CLASSIFICATION ANYWHERE. Refused — §7 proves the refusal holds
+  * A RETRACTION CREATED THROUGH A WRITER. There is none: re-counted at
+    2de2fef, `def retract_report` does not exist, and
+    `enforce_content_immutability` still refuses to walk an approved report
+    back at the database. §7 ARRANGES the row by direct insert — legitimate,
+    because its subject is a reader — and §5 asserts the verb's continued
+    absence.
+  * A VARIANT CLASSIFICATION ANYWHERE. Refused — §6 proves the refusal holds
     behaviourally, with a marker that cannot arrive by coincidence.
   * A PRODUCTION PATH THAT REACHES ANY OF THIS. `_release_report` has ZERO
     non-test callers at 3a482f1, so this route returns `[]` for every patient
@@ -107,6 +117,11 @@ RUN_DOCUMENT = {
 }
 
 A_UUID_THAT_NAMES_NOTHING = uuid.UUID("2c9f0a2e-7b41-4f3a-9d18-6e5b2c4a7f30")
+
+# A RETRACTION REASON THAT CANNOT ARRIVE BY COINCIDENCE — the same device as
+# CLASSIFICATION_MARKER above, for the datum w148's human decision 2 refuses to
+# this surface by name.
+RETRACTION_REASON_MARKER = "w148-retraction-reason-must-never-reach-a-patient"
 
 
 # ─── fixtures ────────────────────────────────────────────────────────────────
@@ -355,6 +370,39 @@ def _tombstone(conn, org_id, report_id):
             (T0, actor, org_id, report_id),
         )
     conn.commit()
+
+
+def _retract(conn, org_id, report_id, reason, replacement_report_id=None, from_state="released"):
+    """
+    Record a retraction of `report_id` BY DIRECT INSERT — ARRANGEMENT, not the
+    bypass pattern, and the distinction is stated rather than left to be
+    reconstructed.
+
+    The bypass pattern is a test that builds its EXPECTATION with raw SQL and
+    therefore passes while the method under test is broken. The subject of
+    every row that calls this is `list_my_report_trend`, a READER, and every
+    expectation below is read back through `GET /portal/me/trends`. The raw
+    SQL only puts a row in a table.
+
+    IT IS RAW SQL BECAUSE THERE IS NO WRITER. `def retract_report` does not
+    exist in clinical/data_access.py — the row below asserts that, it is
+    green, and w148 deliberately did not bring the verb across. When one
+    arrives these calls become calls to it.
+
+    `retracted_from_state` is CHECKed to ('approved', 'released') by ruling E1.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id FROM users WHERE org_id = %s LIMIT 1", (org_id,))
+        actor = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO report_retractions "
+            "(org_id, report_id, retracted_at, retracted_by, reason, retracted_from_state, "
+            " replacement_report_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (org_id, report_id, T0, actor, reason, from_state, replacement_report_id),
+        )
+    conn.commit()
+    return actor
 
 
 def _portal_login(client, org_id, email, password=PASSWORD):
@@ -961,30 +1009,20 @@ class TestTheSuccessAnswerIsNotAnExistenceOracleEither:
 
 
 class TestTheRetractionVerdict:
-    def test_no_retraction_mechanism_exists_so_no_row_here_pretends_one_does(self, conn, world):
-        """
-        THE MEASUREMENT. `report_retractions` is on the held, unmerged
-        w122-retraction branch; it does not exist here, so a retracted report
-        cannot be constructed and the queue's required "retracted-data
-        behaviour" resolves, measurably, to NOT APPLICABLE at this SHA.
+    """
+    THE MEASUREMENT THAT STOOD HERE HAS BEEN ANSWERED. Until 2de2fef
+    `report_retractions` did not exist and the first row said so, naming the
+    work its arrival would owe: an `is_retracted` field PER POINT, and no
+    filter in `_MY_RELEASED_REPORTS_SQL`. The table arrived, the row fired, the
+    human decided, and w148 did exactly that — see
+    `TestTheRetractedTrendPointIsShownAndFlagged` below for the behavioural
+    answer. E4's optional `replacement_report_id`, which that row also named as
+    a possibility, was REFUSED by the same decision.
 
-        Catches: w122 being merged without anyone revisiting THE SERIES — which
-        is a different surface from the one w135's equivalent row guards, and
-        needs its own decision: under E3/E7 a retracted point is SHOWN AND
-        FLAGGED, so the work is to ADD `is_retracted` per node (and E4's
-        optional `replacement_report_id`, which is the same edge shape as
-        `amends_report_id`), never to filter anything out.
-        """
-        with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass('public.report_retractions'), to_regclass('public.amendments')")
-            retractions, amendments = cur.fetchone()
-        assert amendments is not None, "the probe is broken — `amendments` should exist"
-        assert retractions is None, (
-            "report_retractions now exists. GET /portal/me/trends must gain an `is_retracted` field "
-            "per POINT (its nodes are report ids, which is what retraction attaches to) — rulings E3 "
-            "and E7 say a retracted report is SHOWN AND FLAGGED, never hidden or made unfindable. "
-            "Do NOT add a filter to DataAccess._MY_RELEASED_REPORTS_SQL."
-        )
+    What remains here is the half that has NOT moved: no verb in this
+    repository can retract anything, and release is still the only thing that
+    keeps a report out of the series.
+    """
 
     def test_the_clinical_layer_still_has_no_operation_that_retracts_an_approval(self):
         """
@@ -1025,6 +1063,43 @@ class TestTheRetractionVerdict:
         `test_no_portal_handler_reaches_raw_result_data`; the fix was to the
         test, and it is recorded here rather than quietly repaired.
 
+        ─── THIS IS A GUARD AND w148 RE-AUTHORED IT. SAID PLAINLY. ───
+
+        WHAT IT PROTECTED, in its own words above: "a later implementer adding
+        `AND NOT EXISTS (SELECT 1 FROM report_retractions ...)` or a tombstone
+        filter, either of which contradicts E7", checked on the shared SQL AND
+        on the method's own Python "because the method could grow a
+        Python-side filter that the SQL check cannot see". Both halves are
+        about REMOVING POINTS FROM THE SERIES. The old text spelled that as
+        `"retract" not in ...`, which stated the property exactly only while
+        retraction could not legitimately appear at all.
+
+        WHY IT COULD NOT STAY LITERAL: the human's decision 2 puts
+        `is_retracted` on every point, and it must be derived in the ONE shared
+        statement — `test_the_two_methods_share_one_sql_text` pins that
+        constant's caller count at four and
+        `test_every_portal_statement_binds_the_patient_from_the_session`
+        requires any second statement to bind the session's patient itself. So
+        the word now appears in both texts.
+
+        THE PROPERTY STILL HOLDS, AND BOTH HALVES ARE STILL ASSERTED.
+          * SQL: the statement is split at its own `FROM`; retraction must be
+            PRESENT in the projection and ABSENT from every JOIN, LATERAL and
+            the WHERE. A projection is computed per row already chosen by the
+            FROM/WHERE — it cannot add or drop one.
+          * PYTHON: instead of banning the word, every construct that could
+            REMOVE AN ELEMENT is enumerated from the AST — `if`/`while` tests,
+            conditional expressions, comprehension conditions, and calls to
+            remove/pop/discard/filter — and none of them may mention
+            retraction. A `del` statement is banned outright. That is the
+            property the old line was approximating, stated directly.
+        Non-vacuity for the Python half: the method is asserted to contain at
+        least one `if` test, so the scan is looking at something.
+
+        THE BEHAVIOURAL PROOF is `TestTheRetractedTrendPointIsShownAndFlagged`
+        below: a really-retracted point is asserted to be still IN the series,
+        in its place, flagged. Any filter re-introduced anywhere fails those.
+
         Vacuous against: everything about who may read what.
         """
         import clinical.data_access
@@ -1032,8 +1107,19 @@ class TestTheRetractionVerdict:
 
         shared = DataAccess._MY_RELEASED_REPORTS_SQL
         assert "rep.state = 'released'" in shared, shared
-        assert "retract" not in shared.lower(), shared
         assert "tombston" not in shared.lower(), shared
+
+        select_list, separator, row_source = shared.partition("FROM patients p ")
+        assert separator, "the split is broken — this row would compare nothing to nothing"
+        assert "rep.state = 'released'" in row_source, row_source
+        assert "retract" not in row_source.lower(), (
+            "retraction has reached the FROM/JOIN/WHERE of the shared statement, where it can decide "
+            "which rows come back — E7 forbids exactly that. The flag belongs in the projection.\n"
+            f"{row_source}"
+        )
+        assert "AS is_retracted" in select_list, select_list
+        assert "rr.org_id = rep.org_id" in select_list, select_list
+        assert "rr.report_id = rep.id" in select_list, select_list
 
         source = pathlib.Path(inspect.getfile(clinical.data_access)).read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -1048,8 +1134,29 @@ class TestTheRetractionVerdict:
             "the AST lookup or the docstring strip removed too much — this row would be vacuous"
         )
         assert "superseded_by_report_id" in body, "the docstring strip removed executable code"
-        assert "retract" not in body.lower(), body
         assert "tombston" not in body.lower(), body
+        assert "is_retracted" in body, "the flag is not carried per point — decision 2 is not implemented"
+
+        # Every construct in the method that could REMOVE a point, enumerated.
+        removing = []
+        for node in ast.walk(method):
+            if isinstance(node, (ast.If, ast.IfExp, ast.While)):
+                removing.append(ast.unparse(node.test))
+            elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                removing.extend(ast.unparse(cond) for gen in node.generators for cond in gen.ifs)
+            elif isinstance(node, ast.Call) and getattr(node.func, "attr", None) in ("remove", "pop", "discard"):
+                removing.append(ast.unparse(node))
+            elif isinstance(node, ast.Call) and getattr(node.func, "id", None) == "filter":
+                removing.append(ast.unparse(node))
+        assert removing, "no element-removing construct found at all — the scan is broken, not the method"
+        for construct in removing:
+            assert "retract" not in construct.lower(), (
+                f"a Python-side retraction filter has appeared in list_my_report_trend: {construct}. "
+                "E7 and the human's decision 2 both say the point REMAINS in the series."
+            )
+        assert not [node for node in ast.walk(method) if isinstance(node, ast.Delete)], (
+            "list_my_report_trend now deletes something — a point removed after the fact is still a point removed"
+        )
 
     def test_every_node_of_the_series_is_a_report_id_which_is_what_retraction_attaches_to(
         self, client, dao, conn, world, vcf
@@ -1176,8 +1283,18 @@ class TestNoClassificationReachesThePatientThroughTheSeries:
 
     def test_the_trend_point_model_carries_no_classification_and_no_interpretation_id(self):
         """
-        THE SHAPE, AS AN EXPLICIT SET. A sixth field on this model is a thing
-        somebody must look at.
+        THE SHAPE, AS AN EXPLICIT SET. A SEVENTH field on this model is a
+        thing somebody must look at — it was five until w148 added the one
+        field the human approved, and the count moved here rather than the set
+        being loosened.
+
+        THE INTERNAL RETRACTION COLUMNS ARE NAMED IN THE FORBIDDEN LIST, not
+        merely absent from the set, so the failure message says what was
+        exposed. But this row is NOT the leakage test: a model field list is
+        vacuous against a handler that puts the datum somewhere else, and
+        against a model that gains a field later. The leakage row asserts over
+        the serialised body, in
+        TestTheRetractedTrendPointIsShownAndFlagged.
 
         Catches: a "helpful" widening of `PortalTrendPoint` — the cheapest way
         for the held work to arrive here one field at a time. Vacuous against:
@@ -1193,6 +1310,230 @@ class TestNoClassificationReachesThePatientThroughTheSeries:
             "released_at",
             "amends_report_id",
             "superseded_by_report_id",
+            "is_retracted",
         }, fields
-        for forbidden in ("interpretation_id", "classification", "variant_key", "content_hash", "approver_id"):
+        for forbidden in (
+            "interpretation_id",
+            "classification",
+            "variant_key",
+            "content_hash",
+            "approver_id",
+            "replacement_report_id",
+            "retraction_reason",
+            "retracted_by",
+            "retracted_at",
+            "retracted_from_state",
+        ):
             assert forbidden not in fields, f"PortalTrendPoint now carries {forbidden!r}"
+
+
+# ─── 7. retraction: the flag the patient sees, and nothing else (w148) ───────
+
+
+class TestTheRetractedTrendPointIsShownAndFlagged:
+    """
+    THE HUMAN'S DECISION, IMPLEMENTED (w148, PHASE 3): "A trend point
+    originating from a retracted report remains in the patient's longitudinal
+    data but carries an `is_retracted` flag. Do NOT expose
+    `replacement_report_id` or other internal retraction details."
+
+    THIS CLASS REPLACES THE MEASUREMENT THAT USED TO STAND HERE, whose failure
+    message named exactly this work: "must gain an `is_retracted` field per
+    POINT ... Do NOT add a filter to DataAccess._MY_RELEASED_REPORTS_SQL." The
+    table arrived at 2de2fef; no filter was added; the flag is a projection.
+
+    E4's OPTIONAL `replacement_report_id` IS NOT BUILT. The old row named it as
+    a possibility; the human's decision names it as a refusal. The refusal is
+    the one implemented.
+
+    HOW A RETRACTION IS CREATED HERE: `_retract` above, by direct insert,
+    because there is no retract verb in this repository and this wave did not
+    bring one across. That is ARRANGEMENT for a subject that is a READER, not
+    the bypass pattern -- every expectation below is still read back through
+    `GET /portal/me/trends`.
+    """
+
+    def test_a_normal_point_carries_the_flag_and_it_is_false(self, client, dao, conn, world, vcf):
+        """
+        (A) THE SIXTH FIELD, AND IT IS FALSE, on a series with a real
+        supersession edge in it so the row also proves the existing shape
+        survived: two points, in first-delivery order, with `amends_report_id`
+        and `superseded_by_report_id` still wired.
+
+        Catches: the field missing, the field hard-coded `true`, and the
+        ordering or the edge being lost to the new column. Vacuous against:
+        wrong-version F, the flag hard-coded `false`.
+        """
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.report_retractions')")
+            assert cur.fetchone()[0] is not None, "the premise is broken — migration 0003 did not run"
+
+        org = world["a"]
+        run = _pipeline(dao, org, org["first_patient"], vcf, "released")
+        amendment_id = _amend(dao, org, run)
+        conn.commit()
+
+        series = _series(client, _portal_login(client, org["org_id"], org["first_email"]))
+        assert [p["report_id"] for p in series] == [str(run["report_id"]), str(amendment_id)], series
+        assert [p["is_retracted"] for p in series] == [False, False], series
+        assert series[0]["superseded_by_report_id"] == str(amendment_id), series
+        assert series[1]["amends_report_id"] == str(run["report_id"]), series
+
+    def test_a_retracted_point_stays_in_the_series_and_says_true(self, client, dao, conn, world, vcf):
+        """
+        (B) THE ROW THE WAVE EXISTS FOR. The retracted report is the FIRST of
+        two points, so the row proves three things at once: it is still there
+        (E7 — never unfindable), it is flagged, and its NEIGHBOUR is not.
+
+        Catches: wrong-version F, the flag hard-coded `false`, which every
+        absence and isolation row passes; wrong-version E, the retracted point
+        filtered out instead of flagged, which would leave a one-point series;
+        and a derivation that flags the whole answer rather than the row.
+        Vacuous against: whose retraction set it — the two rows below.
+        """
+        org = world["a"]
+        run = _pipeline(dao, org, org["first_patient"], vcf, "released")
+        amendment_id = _amend(dao, org, run)
+        conn.commit()
+        _retract(conn, org["org_id"], run["report_id"], RETRACTION_REASON_MARKER)
+
+        series = _series(client, _portal_login(client, org["org_id"], org["first_email"]))
+        assert [p["report_id"] for p in series] == [str(run["report_id"]), str(amendment_id)], (
+            "a retracted point left the series — rulings E3 and E7 say it is SHOWN AND FLAGGED, and "
+            "the decision this wave implements says it REMAINS in the longitudinal data"
+        )
+        assert [p["is_retracted"] for p in series] == [True, False], series
+        # The existing semantics are untouched by the new column.
+        assert series[0]["superseded_by_report_id"] == str(amendment_id), series
+        assert series[1]["amends_report_id"] == str(run["report_id"]), series
+
+    def test_a_neighbours_retraction_in_the_same_organisation_does_not_flag_my_point(
+        self, client, dao, conn, world, vcf
+    ):
+        """
+        (C) THE PATIENT AXIS. Two patients in ONE organisation; theirs is
+        retracted, mine is not.
+
+        Catches: wrong-version B — a derivation bound to the organisation but
+        not to the report row it describes. Also catches the neighbour's point
+        appearing in my series. Vacuous against: the cross-tenant form.
+        """
+        org = world["a"]
+        mine = _pipeline(dao, org, org["first_patient"], vcf, "released")
+        theirs = _pipeline(dao, org, org["second_patient"], vcf, "released", tag="w148-neighbour")
+        conn.commit()
+        _retract(conn, org["org_id"], theirs["report_id"], RETRACTION_REASON_MARKER)
+
+        series = _series(client, _portal_login(client, org["org_id"], org["first_email"]))
+        assert [p["report_id"] for p in series] == [str(mine["report_id"])], series
+        assert series[0]["is_retracted"] is False, (
+            "another patient's retraction, in the same organisation, flagged this patient's point"
+        )
+
+        # The positive twin: the neighbour really does see it flagged, so
+        # "false" above is scoping and not a dead derivation.
+        neighbour = _series(client, _portal_login(client, org["org_id"], org["second_email"]))
+        assert [(p["report_id"], p["is_retracted"]) for p in neighbour] == [(str(theirs["report_id"]), True)]
+
+    def test_a_retraction_in_another_organisation_does_not_flag_my_point(self, client, dao, conn, world, vcf):
+        """
+        (D) THE TENANT AXIS, SEPARATELY — and the same email address exists in
+        both organisations in this fixture, so a derivation that lost the org
+        predicate has somewhere to go wrong.
+
+        Catches: wrong-version C — the join not org-bound. Vacuous against:
+        the same-tenant form, which is the row above.
+        """
+        a, b = world["a"], world["b"]
+        mine = _pipeline(dao, a, a["first_patient"], vcf, "released")
+        theirs = _pipeline(dao, b, b["first_patient"], vcf, "released", tag="w148-other-org")
+        conn.commit()
+        _retract(conn, b["org_id"], theirs["report_id"], RETRACTION_REASON_MARKER)
+
+        series = _series(client, _portal_login(client, a["org_id"], a["first_email"]))
+        assert [p["report_id"] for p in series] == [str(mine["report_id"])], series
+        assert series[0]["is_retracted"] is False, "a retraction in ANOTHER ORGANISATION flagged this patient's point"
+
+        other = _series(client, _portal_login(client, b["org_id"], b["first_email"]))
+        assert [(p["report_id"], p["is_retracted"]) for p in other] == [(str(theirs["report_id"]), True)]
+
+    def test_no_replacement_identifier_or_internal_detail_reaches_the_series_body(self, client, dao, conn, world, vcf):
+        """
+        (E) THE LEAKAGE ROW, OVER THE SERIALISED BODY. Asserting on
+        `PortalTrendPoint.model_fields` instead would be vacuous against a
+        model that gains a field later and against a handler that put the datum
+        somewhere else; the shape row further down does that job and says so.
+
+        THE REPLACEMENT IS A REAL REPORT THAT WAS NEVER RELEASED, so its id has
+        no legitimate reason to be anywhere in this response — finding it is a
+        leak and not a coincidence. `retracted_by` is a real user id; the reason
+        is a marker nothing else in this repository spells.
+
+        Catches: wrong-version D — `replacement_report_id` included "because
+        the data is there", which is exactly what E4 makes available and what
+        the human's decision refuses. Vacuous against: a leak by another route.
+        """
+        org = world["a"]
+        run = _pipeline(dao, org, org["first_patient"], vcf, "released")
+        never_released = _amend(dao, org, run, reason="w148: an amendment that is never issued", release=False)
+        conn.commit()
+        actor = _retract(
+            conn,
+            org["org_id"],
+            run["report_id"],
+            RETRACTION_REASON_MARKER,
+            replacement_report_id=never_released,
+        )
+
+        raw = client.get(
+            "/portal/me/trends", cookies={PATIENT_COOKIE: _portal_login(client, org["org_id"], org["first_email"])}
+        ).content
+        assert b'"is_retracted":true' in raw.replace(b" ", b""), (
+            "the positive half failed — this row would be vacuous against an empty series"
+        )
+        assert str(never_released).encode() not in raw, raw
+        assert str(actor).encode() not in raw, raw
+        assert RETRACTION_REASON_MARKER.encode() not in raw, raw
+        for forbidden in (b"replacement", b"retracted_by", b"retracted_at", b"retracted_from_state", b"reason"):
+            assert forbidden not in raw.lower(), (forbidden, raw)
+
+    def test_the_ordering_and_the_empty_and_isolated_answers_are_unchanged_by_the_new_column(
+        self, client, dao, conn, world, vcf
+    ):
+        """
+        (F) THE EXISTING SEMANTICS, RE-PROVED WITH RETRACTIONS PRESENT — the
+        half of the human's coverage list that is not about the flag at all:
+        "existing ordering and semantics intact".
+
+        Three released reports for one patient, the MIDDLE one retracted: the
+        order is still first-delivery order and the retraction does not move
+        it. And the other organisation's patient still gets the empty series
+        byte-for-byte, with a retraction sitting in the database — so the new
+        column did not turn `[]` into `[null]` or into an error.
+
+        Catches: a retraction-aware ORDER BY, and a derivation that makes the
+        empty answer stop being THE_EMPTY_SERIES. Vacuous against: the flag's
+        value, covered above.
+        """
+        a, b = world["a"], world["b"]
+        first = _pipeline(dao, a, a["first_patient"], vcf, "released", tag="w148-one")
+        second = _pipeline(dao, a, a["first_patient"], vcf, "released", tag="w148-two")
+        third = _pipeline(dao, a, a["first_patient"], vcf, "released", tag="w148-three")
+        conn.commit()
+        _retract(conn, a["org_id"], second["report_id"], RETRACTION_REASON_MARKER)
+
+        series = _series(client, _portal_login(client, a["org_id"], a["first_email"]))
+        assert [p["report_id"] for p in series] == [
+            str(first["report_id"]),
+            str(second["report_id"]),
+            str(third["report_id"]),
+        ], series
+        assert [p["is_retracted"] for p in series] == [False, True, False], series
+        released_at = [p["released_at"] for p in series]
+        assert released_at == sorted(released_at), series
+
+        other = client.get(
+            "/portal/me/trends",
+            cookies={PATIENT_COOKIE: _portal_login(client, b["org_id"], b["first_email"])},
+        )
+        assert (other.status_code, other.content) == THE_EMPTY_SERIES, other.content

@@ -191,7 +191,7 @@ class PortalReportItem(BaseModel):
     """
     One RELEASED report of the patient's own — the whole of it.
 
-    THREE FIELDS, AND THE SHORTNESS IS THE MEASUREMENT, NOT AN OMISSION.
+    FOUR FIELDS, AND THE SHORTNESS IS STILL THE MEASUREMENT, NOT AN OMISSION.
     `reports` has no content column, so there is no document here to withhold
     half of: what this model stores about a released report is that it exists,
     which test it came from, and when it was first delivered. That is these
@@ -209,11 +209,28 @@ class PortalReportItem(BaseModel):
     (see `_release_report`) and must not change what the patient is told about
     when their own report was issued — the same anchor the retention clock
     uses, ruling D3.
+
+    `is_retracted` — w148, human decision 1: "patient-facing report responses
+    must expose a simple retraction status/flag. Do NOT expose internal
+    retraction reasons, internal review details, or `replacement_report_id`."
+    So the flag is a BOOLEAN and the model has no fifth field: no `reason`, no
+    `retracted_by`, no `retracted_at`, no `retracted_from_state`, no
+    `replacement_report_id`. All five exist on the row the query already
+    touches and all five are deliberately left there — see
+    `DataAccess.list_my_released_reports`, whose refusal list carries the
+    reason for each, so the justification cannot ship separately from the
+    thing it justifies.
+
+    IT IS REQUIRED, NOT DEFAULTED. A handler that forgot to pass it would
+    raise here rather than quietly telling every patient that nothing has
+    been retracted — which is the wrong answer that every absence test and
+    every isolation test in w135 and w136 would pass.
     """
 
     report_id: str
     order_id: str
     released_at: str
+    is_retracted: bool
 
 
 class PortalTrendPoint(BaseModel):
@@ -228,7 +245,7 @@ class PortalTrendPoint(BaseModel):
     the held w127 trends work produces — has no retraction status at all,
     because one interpretation carries many reports.
 
-    FIVE FIELDS, AND FOUR OF THEM ARE ALREADY ON `PortalReportItem`. The one
+    SIX FIELDS, AND FOUR OF THEM ARE ALREADY ON `PortalReportItem`. The one
     new datum is the supersession edge, and it exposes no new class of
     information: both ends of every edge are reports this same response
     already lists, and an edge whose other end is a report the caller was
@@ -237,12 +254,18 @@ class PortalTrendPoint(BaseModel):
     `superseded_by_report_id` is DERIVED FROM THIS LIST, not queried. It can
     only ever name a report already in the answer.
 
-    NO `is_retracted` FIELD, and its absence is a measurement rather than a
-    decision: `report_retractions` does not exist at this SHA and no code in
-    this repository can retract anything. Under rulings E3 and E7 a retracted
-    report is SHOWN AND FLAGGED, never hidden — so when w122 lands the flag is
-    an added field on this model and a join on `report_id`, with no filter to
-    remove from the query. Two tests fail the moment that table appears.
+    `is_retracted` — w148, human decision 2: "a trend point originating from a
+    retracted report REMAINS in the patient's longitudinal data but carries an
+    `is_retracted` flag. Do NOT expose `replacement_report_id` or other
+    internal retraction details." The point is not filtered out (E7: never
+    unfindable) and the flag is the whole of what is exposed.
+
+    AND `replacement_report_id` IS THE ONE FIELD THIS MODEL WAS PREDICTED TO
+    GAIN AND DID NOT. The note that stood here said the flag would arrive "and
+    E4's optional `replacement_report_id`, which is the same edge shape as
+    `amends_report_id`". The edge shape was indeed available; the human
+    declined it. Recorded rather than quietly dropped, because the next reader
+    will find the prediction in the history and wonder.
 
     NO CLASSIFICATION, NO `interpretation_id`, NO `variant_key`. See
     `list_my_trends` and w135's refusal, which this wave did not reverse.
@@ -255,6 +278,8 @@ class PortalTrendPoint(BaseModel):
     amends_report_id: Optional[str] = None
     # Its inverse. Derived from the same list; never from a second query.
     superseded_by_report_id: Optional[str] = None
+    # Required, not defaulted — same reason as on `PortalReportItem`.
+    is_retracted: bool
 
 
 def _presented_patient_session_id(
@@ -399,6 +424,11 @@ async def list_my_reports(
             report_id=str(r["report_id"]),
             order_id=str(r["order_id"]),
             released_at=r["released_at"].isoformat(),
+            # PASSED THROUGH, NOT RE-DERIVED — the same rule as `stages`
+            # above. The derivation is one scalar subquery in the shared SQL,
+            # beside the patient anchor that binds it; a second derivation
+            # here would be a second answer to maintain.
+            is_retracted=r["is_retracted"],
         )
         for r in reports
     ]
@@ -457,6 +487,7 @@ async def get_my_report(
         report_id=str(report["report_id"]),
         order_id=str(report["order_id"]),
         released_at=report["released_at"].isoformat(),
+        is_retracted=report["is_retracted"],
     )
 
 
@@ -503,6 +534,7 @@ async def list_my_trends(
             superseded_by_report_id=(
                 str(point["superseded_by_report_id"]) if point["superseded_by_report_id"] else None
             ),
+            is_retracted=point["is_retracted"],
         )
         for point in series
     ]

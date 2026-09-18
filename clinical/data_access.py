@@ -683,6 +683,25 @@ ORG_SCOPED_TABLES = (
     # as login()'s users lookup already is.
     "patient_logins",
     "patient_sessions",
+    # w148. The w122 retraction tables, brought into the schema by migration
+    # 0003 at 2de2fef. BOTH CARRY org_id, so NEITHER MAY BE EXEMPTED --
+    # test_only_a_table_without_an_org_id_column_may_be_exempt permits an
+    # exemption only where the column genuinely does not exist, and that
+    # interlock is here because GAP-1 shipped green while exception_events was
+    # simply missing from this list.
+    #
+    # COUNTED, NOT ASSUMED. This file issues exactly ONE statement against
+    # either of them: the `is_retracted` projection inside the shared
+    # patient-report statement below, whose subquery binds
+    # `rr.org_id = rep.org_id` (and `rr.report_id = rep.id`). The constant's
+    # name is deliberately not spelled here -- the guard that pins its caller
+    # count counts occurrences of the name in this file's TEXT, so prose
+    # naming it would read as a fourth caller. Against
+    # `retraction_notifications` it issues none, which is why listing it is a
+    # true claim rather than an empty one -- the claim is about every
+    # statement there is, and there are none.
+    "report_retractions",
+    "retraction_notifications",
 )
 
 
@@ -2708,18 +2727,22 @@ class DataAccess:
     # itself; what cannot be demonstrated is a production path that reaches
     # them. Recorded here rather than implied.
     #
-    # RETRACTION IS NOT FILTERED HERE BECAUSE THERE IS NOTHING TO FILTER.
-    # COUNTED at d6246cd: `report_retractions` does not exist in schema.sql,
-    # and `clinical/data_access.py` has no unapprove/retract/rescind method --
-    # enforce_content_immutability() FORBIDS walking an approved report back at
-    # the database. The retraction model is held, unmerged, on w122-retraction,
-    # and its human rulings settle the reader question in the opposite
-    # direction from hiding: E7 says a retracted report must NOT become
-    # unfindable, and E3 says retraction does not refuse at the release gate --
-    # the retraction TRAVELS with the document instead. So the forward-safe
-    # shape for this surface is exactly the one below: filter on RELEASE, never
-    # on retraction, and let whoever merges w122 add the flag. A hiding
-    # predicate added here now would have to be removed then.
+    # RETRACTION IS FLAGGED HERE AND NEVER FILTERED -- w148, human decision 1.
+    # COUNTED, AND THE COUNT HAS MOVED since this note was first written:
+    # `report_retractions` DOES now exist in schema.sql (migration 0003,
+    # 2de2fef), while `clinical/data_access.py` STILL has no
+    # unapprove/retract/rescind method -- re-counted at 2de2fef, and
+    # enforce_content_immutability() still FORBIDS walking an approved report
+    # back at the database. So the table is readable and nothing in this
+    # repository can write to it; see the flag's own note below the readers.
+    #
+    # The human rulings settle the reader question in the opposite direction
+    # from hiding: E7 says a retracted report must NOT become unfindable, and
+    # E3 says retraction does not refuse at the release gate -- the retraction
+    # TRAVELS with the document instead. Decision 1 is that form exactly: these
+    # methods filter on RELEASE, never on retraction, and return
+    # `is_retracted` as a plain boolean beside the row. No reason, no
+    # retractor, no timestamp, no `replacement_report_id`.
 
     @auditable(
         action="portal_reports_read",
@@ -2772,13 +2795,26 @@ class DataAccess:
           * `state` -- every row returned is `released` by construction, so a
             state field could only ever say one thing.
           * `tombstoned_at` -- see the module note above and w135's card.
+          * EVERY COLUMN OF `report_retractions` EXCEPT THE FACT ITSELF --
+            w148, human decision 1, stated as a refusal because that is what
+            it is: `reason`, `retracted_by`, `retracted_at`,
+            `retracted_from_state` and `replacement_report_id` are all
+            available in the row this statement already touches, and none of
+            them is returned. The reason is internal review detail; the
+            retractor is a member of laboratory staff (the same ruling that
+            withholds `approver_id`); the replacement is E4's optional edge,
+            which the human declined for this surface. What IS returned is one
+            boolean, `is_retracted`.
+
+        WHAT IS NOW RETURNED, AND IT IS FOUR FIELDS RATHER THAN THREE:
+        `report_id`, `order_id`, `released_at`, `is_retracted`.
         """
         self._require_patient_session(patient_session)
         rows = self._query(
             self._MY_RELEASED_REPORTS_SQL + " ORDER BY rel.first_released_at, rep.id",
             (patient_session.patient_id, patient_session.org_id),
         )
-        return [{"report_id": r[0], "order_id": r[1], "released_at": r[2]} for r in rows]
+        return [{"report_id": r[0], "order_id": r[1], "released_at": r[2], "is_retracted": r[4]} for r in rows]
 
     @auditable(
         action="portal_report_read",
@@ -2816,7 +2852,7 @@ class DataAccess:
         )
         if row is None:
             raise NotFoundError(REPORT_NOT_FOUND)
-        return {"report_id": row[0], "order_id": row[1], "released_at": row[2]}
+        return {"report_id": row[0], "order_id": row[1], "released_at": row[2], "is_retracted": row[4]}
 
     # ── w136: the patient's own released reports, AS A SERIES ────────────────
     #
@@ -2853,21 +2889,67 @@ class DataAccess:
     # THE EDGE IS `amendments`, WHICH EXISTS AT THIS SHA -- COUNTED. The
     # corrective act this schema has is AMENDMENT (schema.sql:1213,
     # `clinical_app` holds SELECT at schema.sql:1594, `create_amendment` is
-    # Approver-gated); the one it does not have is RETRACTION
-    # (`report_retractions` appears 0 times in schema.sql; there is no
-    # retract/unapprove/rescind verb in this class; and
-    # enforce_content_immutability REFUSES to walk an approved report back).
+    # Approver-gated).
+    #
+    # RE-COUNTED IN w148, BECAUSE HALF OF WHAT THIS PARAGRAPH SAID HAS STOPPED
+    # BEING TRUE and a census claim gets fixed rather than left standing. It
+    # used to read "the one it does not have is RETRACTION (`report_retractions`
+    # appears 0 times in schema.sql ...)". At 2de2fef `report_retractions`
+    # appears in schema.sql and has its own migration. What has NOT changed is
+    # the other half: there is still no retract/unapprove/rescind verb in this
+    # class, and enforce_content_immutability still REFUSES to walk an approved
+    # report back. So the schema can RECORD a retraction and this layer can
+    # READ one; nothing in this repository can CREATE one.
     #
     # AND NOTHING IS FILTERED. No retraction predicate, no tombstone
     # predicate -- only release, exactly as the two readers above. Rulings E3
     # and E7 settle the reader question in the opposite direction from hiding:
     # a retracted report is STILL RETURNED, carrying the fact, because
-    # filtering it "would make a retracted report unfindable". So the
-    # forward-safe shape is a node set of report ids with no hiding predicate
-    # to remove: whoever merges w122 adds `is_retracted` (and E4's optional
-    # `replacement_report_id`, which is THE SAME EDGE SHAPE as the amendment
-    # edge below) per node, and deletes nothing. Two tests fail the moment
-    # `report_retractions` appears, naming E3 and E7.
+    # filtering it "would make a retracted report unfindable".
+    #
+    # w148: THAT IS NO LONGER A FORECAST. `report_retractions` arrived in the
+    # schema with migration 0003 (2de2fef), the two rows that said "fail the
+    # moment this table appears" did exactly that, and the human ruled both
+    # patient surfaces: a SIMPLE BOOLEAN, and nothing else.
+    #
+    #   1. PATIENT RETRACTED REPORT -- Decision A. The report responses expose
+    #      a retraction flag. NOT the reason, NOT the reviewer, NOT
+    #      `replacement_report_id`.
+    #   2. PATIENT RETRACTED TREND POINT -- Decision A. The point REMAINS in
+    #      the series and carries the same flag. Again no replacement id and
+    #      no internal detail.
+    #
+    # SO E4's OPTIONAL `replacement_report_id` IS REFUSED, and its refusal is
+    # the whole of the difference between this wave and the forecast above:
+    # the edge shape was available and the human declined it.
+    #
+    # WHERE THE FLAG LIVES, AND WHY IT COULD NOT LIVE ANYWHERE ELSE. It is a
+    # SCALAR `EXISTS` IN THE SELECT LIST of this same statement. Two standing
+    # requirements forced that and neither had any give in it:
+    #   * `test_every_portal_statement_binds_the_patient_from_the_session`
+    #     requires every statement a portal method issues to bind the
+    #     session's patient, and `test_the_two_methods_share_one_sql_text`
+    #     pins the caller count of this constant at exactly four -- one
+    #     definition and three callers. A SECOND statement breaks both.
+    #   * Rulings E3/E7 forbid the flag from removing a row.
+    # A projection satisfies both by construction: it is evaluated per row
+    # that the FROM/WHERE has ALREADY chosen, so it cannot add a row and
+    # cannot drop one, and it inherits this statement's patient anchor rather
+    # than needing its own.
+    #
+    # AND IT IS BOUND TO THE ROW IT DESCRIBES, on BOTH axes, structurally:
+    # `rr.org_id = rep.org_id AND rr.report_id = rep.id`. Without the first, a
+    # retraction in another tenant would flag this patient's report; without
+    # the second, one patient's retraction would flag their neighbour's. Both
+    # wrong versions have their own test.
+    #
+    # THE TWO GUARD ROWS THAT SAID `"retract" not in shared` WERE RE-AUTHORED,
+    # NOT DELETED, and the property they protected is unchanged: retraction
+    # must not decide WHICH ROWS COME BACK. They now assert that the word
+    # appears ONLY in the select list and NOWHERE in the FROM/JOIN/WHERE --
+    # which is the same property stated where it can still be enforced, and is
+    # strictly stronger than the old text on the half that matters, because
+    # the old text would have been satisfied by deleting the constant.
 
     # ONE SQL TEXT, THREE CALLERS. The list, the single-report read and the
     # trend must not be able to disagree about what "released" and "mine"
@@ -2895,8 +2977,18 @@ class DataAccess:
     # constraint on `amendment_report_id`, and a plain join would return the
     # patient's one report twice if one ever appeared twice. Same hazard the
     # `rel` aggregate exists for, one table over.
+    #
+    # THE FIFTH COLUMN IS THE RETRACTION FLAG (w148), and it is a SCALAR
+    # SUBQUERY IN THE PROJECTION rather than a join for the reason set out at
+    # length above: a projection cannot change the row set, which is exactly
+    # what rulings E3 and E7 forbid it from doing. It is bound on both axes to
+    # the row it describes. It returns a plain boolean and nothing else --
+    # no reason, no retractor, no timestamp, no replacement id -- so there is
+    # no internal detail in this result set for a handler to leak by accident.
     _MY_RELEASED_REPORTS_SQL = (
-        "SELECT rep.id, o.order_id, rel.first_released_at, sup.amends_report_id "
+        "SELECT rep.id, o.order_id, rel.first_released_at, sup.amends_report_id, "
+        "       EXISTS (SELECT 1 FROM report_retractions rr "
+        "                WHERE rr.org_id = rep.org_id AND rr.report_id = rep.id) AS is_retracted "
         "FROM patients p "
         "JOIN orders o          ON o.org_id = p.org_id  AND o.patient_id = p.patient_id "
         "JOIN samples s         ON s.org_id = o.org_id  AND s.order_id = o.order_id "
@@ -2961,6 +3053,16 @@ class DataAccess:
         that it was never released to anyone. See the long note above the SQL
         for rulings E3/E7 and for why a classification series is refused.
 
+        `is_retracted` -- w148, human decision 2: "a trend point originating
+        from a retracted report REMAINS in the patient's longitudinal data but
+        carries an `is_retracted` flag." A boolean, per POINT, derived in the
+        shared statement's projection and bound there to (org_id, report_id),
+        so a retraction belonging to another patient or another organisation
+        cannot reach it. NO `replacement_report_id` and no other internal
+        retraction detail, which the same decision refuses explicitly -- and
+        that refusal is what makes this different from `amends_report_id`
+        beside it, whose edge shape E4 would have allowed.
+
         IN THIS DEPLOYMENT THIS METHOD RETURNS `[]` FOR EVERY PATIENT, FOR
         EVER, because `_release_report` has ZERO non-test callers (re-counted
         at 3a482f1). It is still correct, and the tests construct the released
@@ -2980,6 +3082,12 @@ class DataAccess:
                 "released_at": r[2],
                 "amends_report_id": r[3],
                 "superseded_by_report_id": None,
+                # w148, human decision 2. A BOOLEAN, PER POINT, AND THE POINT
+                # STAYS. Nothing is dropped from `series` on account of it --
+                # there is no comprehension condition and no `if` anywhere in
+                # this method that reads it, which is what the re-authored
+                # guard in test_w136 now asserts structurally.
+                "is_retracted": r[4],
             }
             for r in rows
         ]

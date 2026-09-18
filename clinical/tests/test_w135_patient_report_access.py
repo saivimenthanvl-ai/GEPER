@@ -59,18 +59,29 @@ RULE 4 — EVERY ABSENCE HAS A POSITIVE TWIN. "The body does not contain X" is
 satisfied completely by a surface that returns nothing at all, and this surface
 returns nothing at all in production. Every absence row here is paired.
 
-RETRACTION, AND WHY THERE IS NO RETRACTED-REPORT ROW. COUNTED at d6246cd:
-`report_retractions` does not exist in schema.sql, `clinical/data_access.py`
-has no unapprove/retract/rescind method, and enforce_content_immutability()
-FORBIDS walking an approved report back at the database. A retracted report is
-not constructible at this SHA, so the queue's "own retracted report WHERE
-APPLICABLE" resolves to not applicable — and that is asserted as a measurement
-below rather than left as a gap. The established policy, read from the held
-w122-retraction branch, points AWAY from hiding: ruling E7 says a retracted
-report must not become unfindable and E3 says retraction does not refuse at the
-release gate. So this surface filters on RELEASE and never on retraction, and
-`test_the_only_thing_that_hides_a_report_from_its_owner_is_release_state` holds
+RETRACTION — AND THE COUNT HAS MOVED SINCE THIS PARAGRAPH WAS FIRST WRITTEN.
+It used to say `report_retractions` does not exist and a retracted report is
+not constructible, and a row below asserted it. RE-COUNTED at 2de2fef:
+
+  * `report_retractions` DOES exist in schema.sql — migration 0003 brought it
+    across, and the measurement row fired exactly as designed.
+  * `clinical/data_access.py` STILL has no unapprove/retract/rescind method,
+    and enforce_content_immutability() still FORBIDS walking an approved
+    report back at the database. There is no writer, in production or in a
+    test, that can create a retraction through this layer.
+
+So w148 implements the HUMAN'S DECISION 1: the report responses carry a simple
+`is_retracted` boolean and nothing else — no reason, no retractor, no
+timestamp, no `replacement_report_id`. Rulings E7 and E3 still point away from
+hiding, so this surface still filters on RELEASE and never on retraction, and
+`test_the_only_thing_that_hides_a_report_from_its_owner_is_release_state` — a
+GUARD, re-authored in w148 and saying so in its own docstring — still holds
 that shape in place.
+
+AND THE RETRACTION ROWS IN §8 ARRANGE THEIR STATE BY DIRECT INSERT, which is
+the ONE addition to the Rule-2a paragraph above. `_retract` explains why that
+is arrangement and not the bypass pattern: the subject of every one of those
+rows is a READER, and every expectation is still read back through the route.
 """
 
 from __future__ import annotations
@@ -100,6 +111,11 @@ CLIENT_IP = "203.0.113.11"
 THE_REFUSAL = (401, json.dumps({"detail": "Authentication failed."}, separators=(",", ":")).encode())
 
 T0 = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
+
+# A RETRACTION REASON THAT CANNOT ARRIVE BY COINCIDENCE. Nothing else in this
+# repository spells it, so finding it in a patient response is a leak and not
+# a collision. w148, human decision 1, refuses it to this surface by name.
+RETRACTION_REASON_MARKER = "w148-retraction-reason-must-never-reach-a-patient"
 
 VCF_TEXT = (
     "##fileformat=VCFv4.2\n"
@@ -339,6 +355,42 @@ def _tombstone(conn, org_id, report_id):
     conn.commit()
 
 
+def _retract(conn, org_id, report_id, reason, replacement_report_id=None, from_state="released"):
+    """
+    Record a retraction of `report_id` BY DIRECT INSERT — and that is
+    ARRANGEMENT, not the bypass pattern.
+
+    THE DISTINCTION MATTERS AND IS STATED HERE SO NOBODY HAS TO RECONSTRUCT
+    IT. The bypass pattern (the Phase 5d incident) is a test that builds its
+    EXPECTATION with raw SQL and therefore passes while the method under test
+    is broken. The subject of every row that calls this is a READER —
+    `list_my_released_reports`, `get_my_released_report`,
+    `list_my_report_trend` — and every expectation is read back through the
+    HTTP route. The raw SQL only puts a row in a table.
+
+    IT IS RAW SQL BECAUSE THERE IS NO WRITER, NOT BECAUSE ONE WAS AVOIDED.
+    `def retract_report` does not exist in clinical/data_access.py; the row
+    below this file's retraction class asserts that, it is green, and w148
+    deliberately did not bring the verb across. When a writer arrives these
+    calls become calls to it and nothing else in these rows changes.
+
+    `retracted_from_state` is CHECKed to ('approved', 'released') by ruling
+    E1, so this helper cannot be asked to retract a draft.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id FROM users WHERE org_id = %s LIMIT 1", (org_id,))
+        actor = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO report_retractions "
+            "(org_id, report_id, retracted_at, retracted_by, reason, retracted_from_state, "
+            " replacement_report_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (org_id, report_id, T0, actor, reason, from_state, replacement_report_id),
+        )
+    conn.commit()
+    return actor
+
+
 def _portal_login(client, org_id, email, password=PASSWORD):
     from clinical.auth_endpoints import _LOGIN_THROTTLE
 
@@ -412,11 +464,16 @@ class TestWhatAReleasedReportConsistsOfInThisModel:
         for suspicious in ("content", "body", "document", "pdf", "html", "text", "narrative"):
             assert suspicious not in columns, f"reports now stores {suspicious!r} -- w135's premise has changed"
 
-    def test_a_released_report_carries_three_fields_and_they_are_all_real(self, client, dao, conn, world, vcf):
+    def test_a_released_report_carries_four_fields_and_they_are_all_real(self, client, dao, conn, world, vcf):
         """
         THE POSITIVE TWIN FOR EVERY ABSENCE ROW IN THIS FILE, and it asserts
         VALUES, not shape: the report id the writers actually produced, the
         order it belongs to, and a release timestamp that parses.
+
+        THE FIELD SET MOVED FROM THREE TO FOUR IN w148 and this row is where
+        that is recorded. `is_retracted` was added on the human's decision 1;
+        the assertion is still an EXACT SET, so a fifth field — the internal
+        retraction detail the same decision refuses — fails here.
 
         Catches: a surface that returns an empty list for everybody, which
         satisfies every "does not contain" row in this file completely -- and
@@ -429,7 +486,7 @@ class TestWhatAReleasedReportConsistsOfInThisModel:
         body = _reports_over_http(client, cookie)
         assert len(body) == 1, body
         item = body[0]
-        assert set(item) == {"report_id", "order_id", "released_at"}, item
+        assert set(item) == {"report_id", "order_id", "released_at", "is_retracted"}, item
         assert item["report_id"] == str(report_id), item
         assert item["order_id"] == str(order_id), item
         assert dt.datetime.fromisoformat(item["released_at"]) is not None, item
@@ -1038,29 +1095,18 @@ class TestTheDataLayerMethodIsTheOneThatEnforcesIt:
 
 class TestTheRetractionQuestionAsItStandsAtThisSHA:
     """
-    THE QUEUE ASKS FOR "own retracted report WHERE APPLICABLE". These rows
-    establish, executably, that it is NOT applicable at this SHA -- and pin the
-    shape that keeps this surface correct when the held model lands.
+    THE QUEUE ASKED FOR "own retracted report WHERE APPLICABLE", and until
+    2de2fef the answer was NOT APPLICABLE: the table did not exist and the
+    first row here said so.
+
+    IT IS APPLICABLE NOW. Migration 0003 brought `report_retractions` into the
+    schema, this class's schema probe failed exactly as designed, and the
+    human decided what the patient sees. The behavioural answer lives in
+    `TestTheRetractedReportIsShownAndFlagged` below. What remains HERE is the
+    half of the measurement that has NOT moved: there is still no verb in this
+    repository that can retract anything, and release is still the only
+    predicate that decides what a patient can reach.
     """
-
-    def test_no_retraction_mechanism_exists_in_this_schema(self, conn, world):
-        """
-        THE MEASUREMENT. `report_retractions` is on the held, unmerged
-        w122-retraction branch; it does not exist here, so a retracted report
-        cannot be constructed and no row in this file pretends to.
-
-        Catches: w122 being merged without anyone revisiting this surface --
-        at which point rulings E3 and E7 have to be applied to the patient
-        view, and this row is where whoever merges it finds out.
-        """
-        with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass('public.report_retractions'), to_regclass('public.reports')")
-            retractions, reports = cur.fetchone()
-        assert reports is not None, "the probe is broken -- `reports` should exist"
-        assert retractions is None, (
-            "report_retractions now exists. w122's rulings E3/E7 say a retracted report must NOT be "
-            "hidden or made unfindable -- decide what the PATIENT sees and revisit w135."
-        )
 
     def test_the_clinical_layer_has_no_operation_that_retracts_an_approval(self):
         """
@@ -1089,18 +1135,68 @@ class TestTheRetractionQuestionAsItStandsAtThisSHA:
         document instead. So the correct predicate on this surface is release,
         and only release.
 
-        Catches: a later implementer adding `AND NOT EXISTS (SELECT 1 FROM
-        report_retractions ...)` or a tombstone filter to this query, which
-        would contradict E7 and would have to be removed again. Vacuous
-        against: everything about who may read what -- it is a statement about
-        one SQL text, and it is paired with the behavioural rows above.
+        ─── THIS IS A GUARD AND w148 RE-AUTHORED IT. SAID PLAINLY. ───
+
+        WHAT IT PROTECTED: that retraction cannot decide WHICH ROWS COME BACK
+        from `_MY_RELEASED_REPORTS_SQL`. Its own docstring named the failure it
+        was written for, in these words: "a later implementer adding `AND NOT
+        EXISTS (SELECT 1 FROM report_retractions ...)` or a tombstone filter to
+        this query". That is a FILTER. The old text spelled the property as
+        `"retract" not in shared.lower()`, which was an exact statement of it
+        only for as long as retraction could not legitimately appear in the
+        statement at all.
+
+        WHY IT COULD NOT STAY LITERAL: the human's decision 1 requires the
+        flag on this surface, and two other standing rows require it to be
+        derived in THIS statement -- `test_the_two_methods_share_one_sql_text`
+        pins this constant's caller count at exactly four, and
+        test_patient_identity.py's
+        `test_every_portal_statement_binds_the_patient_from_the_session`
+        requires every statement a portal method issues to bind the session's
+        patient. A second statement breaks both. So the word now appears in
+        this text, once, in the projection.
+
+        THE PROPERTY STILL HOLDS, AND IS ASSERTED, NOT ASSUMED. The statement
+        is split at its own `FROM` and the word is required to be present in
+        the select list and ABSENT from everything after it -- every JOIN,
+        every LATERAL, and the WHERE. A projection is evaluated per row that
+        the FROM/WHERE has already chosen: it can neither add a row nor remove
+        one. That is the same property, stated where it is still true, and on
+        one half it is STRICTLY STRONGER than the old text, which was
+        satisfied by deleting the constant outright and is now paired with a
+        positive assertion that the derivation exists.
+
+        THE BEHAVIOURAL PROOF is `TestTheRetractedReportIsShownAndFlagged`
+        below: a really-retracted, really-released report is asserted to be
+        STILL IN THE LIST and still readable by id. A filter re-introduced
+        anywhere -- SQL or Python -- fails those rows whatever this one says.
+
+        Catches: the filter this row has always been about. Vacuous against:
+        everything about who may read what.
         """
         from clinical.data_access import DataAccess
 
         shared = DataAccess._MY_RELEASED_REPORTS_SQL
         assert "rep.state = 'released'" in shared, shared
-        assert "retract" not in shared.lower(), shared
         assert "tombston" not in shared.lower(), shared
+
+        select_list, separator, row_source = shared.partition("FROM patients p ")
+        assert separator, "the split is broken -- this row would compare nothing to nothing"
+        assert "rep.state = 'released'" in row_source, row_source
+
+        # THE PROPERTY: retraction appears only where it cannot choose rows.
+        assert "retract" not in row_source.lower(), (
+            "retraction has reached the FROM/JOIN/WHERE of the shared statement, where it can decide "
+            "which rows come back. Rulings E3 and E7 forbid exactly that: a retracted report is SHOWN "
+            "AND FLAGGED, never hidden or made unfindable. The flag belongs in the projection.\n"
+            f"{row_source}"
+        )
+        # AND THE POSITIVE HALF, which the old text did not have: the
+        # derivation must actually be there, in the projection, bound on both
+        # axes to the row it describes.
+        assert "AS is_retracted" in select_list, select_list
+        assert "rr.org_id = rep.org_id" in select_list, select_list
+        assert "rr.report_id = rep.id" in select_list, select_list
 
     def test_a_tombstoned_report_still_appears_and_that_is_an_open_ruling(self, client, dao, conn, world, vcf):
         """
@@ -1137,3 +1233,235 @@ class TestTheRetractionQuestionAsItStandsAtThisSHA:
             "ruling (retention.py D4, explicitly left open) and not something this surface may decide "
             "by accident. See card W135-C4."
         )
+
+
+# ─── 8. retraction: the flag the patient sees, and nothing else (w148) ───────
+
+
+class TestTheRetractedReportIsShownAndFlagged:
+    """
+    THE HUMAN'S DECISION, IMPLEMENTED (w148, PHASE 2): "Patient-facing report
+    responses must expose a simple retraction status/flag. Do NOT expose
+    internal retraction reasons, internal review details, or
+    `replacement_report_id`."
+
+    THIS CLASS REPLACES THE MEASUREMENT THAT USED TO STAND HERE. Until 2de2fef
+    `report_retractions` did not exist and a row here asserted its absence,
+    naming what its arrival would owe: "decide what the PATIENT sees and
+    revisit w135." The table arrived; the decision was made; the rows below are
+    the positive form of the same obligation. An absence row is satisfied by
+    the broken state (Rule 4), so every row here asserts CONTENT -- the value
+    of the flag on a real, released, really-retracted report -- and not merely
+    that something appeared.
+
+    HOW A RETRACTION IS CREATED HERE, AND WHY IT IS NOT THE BYPASS PATTERN: see
+    `_retract` above. The subject of every row in this class is a READER.
+    """
+
+    def test_an_own_released_report_that_is_not_retracted_carries_the_flag_false(self, client, dao, conn, world, vcf):
+        """
+        (A) THE FOURTH FIELD, AND IT IS FALSE. The re-authored positive half of
+        the old schema probe: `report_retractions` now exists, and the patient
+        surface says, of a report nobody retracted, that it is not retracted.
+
+        Catches: the flag missing altogether, and the flag hard-coded `true`.
+        Vacuous against: wrong-version F, the flag hard-coded `false` -- which
+        is what the next row is for.
+        """
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.report_retractions')")
+            assert cur.fetchone()[0] is not None, "the premise is broken -- migration 0003 did not run"
+
+        order_id, report_id = _pipeline(dao, world["a"], world["a"]["first_patient"], vcf, "released")
+        conn.commit()
+        cookie = _portal_login(client, world["a"]["org_id"], world["a"]["first_email"])
+
+        body = _reports_over_http(client, cookie)
+        assert len(body) == 1, body
+        assert body[0] == {
+            "report_id": str(report_id),
+            "order_id": str(order_id),
+            "released_at": body[0]["released_at"],
+            "is_retracted": False,
+        }, body
+
+        single = client.get(f"/portal/me/reports/{report_id}", cookies={PATIENT_COOKIE: cookie})
+        assert single.status_code == 200, single.text
+        assert single.json()["is_retracted"] is False, single.text
+
+    def test_an_own_released_report_that_is_retracted_is_still_shown_and_says_true(self, client, dao, conn, world, vcf):
+        """
+        (B) THE POSITIVE ROW THE WHOLE WAVE EXISTS FOR, and it is two claims in
+        one: the report is STILL THERE (rulings E3/E7 -- a retracted report is
+        never hidden and never made unfindable), and it says so.
+
+        Catches: wrong-version F, the flag hard-coded `false` -- which every
+        absence row and every isolation row in this file passes. Catches
+        wrong-version E, the retracted row filtered out instead of flagged:
+        the report id is asserted present, not merely flagged. Vacuous
+        against: every question about WHOSE retraction set the flag, which the
+        two isolation rows below are for.
+        """
+        org = world["a"]
+        order_id, report_id = _pipeline(dao, org, org["first_patient"], vcf, "released")
+        conn.commit()
+        _retract(conn, org["org_id"], report_id, RETRACTION_REASON_MARKER)
+
+        cookie = _portal_login(client, org["org_id"], org["first_email"])
+        body = _reports_over_http(client, cookie)
+        assert [r["report_id"] for r in body] == [str(report_id)], (
+            "a retracted report vanished from its own patient's list -- rulings E3 and E7 say it is "
+            "SHOWN AND FLAGGED, never hidden or made unfindable"
+        )
+        assert body[0]["is_retracted"] is True, body
+        assert body[0]["order_id"] == str(order_id), body
+
+        single = client.get(f"/portal/me/reports/{report_id}", cookies={PATIENT_COOKIE: cookie})
+        assert single.status_code == 200, single.text
+        assert single.json()["is_retracted"] is True, single.text
+
+    def test_another_patients_retraction_in_the_same_organisation_does_not_set_my_flag(
+        self, client, dao, conn, world, vcf
+    ):
+        """
+        (C) THE PATIENT AXIS OF THE DERIVATION. Two patients in ONE
+        organisation; the neighbour's report is retracted and mine is not.
+
+        Catches: wrong-version B -- the flag derived from a join that is not
+        patient-bound, e.g. `EXISTS (SELECT 1 FROM report_retractions rr WHERE
+        rr.org_id = rep.org_id)`, under which any retraction in the tenant sets
+        everybody's flag. Also catches the neighbour's REPORT arriving in my
+        list at all. Vacuous against: the cross-tenant form, which is the next
+        row -- a same-org derivation passes an org-bound-only join.
+        """
+        org = world["a"]
+        _, mine = _pipeline(dao, org, org["first_patient"], vcf, "released")
+        _, theirs = _pipeline(dao, org, org["second_patient"], vcf, "released")
+        conn.commit()
+        _retract(conn, org["org_id"], theirs, RETRACTION_REASON_MARKER)
+
+        cookie = _portal_login(client, org["org_id"], org["first_email"])
+        body = _reports_over_http(client, cookie)
+        assert [r["report_id"] for r in body] == [str(mine)], body
+        assert body[0]["is_retracted"] is False, (
+            "another patient's retraction, in the same organisation, set this patient's flag -- "
+            "the derivation is not bound to the row it is describing"
+        )
+
+        # The neighbour's report is inaccessible by id as well, and the
+        # positive twin: its OWNER really does see it, retracted and true, so
+        # "absent" above means "scoped out" rather than "never written".
+        refused = client.get(f"/portal/me/reports/{theirs}", cookies={PATIENT_COOKIE: cookie})
+        assert (refused.status_code, refused.content) == THE_REFUSAL, refused.content
+        neighbour = _portal_login(client, org["org_id"], org["second_email"])
+        assert [r["is_retracted"] for r in _reports_over_http(client, neighbour)] == [True]
+
+    def test_another_organisations_retraction_does_not_set_my_flag(self, client, dao, conn, world, vcf):
+        """
+        (D) THE TENANT AXIS, SEPARATELY, and it is a separate row on purpose:
+        the same email address exists in both organisations here, so a
+        derivation keyed on anything but (org_id, report_id) has somewhere to
+        go wrong.
+
+        Catches: wrong-version C -- a join bound to the report id but not to
+        the organisation. Two reports in two tenants cannot share an id in
+        practice, so this row is ALSO checked the other way round: the other
+        organisation's report is asserted inaccessible by id, and its own
+        patient is asserted to see it flagged.
+        """
+        a, b = world["a"], world["b"]
+        _, mine = _pipeline(dao, a, a["first_patient"], vcf, "released")
+        _, theirs = _pipeline(dao, b, b["first_patient"], vcf, "released")
+        conn.commit()
+        _retract(conn, b["org_id"], theirs, RETRACTION_REASON_MARKER)
+
+        cookie = _portal_login(client, a["org_id"], a["first_email"])
+        body = _reports_over_http(client, cookie)
+        assert [r["report_id"] for r in body] == [str(mine)], body
+        assert body[0]["is_retracted"] is False, (
+            "a retraction in ANOTHER ORGANISATION set this patient's flag -- the derivation is not org-bound"
+        )
+        refused = client.get(f"/portal/me/reports/{theirs}", cookies={PATIENT_COOKIE: cookie})
+        assert (refused.status_code, refused.content) == THE_REFUSAL, refused.content
+
+        other = _portal_login(client, b["org_id"], b["first_email"])
+        assert [r["is_retracted"] for r in _reports_over_http(client, other)] == [True]
+
+    def test_an_approved_but_never_released_report_is_unreachable_even_though_it_is_retracted(
+        self, client, dao, conn, world, vcf
+    ):
+        """
+        (E) RETRACTION IS NOT A RELEASE GATE, IN EITHER DIRECTION -- and this
+        is the only unreleased state a retraction is REPRESENTABLE against:
+        `retracted_from_state` is CHECKed to ('approved', 'released') by ruling
+        E1, so a retracted draft cannot be written down and no row here
+        pretends otherwise. The draft / under_review / approved cases WITHOUT a
+        retraction are covered by the two parametrized rows in
+        TestOnlyAReleasedReportIsReachableByItsOwnPatient, which this wave left
+        untouched and green.
+
+        Catches: a retraction row becoming a second way IN -- e.g. the
+        derivation written as an inner `JOIN report_retractions`, which would
+        add an unreleased report to the answer as readily as a filter would
+        drop a released one. Vacuous against: the flag's VALUE, which the rows
+        above cover.
+        """
+        org = world["a"]
+        _, report_id = _pipeline(dao, org, org["first_patient"], vcf, "approved")
+        conn.commit()
+        _retract(conn, org["org_id"], report_id, RETRACTION_REASON_MARKER, from_state="approved")
+
+        cookie = _portal_login(client, org["org_id"], org["first_email"])
+        assert _reports_over_http(client, cookie) == [], "an unreleased report reached its patient"
+        refused = client.get(f"/portal/me/reports/{report_id}", cookies={PATIENT_COOKIE: cookie})
+        assert (refused.status_code, refused.content) == THE_REFUSAL, refused.content
+
+    def test_no_replacement_identifier_or_internal_retraction_detail_is_in_the_body(
+        self, client, dao, conn, world, vcf
+    ):
+        """
+        (F) THE LEAKAGE ROW, ASSERTED OVER THE SERIALISED BODY AND NOT OVER THE
+        MODEL'S FIELD LIST. A row that checks `PortalReportItem.model_fields`
+        is vacuous against a model that gains a field later, and against a
+        handler that puts the datum somewhere else.
+
+        THE REPLACEMENT IS A REAL REPORT THAT IS NOT ITSELF RELEASED, which is
+        what makes this row positive rather than an incantation: its id has no
+        legitimate reason to be in this response, so finding it is proof of a
+        leak rather than a coincidence. Likewise `retracted_by` is a real user
+        id and the reason is a marker nothing else in this repository spells.
+
+        Catches: wrong-version D -- `replacement_report_id` included "because
+        the data is there". Vacuous against: a leak through a different route.
+        """
+        org = world["a"]
+        _, report_id = _pipeline(dao, org, org["first_patient"], vcf, "released")
+        _, replacement_id = _pipeline(dao, org, org["first_patient"], vcf, "approved")
+        conn.commit()
+        actor = _retract(
+            conn,
+            org["org_id"],
+            report_id,
+            RETRACTION_REASON_MARKER,
+            replacement_report_id=replacement_id,
+        )
+
+        cookie = _portal_login(client, org["org_id"], org["first_email"])
+        for raw in (
+            client.get("/portal/me/reports", cookies={PATIENT_COOKIE: cookie}).content,
+            client.get(f"/portal/me/reports/{report_id}", cookies={PATIENT_COOKIE: cookie}).content,
+        ):
+            assert b'"is_retracted":true' in raw.replace(b" ", b""), (
+                "the positive half failed -- this row would be vacuous against an empty answer"
+            )
+            assert str(replacement_id).encode() not in raw, raw
+            assert str(actor).encode() not in raw, raw
+            assert RETRACTION_REASON_MARKER.encode() not in raw, raw
+            for forbidden in (
+                b"replacement",
+                b"retracted_by",
+                b"retracted_at",
+                b"retracted_from_state",
+                b"reason",
+            ):
+                assert forbidden not in raw.lower(), (forbidden, raw)

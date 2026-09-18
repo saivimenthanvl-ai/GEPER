@@ -2772,12 +2772,85 @@ class DataAccess:
             raise NotFoundError(REPORT_NOT_FOUND)
         return {"report_id": row[0], "order_id": row[1], "released_at": row[2]}
 
-    # ONE SQL TEXT, TWO CALLERS. The list and the single-report read must not be
-    # able to disagree about what "released" and "mine" mean: two copies of this
-    # join is two places for an org predicate to be dropped from, and only one
-    # of them is exercised by the isolation tests somebody remembers to write.
+    # ── w136: the patient's own released reports, AS A SERIES ────────────────
+    #
+    # WHAT A PATIENT TREND IS IN THIS MODEL, AND WHAT IT IS NOT. The held
+    # trends work (`w127-trends`, tip 861e59f, read via `git show`, NEVER
+    # MERGED) builds a series of ACMG CLASSIFICATIONS, one point per variant
+    # per INTERPRETATION, read out of `interpretations.run_document`. That
+    # series is NOT served to a patient here, and there are two separate
+    # reasons, either of which alone would be sufficient:
+    #
+    #   1. IT IS THE REFUSAL w135 ALREADY MADE, ONE WAVE AGO, IN THIS FILE.
+    #      `run_document` is raw pipeline output with no report-state check
+    #      anywhere near it; `get_interpretation` returns the whole of it. The
+    #      two report readers above return no `interpretation_id` precisely so
+    #      that the bypass is zero routes away rather than one, and two tests
+    #      in test_w135_patient_report_access.py pin that. Reversing that
+    #      refusal one wave later, with no ruling, is not a reconciliation.
+    #   2. A CLASSIFICATION SERIES CANNOT CARRY A RETRACTION. Retraction, on
+    #      the held `w122-retraction` (a4907d3), attaches to a REPORT --
+    #      `report_retractions.report_id`. A w127 trend point is keyed on an
+    #      INTERPRETATION, and one interpretation carries many reports (an
+    #      amendment is a new `reports` row on the SAME interpretation_id; see
+    #      create_amendment). So there is no function from a w127 point to a
+    #      retraction status: the point names the wrong object. Human ruling
+    #      E3's whole bargain is that the retraction TRAVELS WITH THE
+    #      DOCUMENT, and a series that structurally cannot carry it has taken
+    #      the benefit of that bargain without paying it.
+    #
+    # SO THE SERIES THIS FILE SERVES A PATIENT IS KEYED ON REPORTS, which is
+    # the object retraction, amendment and release all already attach to. The
+    # trend a patient can be told about, in THIS model, is: which reports were
+    # issued to me, in what order, and which of them replaced which.
+    #
+    # THE EDGE IS `amendments`, WHICH EXISTS AT THIS SHA -- COUNTED. The
+    # corrective act this schema has is AMENDMENT (schema.sql:1213,
+    # `clinical_app` holds SELECT at schema.sql:1594, `create_amendment` is
+    # Approver-gated); the one it does not have is RETRACTION
+    # (`report_retractions` appears 0 times in schema.sql; there is no
+    # retract/unapprove/rescind verb in this class; and
+    # enforce_content_immutability REFUSES to walk an approved report back).
+    #
+    # AND NOTHING IS FILTERED. No retraction predicate, no tombstone
+    # predicate -- only release, exactly as the two readers above. Rulings E3
+    # and E7 settle the reader question in the opposite direction from hiding:
+    # a retracted report is STILL RETURNED, carrying the fact, because
+    # filtering it "would make a retracted report unfindable". So the
+    # forward-safe shape is a node set of report ids with no hiding predicate
+    # to remove: whoever merges w122 adds `is_retracted` (and E4's optional
+    # `replacement_report_id`, which is THE SAME EDGE SHAPE as the amendment
+    # edge below) per node, and deletes nothing. Two tests fail the moment
+    # `report_retractions` appears, naming E3 and E7.
+
+    # ONE SQL TEXT, THREE CALLERS. The list, the single-report read and the
+    # trend must not be able to disagree about what "released" and "mine"
+    # mean: three copies of this join is three places for an org predicate to
+    # be dropped from, and only one of them is exercised by the isolation
+    # tests somebody remembers to write.
+    #
+    # THE FOURTH COLUMN IS THE AMENDMENT EDGE, and it is inside THIS text
+    # rather than in a second statement for exactly that reason. The two w135
+    # readers select it and ignore it; their returned dicts are unchanged.
+    #
+    # WHY THE EDGE CANNOT POINT OUTSIDE THE CALLER'S OWN RELEASED REPORTS,
+    # STRUCTURALLY AND NOT BY ARGUMENT:
+    #   * `orig.interpretation_id = rep.interpretation_id` -- create_amendment
+    #     copies the original's interpretation_id onto the amendment, so an
+    #     amendment and its original always share one interpretation, which
+    #     already sits under this patient's own order via the five hops above.
+    #     An edge to another patient's report cannot satisfy it.
+    #   * `orig.state = 'released'` AND an EXISTS over `release_events` -- the
+    #     same two conditions, in the same order, that gate the rows
+    #     themselves. Naming an original the patient was never sent would be
+    #     an existence oracle for an unreleased report id.
+    #   * `amd.org_id = rep.org_id` on every hop, as everywhere else here.
+    # LATERAL ... LIMIT 1 rather than a plain JOIN: `amendments` has no unique
+    # constraint on `amendment_report_id`, and a plain join would return the
+    # patient's one report twice if one ever appeared twice. Same hazard the
+    # `rel` aggregate exists for, one table over.
     _MY_RELEASED_REPORTS_SQL = (
-        "SELECT rep.id, o.order_id, rel.first_released_at "
+        "SELECT rep.id, o.order_id, rel.first_released_at, sup.amends_report_id "
         "FROM patients p "
         "JOIN orders o          ON o.org_id = p.org_id  AND o.patient_id = p.patient_id "
         "JOIN samples s         ON s.org_id = o.org_id  AND s.order_id = o.order_id "
@@ -2790,9 +2863,89 @@ class DataAccess:
         "      FROM release_events re "
         "     WHERE re.org_id = rep.org_id AND re.report_id = rep.id"
         ") rel ON rel.deliveries > 0 "
+        "LEFT JOIN LATERAL ("
+        "    SELECT orig.id AS amends_report_id "
+        "      FROM amendments amd "
+        "      JOIN reports orig ON orig.org_id = amd.org_id AND orig.id = amd.original_report_id "
+        "     WHERE amd.org_id = rep.org_id "
+        "       AND amd.amendment_report_id = rep.id "
+        "       AND orig.interpretation_id = rep.interpretation_id "
+        "       AND orig.state = 'released' "
+        "       AND EXISTS (SELECT 1 FROM release_events re2 "
+        "                    WHERE re2.org_id = orig.org_id AND re2.report_id = orig.id) "
+        "     ORDER BY amd.created_at, amd.id "
+        "     LIMIT 1"
+        ") sup ON TRUE "
         "WHERE p.patient_id = %s AND p.org_id = %s "
         "  AND rep.state = 'released'"
     )
+
+    @auditable(
+        action="portal_report_trend_read",
+        resource_type="report",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def list_my_report_trend(self, patient_session: "PatientSession") -> list[dict[str, Any]]:
+        """
+        The authenticated patient's own released reports AS A SERIES, in
+        first-delivery order, with the supersession edge between them.
+
+        TAKES NO IDENTIFIER OF ANY KIND -- not a patient id, not a report id,
+        not a date range. The patient is bound from the session at the anchor,
+        in the ONE shared SQL text above, exactly as the two w135 readers are.
+
+        WHAT A POINT IS: one RELEASED report of the caller's own. Not an
+        interpretation, not a variant, not a classification. The node key is a
+        `report_id`, which is the object `amendments`, `release_events` and
+        (on the held w122 branch) `report_retractions` all attach to.
+
+        `amends_report_id` -- the caller's own released report that THIS one
+        was created to correct, or None. `superseded_by_report_id` is its
+        inverse, DERIVED IN PYTHON FROM THIS SAME LIST and never from a second
+        query: it can therefore only ever name a report already in the answer,
+        so it is structurally incapable of being an existence oracle for a
+        report the caller cannot see. A second query would not have that
+        property for free.
+
+        NOTHING IS HIDDEN. There is no retraction predicate and no tombstone
+        predicate; the only thing that keeps a report out of this series is
+        that it was never released to anyone. See the long note above the SQL
+        for rulings E3/E7 and for why a classification series is refused.
+
+        IN THIS DEPLOYMENT THIS METHOD RETURNS `[]` FOR EVERY PATIENT, FOR
+        EVER, because `_release_report` has ZERO non-test callers (re-counted
+        at 3a482f1). It is still correct, and the tests construct the released
+        state the only legitimate way there is -- by calling `_release_report`
+        behind its own Approver gate. What is not claimed is that any
+        production path reaches it. Same finding as w134-C3 and w135-C3.
+        """
+        self._require_patient_session(patient_session)
+        rows = self._query(
+            self._MY_RELEASED_REPORTS_SQL + " ORDER BY rel.first_released_at, rep.id",
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        series = [
+            {
+                "report_id": r[0],
+                "order_id": r[1],
+                "released_at": r[2],
+                "amends_report_id": r[3],
+                "superseded_by_report_id": None,
+            }
+            for r in rows
+        ]
+        # The inverse edge, over the answer itself. `amends_report_id` is
+        # already restricted by the SQL to a report in this same list, so this
+        # loop cannot invent a node and cannot name one the caller may not see.
+        by_id = {point["report_id"]: point for point in series}
+        for point in series:
+            earlier = by_id.get(point["amends_report_id"])
+            if earlier is not None:
+                earlier["superseded_by_report_id"] = point["report_id"]
+        return series
 
     # ── patient authentication and patient sessions (w130) ───────────────────
     #

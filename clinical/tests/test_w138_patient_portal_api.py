@@ -130,6 +130,10 @@ AUTHENTICATED_PORTAL_ROUTES = (
     ("GET", "/portal/me/tests"),
     ("GET", "/portal/me/reports"),
     ("GET", f"/portal/me/reports/{A_REPORT_ID_THAT_NAMES_NOTHING}"),
+    # w136. The report series. It takes no identifier, so there is nothing to
+    # fill in — which is also why it has no identifier channel of its own and
+    # its only oracle would be the SUCCESS answer (see test_w136).
+    ("GET", "/portal/me/trends"),
     ("POST", "/portal/logout"),
 )
 
@@ -710,7 +714,7 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
         """
         cases = self._cases(client, dao, conn, world)
         assert len(cases) == 8, "the case list shrank -- this row would prove less than it claims"
-        assert len(AUTHENTICATED_PORTAL_ROUTES) == 5, "a portal route left the list without being probed"
+        assert len(AUTHENTICATED_PORTAL_ROUTES) == 6, "a portal route left the list without being probed"
 
         observed = {}
         for name, cookies in cases.items():
@@ -718,10 +722,11 @@ class TestEveryPortalRefusalIsOnePairOnEveryRoute:
                 response = _call(client, method, path, cookies)
                 observed[f"{name} | {method} {path}"] = (response.status_code, response.content)
 
-        # 8 x 5. Was 8 x 3 at 863f07e; w135 added the two report routes to the
-        # list, so the same eight credential states now collapse forty
-        # observations into one pair instead of twenty-four.
-        assert len(observed) == 40, observed
+        # 8 x 6. Was 8 x 3 at 863f07e; w135 added the two report routes and
+        # w136 the series route, so the same eight credential states now
+        # collapse forty-eight observations into one pair instead of
+        # twenty-four.
+        assert len(observed) == 48, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 
@@ -846,15 +851,23 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
         offenders = [path for path, _ in self._leaves(clinical_dsn) if "{patient" in path]
         assert not offenders, f"served route(s) naming a patient in the path: {offenders}"
 
-    def test_the_patient_surface_is_exactly_these_six_routes(self, clinical_dsn):
+    def test_the_patient_surface_is_exactly_these_seven_routes(self, clinical_dsn):
         """
         NOT a hard-coded total used as proof of future safety (the queue
         forbids that) -- an EXPLICIT SET, so the failure message names what
-        arrived or left. A SEVENTH patient route is a thing somebody must look
+        arrived or left. An EIGHTH patient route is a thing somebody must look
         at: the report routes arrived in w135 and were counted here, the
         status question was answered in w134 by widening a BODY rather than
-        the surface, and trends remains an open product ruling held on
-        w127-trends.
+        the surface, and w136 added the report SERIES.
+
+        RULE 3 APPLIED TO THIS DOCSTRING (fix the claim, not the code). It
+        used to end "trends remains an open product ruling held on
+        w127-trends". Half of that is now false and half is still true, so
+        neither half is left to be read as the other: w136 added
+        `GET /portal/me/trends`, a series whose points are the patient's own
+        RELEASED REPORTS; what remains an open product ruling, and is still
+        held on w127-trends and still absent from this set, is a series of
+        VARIANT CLASSIFICATIONS read out of raw `run_document`.
         """
         served = {path for path, _ in self._leaves(clinical_dsn) if path.startswith("/portal")}
         assert served == {
@@ -869,6 +882,11 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
             # which the row above asserts.
             "/portal/me/reports",
             "/portal/me/reports/{report_id}",
+            # w136. The report SERIES. No identifier in any channel, and no
+            # classification in the body -- it is deliberately not the held
+            # `/patients/{patient_id}/variant-trends`, which the row above
+            # would catch if anybody mounted it.
+            "/portal/me/trends",
         }, served
 
     def test_there_are_still_no_administrative_routes(self, clinical_dsn):

@@ -73,6 +73,24 @@ WHAT IS NOT HERE, AND WHY EACH ABSENCE IS DELIBERATE:
     and nothing else, because metadata and release state are the whole of what
     this model stores about a released report. No content storage was
     invented to make the surface look richer.
+
+    AND w136 ADDED `GET /portal/me/trends` WITHOUT CHANGING THAT EITHER.
+    The held trends work builds a series of ACMG CLASSIFICATIONS out of raw
+    `run_document`; it is not served here, and the refusal is the same one
+    stated two paragraphs up, unreversed. What IS served is a series whose
+    points are the patient's own RELEASED REPORTS, in first-delivery order,
+    with the amendment edge between them — the same fields the two w135
+    routes already carry, plus one supersession edge whose both ends are
+    reports the same response already lists. It exposes no new class of
+    information, and its node key is a `report_id`, which is the object
+    retraction attaches to. See `PortalTrendPoint` and the long note above
+    `DataAccess._MY_RELEASED_REPORTS_SQL`.
+  * NO TRENDS ROUTE THAT TAKES A PATIENT IDENTIFIER, and this is the one
+    absence this file's design most depends on. The held
+    `GET /patients/{patient_id}/variant-trends` is a STAFF route on a STAFF
+    router with a STAFF dependency; nothing in this wave mounted it here,
+    widened `_get_session`, or gave any handler in this file a patient
+    parameter in any channel.
   * NO TRANSLITERATED STATUS. `orders.state` still does not appear here and
     never will: three of its seven values have no writer, and `sample_awaited`
     is written AFTER the specimen arrives, so the column's vocabulary is
@@ -196,6 +214,47 @@ class PortalReportItem(BaseModel):
     report_id: str
     order_id: str
     released_at: str
+
+
+class PortalTrendPoint(BaseModel):
+    """
+    One point in the patient's own report series (w136).
+
+    THE NODE IS A REPORT, NOT AN INTERPRETATION AND NOT A VARIANT, and that
+    is the whole reconciliation with the retraction model rather than a
+    stylistic choice. Retraction attaches to a `reports` row
+    (`report_retractions.report_id` on the held w122 branch); so does
+    amendment; so does release. An interpretation-keyed point — which is what
+    the held w127 trends work produces — has no retraction status at all,
+    because one interpretation carries many reports.
+
+    FIVE FIELDS, AND FOUR OF THEM ARE ALREADY ON `PortalReportItem`. The one
+    new datum is the supersession edge, and it exposes no new class of
+    information: both ends of every edge are reports this same response
+    already lists, and an edge whose other end is a report the caller was
+    never sent is excluded in the SQL rather than here.
+
+    `superseded_by_report_id` is DERIVED FROM THIS LIST, not queried. It can
+    only ever name a report already in the answer.
+
+    NO `is_retracted` FIELD, and its absence is a measurement rather than a
+    decision: `report_retractions` does not exist at this SHA and no code in
+    this repository can retract anything. Under rulings E3 and E7 a retracted
+    report is SHOWN AND FLAGGED, never hidden — so when w122 lands the flag is
+    an added field on this model and a join on `report_id`, with no filter to
+    remove from the query. Two tests fail the moment that table appears.
+
+    NO CLASSIFICATION, NO `interpretation_id`, NO `variant_key`. See
+    `list_my_trends` and w135's refusal, which this wave did not reverse.
+    """
+
+    report_id: str
+    order_id: str
+    released_at: str
+    # The caller's own released report this one was created to correct.
+    amends_report_id: Optional[str] = None
+    # Its inverse. Derived from the same list; never from a second query.
+    superseded_by_report_id: Optional[str] = None
 
 
 def _presented_patient_session_id(
@@ -399,6 +458,54 @@ async def get_my_report(
         order_id=str(report["order_id"]),
         released_at=report["released_at"].isoformat(),
     )
+
+
+@router.get(
+    "/me/trends",
+    response_model=List[PortalTrendPoint],
+    summary="The authenticated patient's own released reports AS A SERIES",
+)
+async def list_my_trends(
+    patient_session: PatientSession = Depends(_get_patient_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> List[PortalTrendPoint]:
+    """
+    NO IDENTIFIER OF ANY KIND — not a patient id, not a report id, not a date
+    range. Same shape as `list_my_tests` and `list_my_reports`, same reason.
+
+    THIS IS NOT THE HELD TRENDS ROUTE AND IT IS NOT A PORT OF IT. The held
+    `GET /patients/{patient_id}/variant-trends` (w127-trends, 861e59f, never
+    merged) is a STAFF route — its dependency is
+    `clinical.endpoints._get_session`, the staff session — that takes a
+    patient id from the URL. This file's own header names pointing a patient
+    session at that route as the cheap move that destroys the portal design,
+    and this wave did not make it: no dependency was widened, no staff router
+    was mounted at `/portal`, and nothing here accepts a patient identifier.
+
+    AND IT SERVES NO CLASSIFICATIONS. The held work's series is one point per
+    variant per interpretation, read out of raw `run_document`. w135 refused
+    exactly that to a patient one wave ago and this wave does not reverse it —
+    see the long note above `DataAccess._MY_RELEASED_REPORTS_SQL` for the two
+    independent reasons, the second of which is that a series keyed on
+    interpretations cannot carry a retraction at all.
+    """
+    try:
+        series = dao.list_my_report_trend(patient_session)
+    except AuthorizationError:
+        raise _anonymous_refusal()
+
+    return [
+        PortalTrendPoint(
+            report_id=str(point["report_id"]),
+            order_id=str(point["order_id"]),
+            released_at=point["released_at"].isoformat(),
+            amends_report_id=(str(point["amends_report_id"]) if point["amends_report_id"] else None),
+            superseded_by_report_id=(
+                str(point["superseded_by_report_id"]) if point["superseded_by_report_id"] else None
+            ),
+        )
+        for point in series
+    ]
 
 
 @router.post(

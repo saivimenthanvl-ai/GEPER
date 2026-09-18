@@ -420,6 +420,12 @@ class TestTheRouteCensus:
             # from the caller, and it is a RESOURCE id, never an identity one.
             ("/portal/me/reports", ("GET",)),
             ("/portal/me/reports/{report_id}", ("GET",)),
+            # w136. The patient's own released reports AS A SERIES. It takes NO
+            # identifier at all — it is deliberately NOT the held
+            # `GET /patients/{patient_id}/variant-trends`, which is a STAFF
+            # route on a staff router, and which this census would also catch
+            # had anybody mounted it.
+            ("/portal/me/trends", ("GET",)),
             ("/auth/login", ("POST",)),
             ("/portal/login", ("POST",)),
             # w132c. The two logout routes. They are NOT on the auth router:
@@ -446,10 +452,11 @@ class TestTheRouteCensus:
 
         census = served_routes(app)
         # 11 at 863f07e; 13 from w135, which added the two patient report
-        # routes. The number is checked against the EXPECTED set above, which
-        # is what actually names them — this row exists only to refuse the
-        # empty and wrapper-shaped answers.
-        assert len(census) == 13, census
+        # routes; 14 from w136, which added the patient report series. The
+        # number is checked against the EXPECTED set above, which is what
+        # actually names them — this row exists only to refuse the empty and
+        # wrapper-shaped answers.
+        assert len(census) == 14, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

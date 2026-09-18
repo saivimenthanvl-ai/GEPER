@@ -992,10 +992,17 @@ class TestTheDataLayerMethodIsTheOneThatEnforcesIt:
 
     def test_the_two_methods_share_one_sql_text(self):
         """
-        THE STRUCTURAL GUARANTEE THAT THE LIST AND THE SINGLE READ CANNOT
-        DISAGREE. Two copies of a six-table join is two places for an org
-        predicate to be dropped from, and only one of them is exercised by the
-        isolation tests somebody remembers to write.
+        THE STRUCTURAL GUARANTEE THAT THE READERS CANNOT DISAGREE. Two copies
+        of a six-table join is two places for an org predicate to be dropped
+        from, and only one of them is exercised by the isolation tests
+        somebody remembers to write.
+
+        THREE CALLERS FROM w136, NOT TWO (Rule 3: fix the claim). The report
+        series `list_my_report_trend` reads the same text rather than writing
+        a fourth copy of "mine, and released" -- which is also why the
+        amendment edge it needs lives INSIDE this constant, under the same
+        `p.patient_id = %s AND p.org_id = %s` anchor, instead of in a second
+        statement with its own predicates.
 
         Catches: a later editor inlining one of them. Non-vacuity: the shared
         text is asserted to contain the two session-bound predicates, so this
@@ -1019,8 +1026,10 @@ class TestTheDataLayerMethodIsTheOneThatEnforcesIt:
             "the patient report join is written more than once -- two places for an org predicate "
             "to be dropped from, and only one of them is tested"
         )
-        assert source.count("_MY_RELEASED_REPORTS_SQL") == 3, (
-            "expected one definition and exactly two callers of the shared SQL"
+        assert source.count("_MY_RELEASED_REPORTS_SQL") == 4, (
+            "expected one definition and exactly THREE callers of the shared SQL "
+            "(w135's list and single read, and w136's report series). A fourth caller, "
+            "or an inlined copy, is a thing somebody must look at."
         )
 
 

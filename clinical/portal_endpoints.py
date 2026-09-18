@@ -53,9 +53,15 @@ WHAT IS NOT HERE, AND WHY EACH ABSENCE IS DELIBERATE:
     stored to return, and `get_interpretation` is not the substitute: it
     returns the entire raw `run_document` with no report-state check, so it
     would hand a patient the unapproved pipeline output of a draft.
-  * NO STATUS VOCABULARY. `orders.state` cannot carry one — three of its seven
-    values are written by no code anywhere — so no field here transliterates
-    it.
+  * NO TRANSLITERATED STATUS. `orders.state` still does not appear here and
+    never will: three of its seven values have no writer, and `sample_awaited`
+    is written AFTER the specimen arrives, so the column's vocabulary is
+    inverted as well as stalled. w134 adds a DERIVED `stages` list instead —
+    six stages, each carrying a value the repository's writers support — and
+    `clinical.data_access.derive_order_stages` records the census and the
+    refusals value by value. No status column was added, no status table, and
+    no transition: the derivation is a pure function over a tally of rows that
+    already exist.
 """
 
 from __future__ import annotations
@@ -97,23 +103,50 @@ class PortalPatientResponse(BaseModel):
     sex: str
 
 
+class PortalStage(BaseModel):
+    """
+    One derived stage of one order, and the value derived for it.
+
+    TWO PLAIN STRINGS, NOT AN ENUM CLASS, and not because an enum would be
+    hard. The permitted values live in ONE place — `PORTAL_STAGES` and
+    `PORTAL_STAGE_STATES` in `clinical.data_access`, beside the writer census
+    that justifies each of them. A second enumeration here would be a second
+    place to add a value, and the whole point of this wave is that a value is
+    added only when a writer for it has been counted first.
+    """
+
+    stage: str
+    state: str
+
+
 class PortalOrderItem(BaseModel):
     """
     One of the patient's test orders.
 
-    THERE IS NO `status` FIELD AND ITS ABSENCE IS THE POINT — the same shape as
-    ResolutionRequest's missing `actor` in clinical/endpoints.py. `orders.state`
-    has three declared values (in_progress, reported, closed) that no code
-    anywhere writes, so an order stalls at `sample_awaited` however far the
-    pipeline got. Rendering that column to a patient would show every completed
-    case as awaiting a sample. What a patient is shown for progress is a
-    ruling, and a field here would pre-empt it.
+    THERE IS STILL NO `status` FIELD, AND ITS ABSENCE IS STILL THE POINT — the
+    same shape as ResolutionRequest's missing `actor` in clinical/endpoints.py.
+    `orders.state` is not returned, not renamed and not transliterated: three
+    of its seven declared values (in_progress, reported, closed) are written by
+    no code anywhere, so an order stalls at `sample_awaited`; and w134 counted
+    the sharper reason, which is that `sample_awaited` is itself written AFTER
+    the specimen arrives. Rendering that column would tell a patient whose
+    sample is already sequenced that the laboratory is still waiting for it.
+
+    `stages` IS NOT THAT COLUMN UNDER ANOTHER NAME (w134). It is derived, by
+    `clinical.data_access.derive_order_stages`, from counts of rows that
+    already exist and two timestamps; every value it can emit has a writer
+    counted in that function's header, and the seven writerless values appear
+    nowhere in it. Where the underlying state does not support the three-state
+    distinction, the stage does not emit the missing value: `sample` and
+    `analysis` are NEVER `in_progress`, because this platform never observes
+    them that way.
     """
 
     order_id: str
     created_at: str
     placed_at: Optional[str] = None
     cancelled_at: Optional[str] = None
+    stages: List[PortalStage] = []
 
 
 def _presented_patient_session_id(
@@ -215,6 +248,11 @@ async def list_my_tests(
             created_at=o["created_at"].isoformat(),
             placed_at=o["placed_at"].isoformat() if o["placed_at"] else None,
             cancelled_at=o["cancelled_at"].isoformat() if o["cancelled_at"] else None,
+            # PASSED THROUGH, NOT RE-DERIVED. The derivation happens once, in
+            # the data layer, beside the census that justifies it. A second
+            # derivation here would be a second answer to maintain, and the two
+            # would disagree the first time one of them was edited.
+            stages=[PortalStage(stage=s["stage"], state=s["state"]) for s in o["stages"]],
         )
         for o in orders
     ]

@@ -114,6 +114,154 @@ GENERIC_AUTH_ERROR = "Authentication failed."
 PATIENT_NOT_FOUND = "Patient not found."
 
 
+# ─── w134: the patient-visible progress vocabulary, and what it refuses ──────
+#
+# THE CENSUS THAT PRODUCED THIS IS THE WHOLE JUSTIFICATION, so it is recorded
+# here and not in a document that ships separately from the code.
+#
+# COUNTED at 0b4bcac over non-test Python, whole tree, quoted-literal match:
+# the workflow declares NINETEEN state values across its four state columns
+# (orders.state 7, samples.qc_status 3, fastq_sets.state 4, reports.state 5).
+# TWELVE have a writer. SEVEN have none: in_progress, reported and closed on
+# orders; returned on reports; validated, rejected and consumed on fastq_sets.
+# Of those seven, exactly TWO occur at all -- `reported` and `closed`, both on
+# ONE line, data_access.py's `cancel_order` guard, and both as a READ
+# predicate. A surface built on a value nothing writes reports the same thing
+# for ever, so none of the seven appears below.
+#
+# AND A WRITER IS NOT ENOUGH. A value written and superseded inside ONE
+# transaction is never seen by any reader, so it is not a state this platform
+# can be observed in. `record_pipeline_result` inserts the sequencing run, the
+# VCF, the interpretation AND the draft report in a single transaction --
+# deliberately, so a failure cannot leave a lineage the platform never reported
+# on. That makes "processing in progress" and "interpretation in progress"
+# unobservable, and it is why the six stages below are six and not seven:
+# Processing and Interpretation are ONE stage, `analysis`, because they are one
+# commit. Splitting them would state twice what is observed once.
+#
+# WHAT EACH REFUSAL COSTS, so nobody "completes" the picture later:
+#   order.not_started      -- a listed order has a row; there is no prior state
+#   sample.in_progress     -- receive_sample writes collected_at AND
+#                             received_at in the same INSERT; nothing records
+#                             "collection requested"
+#   analysis.in_progress   -- the four-row single transaction above
+#   review.<returned>      -- zero writers, zero readers
+#   report.in_progress     -- release is one method: the release_events INSERT
+#                             and the state UPDATE. Nothing marks it pending
+#   a `processing` stage   -- sequencing_runs has no state column and no
+#                             completed_at, so a row cannot say "under way";
+#                             and fastq_sets.state is a ONE-VALUE column,
+#                             because schema.sql grants clinical_app SELECT and
+#                             INSERT on that table and no UPDATE at all
+#
+# ADDING A VALUE HERE REQUIRES A WRITER FIRST, and giving a value a writer is a
+# workflow decision -- who performs the transition and when -- not a wiring one.
+PORTAL_STAGES = ("order", "sample", "qc", "analysis", "review", "report")
+
+# The whole vocabulary. Held as a constant so a test can assert the emitted set
+# is a SUBSET of it and catch a value invented in a later edit.
+PORTAL_STAGE_STATES = ("not_started", "in_progress", "completed", "failed", "cancelled")
+
+
+def derive_order_stages(
+    *,
+    placed_at: Any,
+    cancelled_at: Any,
+    sample_count: int,
+    qc_pending: int,
+    qc_passed: int,
+    qc_failed: int,
+    interpretation_count: int,
+    report_count: int,
+    reports_signed_off: int,
+    reports_released: int,
+) -> list[dict[str, str]]:
+    """
+    Six stages for one order, DERIVED from counts of rows that already exist.
+
+    A PURE FUNCTION. No session, no connection, no clock, no writes. It is not
+    a workflow engine and cannot become one by accident: it has no notion of a
+    transition, of legality, or of what may follow what. It reads a tally and
+    names it.
+
+    KEYWORD-ONLY ON PURPOSE. Ten integers and two timestamps in positional
+    order is a defect waiting for a refactor to transpose two of them, and the
+    transposition that matters most -- qc_passed for qc_failed -- would tell a
+    patient their failed sample passed.
+
+    `failed` and `cancelled` are the two values outside the three-state
+    vocabulary, and both are states the writers genuinely produce: record_qc
+    validates its argument to exactly {passed, failed}, and cancel_order stamps
+    cancelled_at. Neither is a synthesis.
+    """
+    # ORDER. `completed` here means THE ORDER WAS PLACED -- the stage's own
+    # completion -- and nothing more. It does not and cannot mean "the test
+    # finished": `reported` and `closed` have no writer, so an order has no
+    # terminal success value to read.
+    if cancelled_at is not None:
+        order_state = "cancelled"
+    elif placed_at is not None:
+        order_state = "completed"
+    else:
+        order_state = "in_progress"
+
+    # SAMPLE. Row existence, because that is the only signal there is: a
+    # `samples` row is inserted by receive_sample and by nothing else, with
+    # received_at stamped in the same statement.
+    sample_state = "completed" if sample_count else "not_started"
+
+    # QC. The ONLY stage whose column has a writer for every declared value,
+    # and so the only one that supports the full distinction.
+    #
+    # A FAILURE ON ANY SAMPLE DOMINATES, and a pending one dominates a passed
+    # one. An order with one failed and one passed sample is not "completed":
+    # the failed specimen is the fact with a consequence for the patient, and a
+    # precedence that let it be hidden behind a passed sibling would be the
+    # status surface lying in the one place it must not.
+    if not sample_count:
+        qc_state = "not_started"
+    elif qc_failed:
+        qc_state = "failed"
+    elif qc_pending:
+        qc_state = "in_progress"
+    else:
+        qc_state = "completed"
+
+    # ANALYSIS -- sequencing run, VCF and interpretation, which are one commit.
+    # Keyed on the interpretation because it is the last of the four inserts:
+    # if it is there, the whole transaction committed.
+    analysis_state = "completed" if interpretation_count else "not_started"
+
+    # REVIEW. draft and under_review are both `in_progress` DELIBERATELY. Both
+    # have writers and the two are distinguishable, but "the report exists in
+    # draft" versus "the report has been submitted" is an internal distinction;
+    # collapsing them is refusing to make a product ruling nobody has made.
+    if not report_count:
+        review_state = "not_started"
+    elif reports_signed_off:
+        review_state = "completed"
+    else:
+        review_state = "in_progress"
+
+    # REPORT -- release. MEASURED AND STATED PLAINLY: `_release_report` is the
+    # writer, it exists, and COUNTED at 0b4bcac it has ZERO callers outside
+    # this repository's tests. In this deployment this stage therefore reads
+    # not_started for every order. That is the measurement being reported, not
+    # a defect introduced by reporting it, and the alternative -- treating
+    # `approved` as released -- would tell a patient a report had been issued
+    # when no release event exists.
+    report_state = "completed" if reports_released else "not_started"
+
+    return [
+        {"stage": "order", "state": order_state},
+        {"stage": "sample", "state": sample_state},
+        {"stage": "qc", "state": qc_state},
+        {"stage": "analysis", "state": analysis_state},
+        {"stage": "review", "state": review_state},
+        {"stage": "report", "state": report_state},
+    ]
+
+
 # ─── Errors ──────────────────────────────────────────────────────────────────
 
 
@@ -2374,25 +2522,86 @@ class DataAccess:
         written this way because it is the shape every deeper portal read will
         need, and because the anchor is where both predicates are bound.
 
-        WHAT IS DELIBERATELY NOT RETURNED: `orders.state`. Three of its seven
-        declared values -- in_progress, reported, closed -- are written by no
-        code anywhere in this repository, so an order stalls at sample_awaited
-        however far the pipeline actually got. A patient progress indicator
-        driven off that column would show every completed case as "awaiting
-        sample". What a patient is shown for status is a ruling; returning the
-        column and letting a caller render it would be shipping the wrong
-        answer under a correct-looking field name.
+        WHAT IS STILL DELIBERATELY NOT RETURNED: `orders.state`. w134 re-counted
+        it and the refusal stands, for a sharper reason than "three values have
+        no writer". `sample_awaited` is written by `receive_sample` AFTER the
+        specimen has arrived (see that method), so the column's own vocabulary
+        is inverted: a patient whose sample is already sequenced would be shown
+        "awaiting sample". The column is not renderable to a patient under any
+        name, and no caller of this method is given the chance to try.
+
+        WHAT IS RETURNED INSTEAD (w134): `stages`, DERIVED. Six named stages,
+        each carrying one value out of a vocabulary that this repository's
+        WRITERS support -- see `derive_order_stages`, which is where every
+        refusal is justified value by value. Nothing here is stored; there is
+        no status column, no status table and no transition. Delete
+        `derive_order_stages` and the workflow is exactly what it was.
+
+        THE COUNTS THE DERIVATION NEEDS ARE AGGREGATED IN THE DATABASE, in two
+        lateral subqueries, each of which is an ungrouped aggregate and so
+        returns exactly one row. That is not a micro-optimisation: a plain
+        LEFT JOIN to `samples` and to `reports` would FAN OUT, and an order
+        with two samples would appear twice in a patient's list of orders.
+
+        EVERY SUBQUERY IS ORG-SCOPED ON ITS OWN, correlated to `o.org_id`
+        rather than trusting the outer join to have narrowed it. The chain
+        samples -> sequencing_runs -> vcfs -> interpretations -> reports is
+        followed with the composite (org_id, id) keys the schema declares, so
+        no hop can cross an organisation even if a bare id were duplicated.
         """
         self._require_patient_session(patient_session)
         rows = self._query(
-            "SELECT o.order_id, o.created_at, o.placed_at, o.cancelled_at "
+            "SELECT o.order_id, o.created_at, o.placed_at, o.cancelled_at, "
+            "       sm.total, sm.qc_pending, sm.qc_passed, sm.qc_failed, "
+            "       an.interpretations, an.reports_total, an.reports_signed_off, an.reports_released "
             "FROM orders o "
             "JOIN patients p ON p.patient_id = o.patient_id AND p.org_id = o.org_id "
+            "LEFT JOIN LATERAL ("
+            "    SELECT count(*) AS total, "
+            "           count(*) FILTER (WHERE s.qc_status = 'pending') AS qc_pending, "
+            "           count(*) FILTER (WHERE s.qc_status = 'passed')  AS qc_passed, "
+            "           count(*) FILTER (WHERE s.qc_status = 'failed')  AS qc_failed "
+            "      FROM samples s "
+            "     WHERE s.org_id = o.org_id AND s.order_id = o.order_id"
+            ") sm ON TRUE "
+            "LEFT JOIN LATERAL ("
+            "    SELECT count(DISTINCT i.id) AS interpretations, "
+            "           count(DISTINCT rep.id) AS reports_total, "
+            "           count(DISTINCT rep.id) FILTER (WHERE rep.state IN ('approved', 'released')) "
+            "               AS reports_signed_off, "
+            "           count(DISTINCT rep.id) FILTER (WHERE rep.state = 'released') AS reports_released "
+            "      FROM samples s2 "
+            "      JOIN sequencing_runs r ON r.org_id = s2.org_id AND r.sample_id = s2.sample_id "
+            "      JOIN vcfs v            ON v.org_id = r.org_id  AND v.sequencing_run_id = r.id "
+            "      JOIN interpretations i ON i.org_id = v.org_id  AND i.vcf_id = v.id "
+            "      LEFT JOIN reports rep  ON rep.org_id = i.org_id AND rep.interpretation_id = i.id "
+            "     WHERE s2.org_id = o.org_id AND s2.order_id = o.order_id"
+            ") an ON TRUE "
             "WHERE p.patient_id = %s AND p.org_id = %s "
             "ORDER BY o.created_at",
             (patient_session.patient_id, patient_session.org_id),
         )
-        return [{"order_id": r[0], "created_at": r[1], "placed_at": r[2], "cancelled_at": r[3]} for r in rows]
+        return [
+            {
+                "order_id": r[0],
+                "created_at": r[1],
+                "placed_at": r[2],
+                "cancelled_at": r[3],
+                "stages": derive_order_stages(
+                    placed_at=r[2],
+                    cancelled_at=r[3],
+                    sample_count=r[4] or 0,
+                    qc_pending=r[5] or 0,
+                    qc_passed=r[6] or 0,
+                    qc_failed=r[7] or 0,
+                    interpretation_count=r[8] or 0,
+                    report_count=r[9] or 0,
+                    reports_signed_off=r[10] or 0,
+                    reports_released=r[11] or 0,
+                ),
+            }
+            for r in rows
+        ]
 
     # ── patient authentication and patient sessions (w130) ───────────────────
     #

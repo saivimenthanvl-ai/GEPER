@@ -339,7 +339,15 @@ class TestAFreshDatabaseHasTheAmendmentObjectsAndSaysItIsAtFour:
             assert [row[0] for row in _history(connection)] == _on_disk_versions()
             state = migrate.inspect_state(connection)
             assert state.ok is True, state.detail
-            assert state.current_version == AMENDMENT_VERSION
+            # DERIVED, NOT `== AMENDMENT_VERSION`. `current_version` is
+            # `max(applied)` -- the FRONTIER of the set, not this migration.
+            # Pinning it to 4 asserts that 0004 is the LAST migration, which is
+            # a claim about the size of `clinical/migrations/` that stops being
+            # true the morning a fifth file lands. w146 removed nine instances
+            # of this shape; w147 and then this file re-introduced it.
+            # `test_w151_migration_declaration_guards.py::TestNoTestPinsTheFrontier`
+            # is the structural guard that now forbids it.
+            assert state.current_version == max(_on_disk_versions())
             assert state.pending == ()
             assert migrate.migrate(connection) == ()
 

@@ -22,6 +22,7 @@ own database per test and drop it afterwards -- see
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import pathlib
 
@@ -762,32 +763,261 @@ class TestTheCommandLineExitCodeIsAVerdict:
         assert "not CLINICAL_DSN" in err
 
 
+def _migration_test_files(directory=None):
+    """
+    THE SUBJECT, DERIVED. Every file in this directory that imports
+    `clinical.tests.migration_db` -- which is what MAKES a file a migration
+    test -- plus that module itself.
+
+    NOT THREE HAND-WRITTEN GLOBS, which is what this used to be
+    (`test_w126m_*.py`, `test_w143_*.py`, `migration_db.py`). Three waves of
+    migration tests were written after that list and none of them were in it,
+    so the guard went on reporting green about files it never opened. A guard
+    that names the files it reads protects the files somebody remembered.
+
+    Each token below is BUILT FROM HALVES because this file is one of the
+    files the guard reads, and a literal copy anywhere in it -- including in a
+    comment -- would make the check fail on its own source.
+    """
+    here = pathlib.Path(__file__).resolve().parent if directory is None else pathlib.Path(directory)
+    marker = "clinical.tests." + "migration_db"
+    files = [p for p in sorted(here.glob("*.py")) if marker in p.read_text(encoding="utf-8")]
+    module = here / "migration_db.py"
+    if module.is_file() and module not in files:
+        files.append(module)
+    return files
+
+
+_REBUILD_TOKENS = ("reset_" + "schema(", "DROP " + "SCHEMA")
+
+# The names that make a function's subject THE MIGRATION MECHANISM: its own
+# throwaway database, the discovered set, the runner, the sentinel. Read from
+# the AST, not from the text, so the prose above does not count as a use.
+_MIGRATION_SUBJECT = (
+    "scratch_database",
+    "discover",
+    "inspect_state",
+    "adopt_existing",
+    "plant_sentinel",
+    "read_sentinel",
+)
+
+
+def _call_name(call):
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    return ""
+
+
+def _executed_strings(node):
+    """
+    Every string literal in this function EXCEPT the prose.
+
+    A docstring is an `Expr` whose value is a string -- it is never executed,
+    and this file's own `WRONG F` docstring discusses the forbidden statement
+    at length. A guard that counted it would fail on its own documentation,
+    which is the C-shaped wrong version of this whole wave.
+    """
+    prose = {
+        id(statement.value)
+        for statement in ast.walk(node)
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+    }
+    return [
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str) and id(child) not in prose
+    ]
+
+
+def _asserts_the_sentinel_is_gone(node):
+    """
+    THE DELIBERATE REBUILD CONTROL, recognised STRUCTURALLY rather than by
+    name.
+
+    `test_w147_…::test_the_sentinel_really_does_die_in_a_rebuild` and
+    `test_w149_…::test_the_control_a_rebuild_destroys_the_sentinel_…` rebuild
+    on purpose: they are the sentinel's own non-vacuity, and without them the
+    sentinel rows above are decoration. What makes them controls rather than
+    accidents is not their names -- it is that they require the sentinel to be
+    GONE afterwards. A function that rebuilt its subject by accident asserts
+    the opposite, or asserts nothing about the sentinel at all; it cannot
+    demand its own destruction and still be the hazard.
+    """
+    for comparison in (n for n in ast.walk(node) if isinstance(n, ast.Compare)):
+        sides = [comparison.left, *comparison.comparators]
+        reads = [s for s in sides if isinstance(s, ast.Call) and _call_name(s) == "read_sentinel"]
+        if not reads:
+            continue
+        expected = [s for s in sides if s not in reads]
+        names = {n.id for side in expected for n in ast.walk(side) if isinstance(n, ast.Name)}
+        if not names & {"SENTINEL_NOTE", "SENTINEL_ORG"}:
+            return True
+    return False
+
+
+def _functions_that_rebuild_their_own_migration_subject(path):
+    """
+    PER FUNCTION, NOT PER FILE, and the widening is what forced the change.
+
+    The hazard this guard is named for is a function that works on a migration
+    subject and ALSO rebuilds a database from `schema.sql`: it has handed
+    itself the answer, and every assertion in it passes against a runner that
+    does nothing. A FILE-level check for the same words bans a legitimate case
+    the wider subject surfaced -- `test_w149_migration_0004_amendment.py`'s
+    `conn` fixture deliberately builds a database from the CURRENT
+    `schema.sql` for six rows that are about a fresh deployment rather than
+    about an upgrade, the way 105 files in this package do. That fixture
+    touches no migration subject, so it is not this guard's business.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    offences = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        names = {
+            child.attr if isinstance(child, ast.Attribute) else child.id
+            for child in ast.walk(node)
+            if isinstance(child, (ast.Name, ast.Attribute))
+        }
+        if not names & set(_MIGRATION_SUBJECT):
+            continue
+        if _asserts_the_sentinel_is_gone(node):
+            continue
+        strings = _executed_strings(node)
+        for token in _REBUILD_TOKENS:
+            if any(token in s for s in strings):
+                offences.append(f"{path.name}::{node.name} rebuilds its own subject ({token!r})")
+    return offences
+
+
 def test_the_migration_tests_never_call_the_drop_and_recreate_fixture():
     """
-    STRUCTURAL, and it is about this file rather than about the mechanism.
+    STRUCTURAL, and w151 repaired its SHAPE rather than its subject.
 
     The trap is that these tests are one import away from being handed a
     freshly rebuilt database, at which point every assertion above passes for
-    the wrong reason. This fails if the words ever appear in the migration
-    test files.
-    """
-    here = pathlib.Path(__file__).resolve().parent
-    files = sorted(here.glob("test_w126m_*.py")) + sorted(here.glob("test_w143_*.py")) + [here / "migration_db.py"]
-    # Non-vacuity: a glob that matched nothing would make this pass by
-    # checking no files at all, which is the exact shape of the failure it
-    # exists to catch.
-    assert len(files) >= 2, [f.name for f in files]
+    the wrong reason.
 
+    TWO CHECKS, because the hazard has two spellings. The SHARED fixture has
+    no legitimate use in a migration test at all, so importing it is refused
+    file-wide. An INLINE rebuild is the package's ordinary idiom and is
+    refused only inside a function whose subject is the migration mechanism.
+    """
+    files = _migration_test_files()
+
+    # NON-VACUITY, and it is not a count: the derived subject must be a STRICT
+    # SUPERSET of the three globs this guard used to read. A derivation that
+    # found fewer files than the hand-written list it replaced would be the
+    # failure this repair exists to remove, wearing the repair's clothes.
+    here = pathlib.Path(__file__).resolve().parent
+    old_subject = set(here.glob("test_w126m_*.py")) | set(here.glob("test_w143_*.py")) | {here / "migration_db.py"}
+    assert old_subject <= set(files), sorted(p.name for p in old_subject - set(files))
+    assert len(files) > len(old_subject), sorted(p.name for p in files)
+    assert pathlib.Path(__file__).resolve() in files
+
+    forbidden_import = "from clinical.tests." + "db_" + "guard"
+    offences = []
     for path in files:
-        name = path.name
-        text = path.read_text(encoding="utf-8")
-        # Each token is BUILT from halves rather than written out, because
-        # this file is one of the files it reads and a literal copy anywhere
-        # in it -- including in this comment -- would make the check fail on
-        # its own source.
-        for forbidden in ("reset_" + "schema(", "from clinical.tests." + "db_" + "guard", 'execute("DROP ' + "SCHEMA"):
-            assert forbidden not in text, f"{name}: {forbidden}"
+        if forbidden_import in path.read_text(encoding="utf-8"):
+            offences.append(f"{path.name}: imports {forbidden_import}")
+        offences.extend(_functions_that_rebuild_their_own_migration_subject(path))
+    assert not offences, offences
 
     # And the sentinel is a sentinel: nothing in schema.sql creates it, so a
     # database rebuilt from schema.sql cannot have it by any route.
     assert migration_db.SENTINEL_TABLE not in SCHEMA_PATH.read_text(encoding="utf-8")
+
+
+def test_the_subject_is_derived_and_finds_a_migration_test_nobody_listed(tmp_path):
+    """
+    WRONG VERSION A, and the only row that can catch it.
+
+    A guard whose subject is a HAND-WRITTEN LIST of today's files passes every
+    other row in this file: the list is complete today, the strict-superset
+    check is satisfied, the token scan finds nothing. It fails on the day a
+    migration test is written that nobody added to the list -- and that day is
+    not today, so the property has to be exercised against a directory this
+    row builds. A derivation finds the new file; a list does not.
+    """
+    (tmp_path / "test_w999_migration_0099_whatever.py").write_text(
+        "from clinical.tests.migration_db import connect, scratch_database\n", encoding="utf-8"
+    )
+    (tmp_path / "test_not_a_migration_test.py").write_text("import pytest\n", encoding="utf-8")
+
+    found = {p.name for p in _migration_test_files(tmp_path)}
+    assert found == {"test_w999_migration_0099_whatever.py"}, found
+
+
+def test_the_drop_and_recreate_guard_fails_on_the_shape_it_forbids(tmp_path):
+    """
+    NON-VACUITY, and it is the row the old guard never had: a guard that has
+    never been observed to fail is decoration. Two synthetic files, one
+    prohibited and one legitimate, differing only in whether the rebuild is in
+    the same function as the migration subject.
+    """
+    # Composed at run time, so the joined token exists in the files WRITTEN
+    # here and never in this file's own source -- which the guard also reads.
+    rebuild = "DROP " + "SCHEMA public CASCADE; CREATE SCHEMA public;"
+
+    prohibited = tmp_path / "test_wrong.py"
+    prohibited.write_text(
+        "def test_it():\n"
+        "    with scratch_database() as dsn, connect(dsn) as connection:\n"
+        f'        connection.cursor().execute("{rebuild}")\n',
+        encoding="utf-8",
+    )
+    legitimate = tmp_path / "test_right.py"
+    legitimate.write_text(
+        "def conn():\n"
+        f'    cur.execute("{rebuild}")\n'
+        "def test_it():\n"
+        "    with scratch_database() as dsn:\n"
+        "        assert dsn\n",
+        encoding="utf-8",
+    )
+
+    # THE PROSE TWIN. The forbidden statement, in a docstring, in a function
+    # whose subject IS the migration mechanism -- which is this file at line
+    # 361 and the reason the exclusion exists.
+    prose_only = tmp_path / "test_prose.py"
+    prose_only.write_text(
+        "def test_it():\n"
+        f'    """A docstring that names {rebuild} and must not count."""\n'
+        "    with scratch_database() as dsn:\n"
+        "        assert dsn\n",
+        encoding="utf-8",
+    )
+
+    # THE DELIBERATE CONTROL TWIN: rebuilds on purpose and requires the
+    # sentinel to be gone. Exempt, and exempt structurally.
+    control = tmp_path / "test_control.py"
+    control.write_text(
+        "def test_it():\n"
+        "    with scratch_database() as dsn, connect(dsn) as connection:\n"
+        "        plant_sentinel(connection)\n"
+        "        assert read_sentinel(connection) == ((SENTINEL_NOTE,), (SENTINEL_ORG,))\n"
+        f'        _apply(connection, "{rebuild}")\n'
+        "        assert read_sentinel(connection) == ((), ())\n",
+        encoding="utf-8",
+    )
+
+    # ...and the same file WITHOUT the demand for its own destruction, which is
+    # the hazard wearing the control's clothes.
+    fake_control = tmp_path / "test_fake_control.py"
+    fake_control.write_text(
+        "def test_it():\n"
+        "    with scratch_database() as dsn, connect(dsn) as connection:\n"
+        "        plant_sentinel(connection)\n"
+        f'        _apply(connection, "{rebuild}")\n'
+        "        assert read_sentinel(connection) == ((SENTINEL_NOTE,), (SENTINEL_ORG,))\n",
+        encoding="utf-8",
+    )
+
+    assert _functions_that_rebuild_their_own_migration_subject(prohibited)
+    assert _functions_that_rebuild_their_own_migration_subject(legitimate) == []
+    assert _functions_that_rebuild_their_own_migration_subject(prose_only) == []
+    assert _functions_that_rebuild_their_own_migration_subject(control) == []
+    assert _functions_that_rebuild_their_own_migration_subject(fake_control)

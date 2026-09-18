@@ -72,6 +72,35 @@ ROLES = (
     "System",
 )
 
+# w141. THE ROLES A PERSON MAY BE GRANTED. `ROLES` is the schema's vocabulary
+# -- the CHECK constraint on `role_assignments.role` enumerates all seven and
+# it is unchanged -- but "System" is not a role anybody holds, it is the
+# INTERNAL SYSTEM PRINCIPAL, and the difference was enforced by convention
+# only.
+#
+# THE CONVENTION, WHICH ALREADY EXISTED EVERYWHERE ELSE:
+#   * `login()` refuses any account with `is_system_account = true`
+#     (reason="system_account"), so the system principal cannot authenticate
+#     interactively;
+#   * the ONLY writer of a `role_assignments` row naming "System" is
+#     `_create_system_session`, which writes it with raw SQL alongside the
+#     `is_system_account = true` user it just created, and whose four call
+#     sites are pinned by name in test_identity.py.
+#
+# THE HOLE THOSE TWO LEFT. `_require_role(session, "System")` reads
+# `role_assignments`; it does NOT read `is_system_account`. So an
+# Administrator calling `assign_role(session, <an ordinary human>, "System")`
+# granted that human the principal the fastq detection write path gates on
+# -- and, because the human's own account is not a system account, that human
+# could still log in interactively and use it. No tenant boundary is crossed
+# (`session.org_id` binds the INSERT and the composite FK enforces it), so
+# this is a privilege-separation defect inside one organisation, not a leak.
+#
+# Stated as a set rather than as `role != "System"` at the call site so the
+# census is readable and so a future role that is also not human-assignable
+# has one place to go.
+HUMAN_ASSIGNABLE_ROLES = tuple(r for r in ROLES if r != "System")
+
 # Phase 7 commit 4 (spec 22, human ruling D2). RE-RULED 2026-09-09:
 # "everything downstream of a VCF inherits the VCF period" -- so
 # "run_document" and "report" are NO LONGER independently configurable.
@@ -1523,10 +1552,27 @@ class DataAccess:
         `basis` is mandatory for Approver -- ISO 15189 7.4.1.5 c) requires the
         reviewer's identity and authority to be retrievable, and the schema
         CHECK refuses the row without it.
+
+        "System" IS NOT ASSIGNABLE, BY ANYBODY, INCLUDING AN ADMINISTRATOR
+        (w141). See HUMAN_ASSIGNABLE_ROLES above for why: it is the internal
+        system principal that `_require_role(session, "System")` gates the
+        fastq detection write path on, and `_create_system_session` is the
+        only thing entitled to hold it. The refusal is a ValueError and not an
+        AuthorizationError deliberately -- an AuthorizationError would say
+        "you may not do this", which invites somebody to look for a principal
+        who may. There is none.
+
+        THE ORDER MATTERS: the Administrator check stays FIRST, so a caller
+        without it learns nothing about which roles are assignable.
         """
         self._require_role(session, "Administrator")
         if role not in ROLES:
             raise ValueError(f"Unknown role: {role!r}. Known roles: {', '.join(ROLES)}")
+        if role not in HUMAN_ASSIGNABLE_ROLES:
+            raise ValueError(
+                f"Role {role!r} is the internal system principal and cannot be granted to a "
+                f"person. Assignable roles: {', '.join(HUMAN_ASSIGNABLE_ROLES)}."
+            )
         if role == "Approver" and not basis:
             raise ValueError(
                 "Assigning Approver requires a qualification basis "

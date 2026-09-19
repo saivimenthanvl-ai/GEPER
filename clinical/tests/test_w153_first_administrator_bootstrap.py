@@ -144,14 +144,50 @@ STAFF_COOKIE = "clinical_session"
 
 OPERATING_CONTEXT = "w153 test: operator provisioning run from a Python interpreter"
 
-NOW = dt.datetime(2026, 9, 19, 9, 0, 0, tzinfo=dt.timezone.utc)
+
+def _now() -> dt.datetime:
+    """
+    THE REAL WALL CLOCK, READ AFRESH EACH TIME. It used to be the module-level
+    literal `dt.datetime(2026, 9, 19, 9, 0, 0, tzinfo=dt.timezone.utc)`, and
+    that literal made this file's HEADLINE ROW RED FOR EVER after 09:30 UTC on
+    2026-09-19.
+
+    WHY, EXACTLY -- because the shape matters more than the one row it broke.
+    `FakeClock` is injected into the `DataAccess` that CREATES the session
+    (`dao.login`), so the session's `created_at`/`last_seen` were stamped at the
+    frozen literal. But
+    `TestTheProvisionedAdministratorCanReachAWaveTwoRoute` then drives that
+    session over HTTP through `clinical.app`, which builds its OWN `DataAccess`
+    on the REAL clock and validates the cookie against a 30-minute idle window.
+    Two clocks, one session: the faked one wrote the timestamp and the real one
+    judged it. The row could only pass while real-now was within 30 minutes of a
+    fixed point in the past, so it passed on the day it was written and could
+    never pass again.
+
+    WHY A FUNCTION AND NOT A MODULE-LEVEL `dt.datetime.now(...)`. A module-level
+    call is evaluated ONCE, at import, which for this suite is collection time.
+    `clinical/tests` takes well over thirty minutes to run serially (measured
+    this wave), so a single import-time timestamp would re-introduce exactly the
+    same expiry with a longer fuse and a far worse failure mode: red only on a
+    slow machine, green on a fast one. Read per `FakeClock`, the gap between the
+    session's timestamp and the HTTP request is the duration of ONE test.
+
+    THE CLOCK IS STILL FROZEN WITHIN A TEST -- `FakeClock` captures this value
+    once at construction and returns it unchanged -- so determinism inside a
+    test is unaffected. What changed is only WHERE the frozen point sits: on the
+    real timeline instead of at a literal in the past.
+    """
+    return dt.datetime.now(dt.timezone.utc)
 
 
 class FakeClock:
     """One clock, injected, as the layer's docstring requires."""
 
     def __init__(self, start: dt.datetime | None = None) -> None:
-        self._now = start or NOW
+        # `if start is not None`, not `start or _now()`: an explicit epoch-zero
+        # or otherwise falsey datetime should be honoured, not silently
+        # replaced.
+        self._now = start if start is not None else _now()
 
     def now(self) -> dt.datetime:
         return self._now
@@ -872,7 +908,11 @@ class TestItGrantsAdministratorAndNothingElse:
             cur.execute(
                 "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                 "VALUES (%s, %s, 'System', %s, %s)",
-                (session.user_id, org_id, session.user_id, NOW),
+                # `assigned_at` only, on a row this test inserts and then rolls
+                # back. Nothing reads it, nothing orders on it and nothing
+                # asserts it, so any instant does; it reads the same clock as
+                # the rest of the file rather than carrying a second literal.
+                (session.user_id, org_id, session.user_id, _now()),
             )
         assert _rows(conn, "SELECT role FROM role_assignments WHERE role = %s", ("System",)) == [("System",)]
         conn.rollback()

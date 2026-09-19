@@ -1615,6 +1615,139 @@ class DataAccess:
         return assignment_id
 
     @auditable(
+        action="role_revoked",
+        resource_type="role_assignment",
+        resource_id_param="target_user_id",
+        requires_session=True,
+        details_builder=lambda params, result: {
+            "target_user_id": str(params.get("target_user_id")),
+            "role": params.get("role"),
+            "assignments_revoked": result,
+        },
+    )
+    @transactional
+    def revoke_role(self, session: Session, target_user_id: uuid.UUID, role: str) -> int:
+        """
+        Withdraw a role. THE FIRST PRODUCTION WRITER OF `revoked_at` /
+        `revoked_by`, and w154 (WAVE 4) exists because there was none.
+
+        THE STATE HAD NO WRITER AND THE ENFORCEMENT WAS ALREADY COMPLETE.
+        Measured at 4700f40 over non-test Python, whole tree: `revoked_at`
+        and `revoked_by` occurred at exactly two code sites, `_get_actor_role`
+        and `get_user_roles`, and BOTH were `revoked_at IS NULL` read
+        predicates. Three sites wrote a `role_assignments` row -- this
+        method's neighbour `assign_role`, `provision_organisation`, and
+        `_create_system_session` -- and not one of them ever set the two
+        columns back. So the platform could grant a role and could read a
+        revocation it had no way to record.
+
+        ── WHY THIS METHOD DOES NOT TOUCH SESSIONS, WHICH IS THE DESIGN
+           QUESTION AND IS SETTLED BY MEASUREMENT RATHER THAN BY TASTE ──
+
+        ROLES ARE RESOLVED PER REQUEST, FROM THIS TABLE. `Session` is a
+        frozen dataclass of exactly three fields -- session_id, user_id,
+        org_id -- and carries no role. `session_valid` reads one `sessions`
+        row and returns those three fields; it does not join
+        `role_assignments` and never has. `_require_role` calls
+        `get_user_roles`, which reads `role_assignments` with
+        `revoked_at IS NULL`, on EVERY gated call. Nothing captures a role at
+        login, so there is no stale copy anywhere to invalidate.
+
+        Therefore setting `revoked_at` IS the enforcement: the caller's very
+        next gated request recomputes the set and fails. Terminating the
+        target's sessions here would be a SECOND mechanism for an effect the
+        first one already has, and the two could then disagree -- which is
+        precisely the failure `set_user_disabled` has to live with and this
+        method does not.
+
+        AND THAT IS NOT WHAT `set_user_disabled` DOES, FOR A REASON.
+        `users.disabled` is the mirror image: NOTHING on the authenticated
+        path reads it. `session_valid` reads only `sessions`, so a disabled
+        user's live session stayed valid until its own window closed -- which
+        is why w133 had to end the sessions inside that method's body. The
+        house pattern is "write the state, then close whatever enforcement
+        does not reach"; here enforcement reaches everything, so there is
+        nothing to close. Copying the session UPDATE across would not be
+        following the pattern, it would be inverting it.
+
+        ── THE UNIT OF REVOCATION IS (USER, ROLE), NOT AN ASSIGNMENT ROW ──
+
+        `_require_role` tests membership in a SET of role NAMES, so the thing
+        authorisation is a function of is "does this user still hold this
+        role", not "is this particular assignment row live". Revoking one row
+        by `assignment_id` would leave a duplicate grant standing and mark a
+        row while changing nothing an authorisation check can see -- a writer
+        whose effect on authorisation is not guaranteed. This method revokes
+        EVERY live assignment of that role for that user in that
+        organisation, in one statement, so the post-condition is the one the
+        gate actually reads.
+
+        ── REFUSALS, IN THE ORDER `assign_role` ALREADY ESTABLISHED ──
+
+        The Administrator check is FIRST, before the vocabulary check and
+        before any row is read, so a caller who is not an Administrator
+        learns nothing about which roles exist or which users do.
+
+        "System" IS NOT REVOCABLE HERE, on the same `HUMAN_ASSIGNABLE_ROLES`
+        tuple `assign_role` refuses it on (w141) and deliberately not on a
+        second, differently-derived rule. That tuple names the roles that are
+        part of the HUMAN role lifecycle; "System" is the internal principal
+        that `_create_system_session` is the only thing entitled to hold, and
+        an Administrator able to withdraw it would hold new authority over
+        the internal principal rather than the preserved authority w141 left
+        them. The lifecycle is closed at both ends by one constant. This is
+        fail-closed: if the platform later needs a System revoker it is an
+        addition, not a repair.
+
+        NO SELF-TARGETING RULE IS ADDED, and the absence is preserved on
+        purpose. There is no such rule anywhere in this class today --
+        `set_user_disabled` lets an Administrator disable their own account
+        and says so, and nothing guards a "last Administrator". An
+        Administrator who revokes their own Administrator role therefore
+        succeeds and is refused on their next administrative request, because
+        roles are resolved per request. Whether an organisation should be
+        prevented from locking itself out is a product decision nobody has
+        made; inventing one here would be widening an existing rule under
+        cover of preserving it.
+
+        A USER WHO DOES NOT HOLD THE ROLE IS NOT A REFUSAL. The target
+        existing is checked (`get_user`, which is where the 404 and the
+        organisation predicate live); holding the role is not. Revoking a
+        role nobody holds returns 0 and writes nothing, because the
+        post-condition asked for -- "this user does not hold this role" -- is
+        already true. Returning the count rather than None is what makes that
+        distinction visible to a caller and to the audit row.
+
+        ONE STATEMENT WITH `RETURNING`, not a read followed by a write. The
+        count and the change then come from the same statement, so a
+        concurrent revoker cannot make this method report a number that does
+        not match what it did.
+        """
+        self._require_role(session, "Administrator")
+        if role not in ROLES:
+            raise ValueError(f"Unknown role: {role!r}. Known roles: {', '.join(ROLES)}")
+        if role not in HUMAN_ASSIGNABLE_ROLES:
+            raise ValueError(
+                f"Role {role!r} is the internal system principal and cannot be revoked from a "
+                f"person. Revocable roles: {', '.join(HUMAN_ASSIGNABLE_ROLES)}."
+            )
+
+        # The target must be in the acting session's organisation. The same
+        # call assign_role makes, in the same position, for the same reason:
+        # a clear NotFoundError, and one that cannot distinguish "no such
+        # user" from "a real user in another organisation".
+        self.get_user(session, target_user_id)
+
+        now = self._clock.now()
+        revoked = self._query(
+            "UPDATE role_assignments SET revoked_at = %s, revoked_by = %s "
+            "WHERE org_id = %s AND user_id = %s AND role = %s AND revoked_at IS NULL "
+            "RETURNING assignment_id",
+            (now, session.user_id, session.org_id, target_user_id, role),
+        )
+        return len(revoked)
+
+    @auditable(
         action="roles_read",
         resource_type="role",
         requires_session=True,

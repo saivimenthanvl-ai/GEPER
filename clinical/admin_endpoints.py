@@ -162,11 +162,15 @@ oversight. See `hive/agents/god/w152-decision-cards.md`.
 
 * FIRST ADMINISTRATOR PROVISIONING. The deadlock above. WAVE 3.
 
-* ROLE REVOCATION. There is no domain method: at `e1be7ab` no `DataAccess`
-  method has `revoke` in its name, and `revoked_at`/`revoked_by` appear only
-  in `SELECT ... WHERE revoked_at IS NULL` predicates. The enforcement model
-  is continuous and strong and the state it enforces on has no writer. There
-  is nothing to wire. ABSENT.
+* ROLE REVOCATION. ABSENT AT `e1be7ab`, WHERE THIS BULLET WAS WRITTEN, AND
+  BUILT AT w154 (WAVE 4). The measurement that made it absent was right: no
+  `DataAccess` method had `revoke` in its name and `revoked_at`/`revoked_by`
+  appeared only in `revoked_at IS NULL` read predicates, so the enforcement
+  model was continuous and strong and the state it enforced on had no writer.
+  `DataAccess.revoke_role` is now that writer and `DELETE
+  /admin/users/{user_id}/roles/{role}` is its route. It ends no sessions, and
+  that is a measurement rather than an omission -- see the method's own
+  docstring, and `revoke_role` below.
 
 * PATIENT ENROLMENT (`create_patient`, `record_consent`, `withdraw_consent`).
   Session-bound but UNGATED — no `_require_role` in any of the three bodies.
@@ -339,6 +343,25 @@ class RoleAssignmentCreated(BaseModel):
     assignment_id: str
 
 
+class RoleRevoked(BaseModel):
+    """
+    HOW MANY LIVE ASSIGNMENTS OF THAT ROLE THIS CALL WITHDREW.
+
+    A RESPONSE model, so it declares no `extra="forbid"` and is deliberately
+    outside the inbound scan in `test_w152_admin_surface.py`: there is no
+    request body on this route at all.
+
+    The count is here rather than a 204 because zero and one are genuinely
+    different outcomes and only one of them changed anything -- revoking a
+    role the user never held is not a refusal (the post-condition asked for
+    is already true) and a caller is entitled to know which of the two
+    happened. It discloses nothing: only an Administrator of the target's own
+    organisation ever sees it, and it counts rows in that organisation.
+    """
+
+    revoked: int
+
+
 class AuditEntry(BaseModel):
     """
     The columns `read_audit` selects, PASSED THROUGH AND NOT RE-DERIVED.
@@ -416,6 +439,65 @@ async def assign_role(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return RoleAssignmentCreated(assignment_id=str(assignment_id))
+
+
+@router.delete(
+    "/users/{user_id}/roles/{role}",
+    response_model=RoleRevoked,
+    summary="Withdraw a role from a user in the CALLER'S OWN organisation",
+    responses={
+        200: {"description": "Every live assignment of that role is withdrawn; the count is returned"},
+        400: {"model": ErrorResponse, "description": "Unknown or unrevocable role"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        403: {"model": ErrorResponse, "description": "Not permitted"},
+        404: {"model": ErrorResponse, "description": "Not found"},
+    },
+)
+async def revoke_role(
+    user_id: str,
+    role: str,
+    session: Session = Depends(_get_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> RoleRevoked:
+    """
+    `DataAccess.revoke_role`, and nothing else.
+
+    THE EXACT INVERSE OF THE ROUTE ABOVE, on the same collection. `POST
+    /users/{id}/roles` grants; `DELETE /users/{id}/roles/{role}` withdraws.
+
+    THE ROLE IS A PATH SEGMENT AND NOT A BODY FIELD, which is why this route
+    adds no request model. A role name is a member of a closed, public
+    vocabulary of seven strings, not an identifier -- it names no row, leaks
+    nothing by being in a URL, and there is nothing else to send. It is also
+    what makes the request idempotent in the way DELETE is supposed to be:
+    the second call withdraws nothing and says so.
+
+    NO VOCABULARY CHECK HAPPENS HERE. An unknown role, and "System", are
+    both refused by the domain method, after its Administrator gate, with the
+    same `ValueError` shape `assign_role` already uses -- so a
+    non-Administrator sending a nonsense role still gets the plain 403 and
+    learns nothing about the vocabulary. Validating the segment here would
+    put a second copy of the role list in this file and would answer before
+    the gate.
+
+    NOTHING IS DONE ABOUT THE TARGET'S LIVE SESSIONS, and it is deliberate.
+    Roles are resolved per request: `Session` carries no role, `session_valid`
+    reads only the `sessions` row, and `_require_role` re-reads
+    `role_assignments` on every gated call. The target's next administrative
+    request is refused by the gate itself. Ending their sessions would be a
+    second mechanism for an effect the first one already has -- and it would
+    also log them out of everything they are still entitled to do.
+    """
+    target = _target(user_id)
+    try:
+        revoked = dao.revoke_role(session, target, role)
+    except AuthorizationError:
+        raise _forbidden()
+    except NotFoundError:
+        raise _not_found()
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return RoleRevoked(revoked=revoked)
 
 
 @router.post(

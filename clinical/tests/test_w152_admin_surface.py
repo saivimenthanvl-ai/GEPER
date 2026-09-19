@@ -1114,6 +1114,12 @@ class TestTheHandlersComposeNoDecoratedCalls:
         assert per_handler, "no dao calls found at all -- this guard is reading the wrong file"
         assert set(per_handler) == {
             "assign_role",
+            # w154 (WAVE 4). The fifth handler, added because role revocation
+            # had no production writer at all. This set is an exact census of
+            # the surface on purpose -- a handler appearing in it without
+            # being named here is a route nobody enumerated -- so growing the
+            # surface means growing the census, which is what this line is.
+            "revoke_role",
             "set_user_disabled",
             "set_patient_login_disabled",
             "read_audit",

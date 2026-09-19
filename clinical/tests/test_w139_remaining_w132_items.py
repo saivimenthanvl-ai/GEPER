@@ -122,6 +122,12 @@ THE_REFUSAL = (401, json.dumps({"detail": "Authentication failed."}, separators=
 # All eight are probed with the same eight INVALID credentials, so the
 # administrative routes can reach neither their role gate nor their domain
 # method here — the subject is the authentication refusal and nothing else.
+# w154. The closed role vocabulary, IMPORTED rather than retyped — see
+# `_shapes` for why a path segment can be one of these and what that means.
+from clinical.data_access import ROLES as _ROLES  # noqa: E402
+
+_ROLE_SEGMENTS = frozenset(_ROLES)
+
 AUTHENTICATED_STAFF_ROUTES = (
     ("GET", "/exceptions/worklist?owner=someone", None),
     ("GET", f"/exceptions/orders/{_UNKNOWN_UUID}", None),
@@ -135,6 +141,11 @@ AUTHENTICATED_STAFF_ROUTES = (
     ("POST", f"/admin/users/{_UNKNOWN_UUID}/disabled", {"disabled": True}),
     ("POST", f"/admin/patient-logins/{_UNKNOWN_UUID}/disabled", {"disabled": True}),
     ("GET", "/admin/audit", None),
+    # w154 (WAVE 4). Role revocation, the inverse of the assign route above.
+    # A DELETE, and the first one in this set — `_call` grew a branch for it.
+    # The role segment is a member of the closed seven-string vocabulary, not
+    # an identifier, which is why `_shapes` has to reduce it; see there.
+    ("DELETE", f"/admin/users/{_UNKNOWN_UUID}/roles/Approver", None),
 )
 
 
@@ -320,6 +331,10 @@ def _call(client, method, path, cookies, body=None):
         return client.get(path, cookies=cookies)
     if method == "PATCH":
         return client.patch(path, json=body, cookies=cookies)
+    # w154: the role-revocation route is a DELETE and declares no body at all,
+    # so it is sent bodyless the way the bodyless POSTs are.
+    if method == "DELETE":
+        return client.delete(path, cookies=cookies)
     # w152: a POST with a declared body is now in the set, so the body is sent
     # when there is one. `None` stays a bodyless POST rather than becoming a
     # JSON `null`, because `/auth/logout` declares no body and a body it did
@@ -376,12 +391,28 @@ def _shapes(paths):
     So `/exceptions/orders/{order_id}` (what the app declares) and
     `/exceptions/orders/00000000-...` (what a probe sends) are the same route,
     which is what a coverage comparison needs to be about.
+
+    w154 WIDENED THIS BY EXACTLY ONE CASE, and the widening is written down
+    rather than folded in. `DELETE /admin/users/{user_id}/roles/{role}` has a
+    second variable segment that is NOT an identifier: it is a member of the
+    closed seven-string role vocabulary, so a probe necessarily sends a real
+    role name where the app declares `{role}`, and without this the two sides
+    would never compare equal. `ROLES` is imported rather than retyped, so a
+    role added to the platform is covered without anybody editing this helper.
+
+    THIS IS A COVERAGE COMPARISON AND NOTHING ELSE. What it could now fail to
+    distinguish is a hypothetical route whose path segment is LITERALLY a role
+    name from the parameterised one — a confusion with no consequence for the
+    property being checked, which is "is every served staff route probed".
     """
     reduced = set()
     for path in paths:
         segments = []
         for segment in path.split("/"):
             if segment.startswith("{") and segment.endswith("}"):
+                segments.append("*")
+                continue
+            if segment in _ROLE_SEGMENTS:
                 segments.append("*")
                 continue
             try:
@@ -1491,10 +1522,10 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
     listed — which for this route is every session-lifecycle state, none of
     which was listed.
 
-    Eight cases x eight routes = 64 observations, ONE pair. (Four routes and
-    32 observations until w152 mounted the administrative surface; the route
-    list is now derived from the app rather than trusted -- see
-    `_staff_authenticated_paths`.)
+    Eight cases x NINE routes = 72 observations, ONE pair. (Four routes and
+    32 observations until w152 mounted the administrative surface; eight and
+    64 until w154 added role revocation; the route list is derived from the
+    app rather than trusted -- see `_staff_authenticated_paths`.)
     """
 
     def _cases(self, client, dao, conn, world):
@@ -1541,7 +1572,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         # w152: four, then eight. The number is a non-vacuity floor, not the
         # property -- the property is that the list matches what the app
         # serves, which the assertion below checks against the route census.
-        assert len(AUTHENTICATED_STAFF_ROUTES) == 8, "a staff route left the list without being probed"
+        assert len(AUTHENTICATED_STAFF_ROUTES) == 9, "a staff route left the list without being probed"
         assert any(path.startswith("/auth/logout") for _, path, _ in AUTHENTICATED_STAFF_ROUTES), (
             "the logout route left the list -- it is the entire reason this class exists"
         )
@@ -1564,7 +1595,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
                 response = _call(client, method, path, cookies, body)
                 observed[f"{name} | {method} {path}"] = (response.status_code, response.content)
 
-        assert len(observed) == 64, observed
+        assert len(observed) == 72, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 
@@ -1594,7 +1625,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
     def test_the_positive_twin_a_live_staff_session_is_not_in_that_set_on_any_route(self, client, world):
         """
         Without this, "everything is the one refusal" is satisfied perfectly by
-        a service that refuses everything, on all eight routes at once.
+        a service that refuses everything, on all nine routes at once.
 
         Each route's OWN success shape is asserted, not merely "not the refusal
         pair", because three different 500s would satisfy that. The logout is

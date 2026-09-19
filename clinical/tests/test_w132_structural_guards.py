@@ -462,6 +462,17 @@ class TestTheRouteCensus:
             # a fixture-provisioned Administrator, which is a fixture and not
             # a bootstrap.
             ("/admin/users/{user_id}/roles", ("POST",)),
+            # w154 (WAVE 4). THE INVERSE OF THE ROUTE ABOVE, and the first
+            # production writer of `role_assignments.revoked_at` /
+            # `revoked_by` this repository has ever had: at 4700f40 those two
+            # columns appeared at exactly two non-test code sites and BOTH
+            # were `revoked_at IS NULL` read predicates. It is one existing
+            # shape — one domain method (`revoke_role`), the staff dependency,
+            # `_require_role` inside the method — and it ends no sessions,
+            # because roles are resolved per request and a second mechanism
+            # for an effect the first one already has can only disagree with
+            # it. See clinical/tests/test_w154_role_revocation.py.
+            ("/admin/users/{user_id}/roles/{role}", ("DELETE",)),
             ("/admin/users/{user_id}/disabled", ("POST",)),
             ("/admin/patient-logins/{patient_login_id}/disabled", ("POST",)),
             ("/admin/audit", ("GET",)),
@@ -484,11 +495,11 @@ class TestTheRouteCensus:
         census = served_routes(app)
         # 11 at 863f07e; 13 from w135, which added the two patient report
         # routes; 14 from w136, which added the patient report series; 18 from
-        # w152, which added the four administrative routes. The number is
-        # checked against the EXPECTED set above, which is what actually names
-        # them — this row exists only to refuse the empty and wrapper-shaped
-        # answers.
-        assert len(census) == 18, census
+        # w152, which added the four administrative routes; 19 from w154,
+        # which added the role-revocation route. The number is checked against
+        # the EXPECTED set above, which is what actually names them — this row
+        # exists only to refuse the empty and wrapper-shaped answers.
+        assert len(census) == 19, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

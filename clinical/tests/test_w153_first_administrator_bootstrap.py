@@ -770,11 +770,39 @@ class TestTheShapeThatMakesItInert:
         assert len(paths) > 10, sorted(paths)
         assert "/admin/audit" in paths and "/auth/login" in paths, sorted(paths)
 
-        # No module that defines any served route so much as names the method.
-        # Every route this app serves is defined in one of these three (the
-        # census row above is what keeps that list honest), and the handlers
-        # are thin translations, so a mention is the only way a call could
-        # get there.
+        # No module that defines any served route CALLS the method. Every
+        # route this app serves is defined in one of these five (the census
+        # row above is what keeps that list honest) and the handlers are thin
+        # translations, so a call there is the only way a route could reach it.
+        #
+        # THE INSTRUMENT CHANGED AT w155, AND THE PROPERTY DID NOT.
+        # This was `assert "provision_organisation" not in source` — a
+        # SUBSTRING scan over the whole file, docstrings included. That is the
+        # defect this repository already has a name for: grep credits prose as
+        # a caller, which is how `_release_report` came to be recorded with
+        # thirteen callers and zero calls. It bit here the moment w155's
+        # module docstring in `admin_endpoints.py` carried the honest caveat
+        # this very row exists to state — that every administrative route is
+        # exactly as reachable as an operator invoking `provision_organisation`
+        # directly. A guard that forbids naming the problem is not a guard.
+        #
+        # So the scan is now an AST ATTRIBUTE-AND-CALL census, which is
+        # STRICTLY STRONGER on code and silent on prose: it catches
+        # `dao.provision_organisation(...)`, a bare reference handed to
+        # `Depends`, and an alias assignment — none of which a substring
+        # search distinguishes from a sentence.
+        def _referenced(path):
+            tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute):
+                    names.add(node.attr)
+                elif isinstance(node, ast.Name):
+                    names.add(node.id)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    names.update(alias.name for alias in node.names)
+            return names
+
         for module_name in (
             "clinical.app",
             "clinical.endpoints",
@@ -786,14 +814,21 @@ class TestTheShapeThatMakesItInert:
                 module = __import__(module_name, fromlist=["*"])
             except ImportError:
                 continue
-            source = pathlib.Path(module.__file__).read_text(encoding="utf-8")
-            assert "provision_organisation" not in source, module_name
+            assert "provision_organisation" not in _referenced(module.__file__), module_name
 
         # The non-vacuity twin for the scan: it CAN find a domain method name
-        # in those files when one is there.
+        # in those files when one is there — and, added at w155, it can tell a
+        # real reference from a mention in prose, which is the whole reason
+        # the instrument changed.
         from clinical import admin_endpoints
 
-        assert "assign_role" in pathlib.Path(admin_endpoints.__file__).read_text(encoding="utf-8")
+        referenced = _referenced(admin_endpoints.__file__)
+        assert "assign_role" in referenced
+        assert "enrol_patient_login" in referenced
+        assert "provision_organisation" in pathlib.Path(admin_endpoints.__file__).read_text(encoding="utf-8"), (
+            "this file no longer MENTIONS provision_organisation, so the row above can no longer "
+            "distinguish a prose mention from a call -- re-check that it still can"
+        )
 
 
 class TestItGrantsAdministratorAndNothingElse:

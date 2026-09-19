@@ -28,10 +28,36 @@ holds and never decides. A handler that made that decision itself would be a
 second authorisation system whose answer could drift from the first one's,
 and the first one is the one the database's composite foreign keys back up.
 
-Four capabilities are wired. The rest of the eleven are NOT, each for a
+Four capabilities were wired at w152, a fifth (role revocation) at w154, and
+a sixth (patient credential issuance) at w155. The rest are NOT, each for a
 stated reason, and the reasons are in `WHAT IS DELIBERATELY NOT HERE` at the
 bottom of this docstring. A capability that needs a product decision is
 stopped and carded rather than guessed.
+
+w155 (WAVE 5) — TWO SHAPES OF ROUTE, AND WHICH ONE THE NEW ONE IS.
+The requirement "a patient ID never comes from an unauthenticated public
+request as authority" is met in this repository by TWO different mechanisms
+and it matters which is which:
+
+  DEFENCE BY ABSENT PARAMETER — the portal. `list_my_report_trend(self,
+  patient_session)` takes NO patient identifier, so the wrong version is
+  UNWRITABLE rather than merely untested. Every `/portal/` route is this
+  shape and none of them may ever stop being it.
+
+  AN AUTHENTICATED ADMINISTRATOR NAMING A TARGET — this surface, including
+  `POST /admin/patients/{patient_id}/logins`. Administration is by definition
+  acting on somebody else, so the identifier is in the path. It is not an
+  authority claim and cannot become one: the caller is authenticated as
+  STAFF, the ORGANISATION the identifier is resolved in comes from
+  `Session.org_id` and never from the request, and the role gate runs before
+  the identifier is read at all. A `patient_id` here selects a row WITHIN the
+  caller's own tenant; it never selects an identity, and it never selects a
+  tenant.
+
+The one shape that exists nowhere is the third: an UNAUTHENTICATED request
+carrying a patient identifier. There is no self-registration route, and
+`test_w155_patient_administration.py` proves it by enumerating the served
+surface rather than by asserting it.
 
 ──────────────────────────────────────────────────────────────────────────
 THE SECURITY MODEL, IN THE ORDER A REQUEST MEETS IT
@@ -103,6 +129,22 @@ THE SECURITY MODEL, IN THE ORDER A REQUEST MEETS IT
    same string on every route, so a caller cannot tell from a refusal WHICH
    administrative object it named, nor which role it was short of.
 
+   THE SURFACE ALSO ANSWERS 400, 409 AND 422, AND NONE OF THE THREE IS AN
+   IDENTIFIER CHANNEL. 400 is the role vocabulary (a closed public list of
+   seven strings), raised after the gate. 422 is a request SHAPE refusal
+   (a forbidden extra field, a missing one, a `limit` out of range) and is
+   the one refusal FastAPI answers BEFORE the handler runs — which is why no
+   route on this surface may ever put a VALUE check in a request model.
+   Hazard, measured this run: validation order leaks. An `EmailStr` or a
+   `min_length` on the enrolment body would be answered to a caller holding
+   no Administrator role at all, and the refusal would then vary with
+   something evaluated before the caller's authorisation was. The enrolment
+   model therefore declares `str` and `str` and checks neither.
+   409 is `PatientAlreadyEnrolledError`, raised strictly after the
+   Administrator gate AND after the patient-exists-in-this-organisation
+   read, so it is visible only to an Administrator naming a patient in their
+   own tenant. It varies with nothing outside that tenant.
+
 6. NO INFORMATION ORACLE. The 404 is the same object for an identifier that
    is malformed, an identifier that exists nowhere, and an identifier that
    names a REAL ROW IN ANOTHER ORGANISATION. That last case is the one a
@@ -172,31 +214,93 @@ oversight. See `hive/agents/god/w152-decision-cards.md`.
   that is a measurement rather than an omission -- see the method's own
   docstring, and `revoke_role` below.
 
-* PATIENT ENROLMENT (`create_patient`, `record_consent`, `withdraw_consent`).
-  Session-bound but UNGATED — no `_require_role` in any of the three bodies.
-  Wiring them as they stand would let any authenticated staff session in the
-  organisation create patients and record consent. Adding the gate in the
-  handler would be the second permission system. Which role owns patient
-  enrolment is a ruling nobody has made. STOPPED, and it is WAVE 5's subject.
+* PATIENT CREDENTIAL ISSUANCE (`enrol_patient_login`). STOPPED AT w152 AND
+  WIRED AT w155 (WAVE 5). The w152 reasoning is left standing below in full,
+  because it was right when it was written and because the thing that changed
+  is not the code — it is the authority. READ BOTH HALVES.
 
-* PATIENT CREDENTIAL ISSUANCE (`enrol_patient_login`). Administrator-gated
-  and audited, so it is mechanically pure wiring — and it is stopped anyway,
-  on the one ground this wave is not allowed to resolve.
-  `GEPER_CLINICAL_PLATFORM_SPEC.md` §16 reads "**Recommendation: no patient
-  access in v1**", and carries an unanswered EXPERT call-out about what
-  counselling provision must accompany patient access. Seven `/portal/`
-  routes are nevertheless mounted and tested, and the tension is reported and
-  unresolved. Issuing the credential is the act that converts that
-  recommendation into a live patient-facing deployment — nothing else can,
-  because there is no self-registration path of any kind. That is a product
-  decision, and this wave does not silently reinterpret the product spec.
-  STOPPED.
+  w152's ground, unedited: "Administrator-gated and audited, so it is
+  mechanically pure wiring — and it is stopped anyway, on the one ground this
+  wave is not allowed to resolve. `GEPER_CLINICAL_PLATFORM_SPEC.md` §16 reads
+  '**Recommendation: no patient access in v1**', and carries an unanswered
+  EXPERT call-out about what counselling provision must accompany patient
+  access. Seven `/portal/` routes are nevertheless mounted and tested, and the
+  tension is reported and unresolved. Issuing the credential is the act that
+  converts that recommendation into a live patient-facing deployment — nothing
+  else can, because there is no self-registration path of any kind. That is a
+  product decision, and this wave does not silently reinterpret the product
+  spec."
 
-  REVOCATION IS WIRED AND ISSUANCE IS NOT, and the asymmetry is the point
+  WHAT SUPERSEDED IT. The human's Wave 5 dispatch instructs, in terms, "Wire
+  patient enrolment and credential operations through the administrative
+  surface", and sets eight requirements for it, the first being
+  Administrator-only enrolment. A product decision that has been MADE is not
+  the same object as one that is missing, and the thing w152 correctly refused
+  to do — settle §16 BY IMPLEMENTATION — is not what w155 did: the ruling came
+  first and from the person entitled to make it. `POST
+  /admin/patients/{patient_id}/logins` is that wiring.
+
+  AND THE TENSION IS RECORDED RATHER THAN DISSOLVED, WHICH IS THE PART A
+  LATER READER NEEDS. §16 still says what it says. The EXPERT call-out about
+  counselling provision is still unanswered. Seven `/portal/` routes and now
+  one issuing route are mounted against a spec section that recommends against
+  the whole surface, and the correct resolution is an edit to §16 by whoever
+  owns it — not a further re-reading by an implementer. It is not reinterpreted
+  here, in either direction. See `hive/agents/god/w155-decision-cards.md`.
+
+  REVOCATION WAS WIRED BEFORE ISSUANCE WAS, and the asymmetry was the point
   rather than an inconsistency: revocation only ever CONTRACTS patient access
   and no citation anywhere opposes contracting it, while issuance expands it
-  and §16 speaks directly to that. The safe half of a carded pair is not held
-  hostage by the half that needs the ruling.
+  and §16 speaks directly to that. The safe half of a carded pair was not held
+  hostage by the half that needed the ruling, and when the ruling came only
+  the second half had to move.
+
+* PATIENT RECORD CREATION AND CONSENT (`create_patient`, `record_consent`,
+  `withdraw_consent`). STILL STOPPED AT w155, AND THE MEASUREMENT IS WHY.
+
+  Re-measured at 60c48d9 by syntax tree, not grep: all three take a `Session`
+  as their first parameter and bind `org_id` from it, all three are
+  `@auditable(requires_session=True)`, and NONE of the three contains a
+  `_require_role` call anywhere in its body. Production call sites: ZERO for
+  each. Test call sites: 86, 57 and 6, across 43 files.
+
+  So the gate CAN be added without breaking a single production caller —
+  there are none. The question the gate cannot answer for itself is WHICH
+  ROLE, and that is a product decision in the strict sense. "Administrator-only
+  enrolment" is a ruling about ENROLMENT, and in this repository's own
+  vocabulary enrolment is `enrol_patient_login` — the method named for it,
+  whose audit action is `patient_login_enrolled`. `create_patient` is the
+  clinical patient REGISTRATION that precedes an order, and `record_consent`
+  is consent capture; making either Administrator-only would mean an
+  Administrator must register every patient and capture every consent before
+  any clinician can order a test. That is a workflow ruling with a cost, it is
+  not what the dispatch said, and inventing it here would be exactly the
+  "unresolved decision turned into an implementation assumption" the queue
+  forbids. STOPPED and carded; no route is added onto any of the three, and
+  none is gated, because a gate whose role is guessed is worse than a method
+  with no HTTP surface.
+
+  THE CONSEQUENCE IS HONEST AND IT IS STATED: the route this wave DOES add
+  names a `patient_id`, and no route on this surface can create one. An
+  Administrator enrolling a patient must be given a patient record that some
+  other path made. That is the same class of gap as `provision_organisation`
+  having no production caller outside `data_access.py` — the capability is
+  IMPLEMENTED and the surface above it is not complete.
+
+* PATIENT MFA. BLOCKED — a new security decision is required and none has been
+  made. Re-verified at 60c48d9: `patient_logins` has no TOTP column of any
+  kind and no patient code path mentions a second factor, so patient MFA is
+  ABSENT rather than broken. Staff MFA is present and FAIL-CLOSED-BROKEN:
+  `_verify_second_factor` raises `ConfigurationError` when `self._cipher` or
+  `self._totp` is `None`, `enrol_totp` raises it too, and every production
+  construction of `DataAccess` — `clinical/endpoints.py:262`,
+  `geper/api/exception_retry_worker.py:132`, `geper/api/submission_worker.py:850`,
+  `geper/review/signoff.py:936` — passes the connection alone, so both are
+  always `None` in production. `enrol_totp` also takes the SECRET AS A
+  PARAMETER, which means the caller generates it. Completing this needs a
+  key-management ruling (where the cipher key lives and who rotates it), a
+  secret-generation ruling, and for patients a schema change. No cryptography
+  was invented here. See the card.
 
 * EXCEPTION AMENDMENT and REPORT RETRACTION. `create_amendment` exists and is
   Approver-gated; the exception-amendment verb does not — `ExceptionEventAction`
@@ -218,6 +322,7 @@ from clinical.data_access import (
     AuthorizationError,
     DataAccess,
     NotFoundError,
+    PatientAlreadyEnrolledError,
     Session,
 )
 from clinical.endpoints import _get_data_access, _get_session
@@ -337,6 +442,53 @@ class DisabledRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     disabled: bool
+
+
+class PatientLoginEnrolmentRequest(BaseModel):
+    """
+    w155 (WAVE 5). The body of `POST /admin/patients/{patient_id}/logins`.
+
+    THERE IS NO `patient_id` FIELD, NO `org_id` FIELD AND NO `enrolled_by`
+    FIELD, and all three absences are the design. The patient is the PATH
+    TARGET, resolved inside the caller's own organisation; the organisation
+    is `Session.org_id`; the issuer is `session.user_id`, written to
+    `patient_logins.enrolled_by` by `enrol_patient_login` itself. A
+    caller-supplied issuer would be a claim, and the rule this repository
+    already settled (`ResolutionRequest` in `clinical/endpoints.py`) is that
+    the field is REMOVED rather than validated.
+
+    NEITHER FIELD IS VALIDATED HERE, AND THAT IS DELIBERATE AND
+    LOAD-BEARING, not laziness. Pydantic runs BEFORE the handler and
+    therefore before the role gate inside the domain method. An `EmailStr`
+    or a password `min_length` would be a 422 answered to a caller holding
+    no Administrator role, so the refusal would vary with the CONTENT of the
+    body at a point where the caller's authorisation had not been evaluated
+    — the same defect `_target` was rewritten not to have for the SHAPE of
+    an identifier. The gate goes first; everything that could answer before
+    it is a leak. `str` and `str`, and no constraint on either.
+
+    THE PASSWORD IS SUPPLIED BY THE ENROLLING ADMINISTRATOR rather than
+    generated here, because that is what `enrol_patient_login` already
+    takes. Generating one server-side and returning it once would be a new
+    decision about a delivery channel nobody has ruled on, and would also
+    mean this handler invented a credential policy the domain layer does
+    not have. It is never echoed back: `PatientLoginEnrolled` carries the
+    identifier and nothing else.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    password: str
+
+
+class PatientLoginEnrolled(BaseModel):
+    """The credential's identifier, which is also the handle the revocation
+    route already takes (`POST /admin/patient-logins/{id}/disabled`). No
+    email, no patient name, no password — nothing the caller did not send or
+    already hold."""
+
+    patient_login_id: str
 
 
 class RoleAssignmentCreated(BaseModel):
@@ -543,6 +695,86 @@ async def set_user_disabled(
 
 
 @router.post(
+    "/patients/{patient_id}/logins",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PatientLoginEnrolled,
+    summary="Issue a portal credential for a patient in the CALLER'S OWN organisation",
+    responses={
+        201: {"description": "The credential is issued and the issuer is recorded"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        403: {"model": ErrorResponse, "description": "Not permitted"},
+        404: {"model": ErrorResponse, "description": "Not found"},
+        409: {"model": ErrorResponse, "description": "This patient already holds a credential"},
+    },
+)
+async def enrol_patient_login(
+    patient_id: str,
+    body: PatientLoginEnrolmentRequest,
+    session: Session = Depends(_get_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> PatientLoginEnrolled:
+    """
+    `DataAccess.enrol_patient_login`, and nothing else.
+
+    w155 (WAVE 5). THE ISSUING HALF OF THE PAIR whose revoking half has been
+    below since w152. The module docstring carries why the two arrived one
+    wave apart and what superseded the stop; this docstring is about the
+    route.
+
+    THE SHAPE. An AUTHENTICATED ADMINISTRATOR NAMING A TARGET, which is the
+    second of the two shapes the module docstring sets out — not defence by
+    absent parameter, and it could not be: enrolment acts on a patient other
+    than the caller, so there is a patient identifier and it is in the path.
+    What makes that safe is not the identifier's absence but where its
+    ORGANISATION comes from. `enrol_patient_login` binds `WHERE patient_id =
+    %s AND org_id = %s` with `org_id` from `session.org_id`, so a real
+    patient in another tenant reads exactly like an invented one and the
+    refusal is byte-identical. The identifier selects a row inside the
+    caller's tenant; it never selects a tenant, and it never selects an
+    identity.
+
+    THE GATE IS THE DOMAIN METHOD'S AND IT RUNS FIRST. `_require_role(session,
+    "Administrator")` is the first statement of `enrol_patient_login`'s body,
+    before the patient read and before the uniqueness read. Nothing in this
+    handler asks what roles the caller holds. That ordering is what makes the
+    403 a function of the caller's own roles alone: a non-Administrator gets
+    the identical refusal whether the named patient is real, invented, in
+    another tenant, or already enrolled.
+
+    EXACTLY ONE DECORATED CALL. `@auditable` commits after each audit row, so
+    a handler that read the patient back, or looked the credential up to
+    return its email, would commit the enrolment's audit row and then fail
+    with the record already written. The domain method is one `@transactional`
+    body under one `@auditable` for that reason and this handler does not
+    undo it.
+
+    409, NOT 404 AND NOT 400. `PatientAlreadyEnrolledError` is the domain's
+    own refusal and it carries the domain's own message, which explains that
+    a second credential for one patient is a PROXY-ACCESS decision rather
+    than a re-enrolment. Folding it into the 404 would tell an Administrator
+    that a patient they can see does not exist, and folding it into the 403
+    would tell them they are not an Administrator. It is raised strictly
+    after the gate and after the same-organisation read, so the only
+    principal who can ever see it is an Administrator naming a patient in
+    their own tenant — it varies with nothing outside it.
+
+    NOTHING IS RETURNED BUT THE IDENTIFIER, and in particular the password is
+    not echoed. The credential the caller gets back is the handle the
+    revocation route takes.
+    """
+    target = _target(patient_id)
+    try:
+        patient_login_id = dao.enrol_patient_login(session, target, body.email, body.password)
+    except AuthorizationError:
+        raise _forbidden()
+    except NotFoundError:
+        raise _not_found()
+    except PatientAlreadyEnrolledError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return PatientLoginEnrolled(patient_login_id=str(patient_login_id))
+
+
+@router.post(
     "/patient-logins/{patient_login_id}/disabled",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Revoke or restore a patient portal credential in the CALLER'S OWN organisation",
@@ -574,10 +806,28 @@ async def set_patient_login_disabled(
     `_get_session` as the anonymous refusal, like any other non-staff
     credential.
 
-    ISSUANCE IS NOT WIRED and revocation is; the module docstring gives the
-    citation and the asymmetry. In a deployment where nothing can yet issue a
-    credential this route has nothing to act on, and that is not a reason to
-    leave the contracting half unbuilt.
+    ISSUANCE IS WIRED AS OF w155, above; between w152 and w155 it was not,
+    and the module docstring gives the citation and the asymmetry.
+
+    "REVOCATION INVALIDATES LIVE PATIENT SESSIONS" — MEASURED AT 60c48d9, NOT
+    ASSUMED, because the answer decides whether anything had to be built here
+    and the wrong answer builds a second mechanism.
+
+    `patient_session_valid` reads ONE `patient_sessions` row by session id and
+    checks `terminated_at`, `expires_at` and the idle window. It does NOT join
+    `patient_logins` and it does NOT read `disabled`. So patient session
+    validation does NOT consult the credential's disabled state, and this is
+    the w133 `users.disabled` case rather than the w154 role case: the flag is
+    read by nothing on the authenticated path, so writing it invalidates
+    nothing by itself, and the termination MUST live in the domain method's
+    body. It already does — the `UPDATE patient_sessions SET terminated_at`
+    keyed on `patient_login_id`, inside the same `@transactional` body. NO
+    SECOND MECHANISM WAS ADDED AT w155, because the first one is the only one
+    and adding another could only disagree with it. What w155 added is the
+    END-TO-END PROOF the requirement actually asks for: a live patient cookie
+    that fetches `/portal/me` before this route is called and is refused by
+    the same cookie afterwards, in
+    `test_w155_patient_administration.py::TestRevocationInvalidatesLivePatientSessions`.
     """
     target = _target(patient_login_id)
     try:

@@ -474,6 +474,17 @@ class TestTheRouteCensus:
             # it. See clinical/tests/test_w154_role_revocation.py.
             ("/admin/users/{user_id}/roles/{role}", ("DELETE",)),
             ("/admin/users/{user_id}/disabled", ("POST",)),
+            # w155 (WAVE 5). PATIENT CREDENTIAL ISSUANCE, the pair-mate of the
+            # revocation route below, which w152 mounted alone. It is the
+            # SECOND of the two safe route shapes: an authenticated
+            # Administrator NAMING A TARGET, with the organisation taken from
+            # `Session.org_id`. It is deliberately not the portal shape --
+            # `/portal/me/trends` takes no identifier at all -- and it must
+            # never acquire a sibling that takes a patient identifier without
+            # a staff session, which is what
+            # `test_w155_patient_administration.py::TestNoPublicPatientSelfRegistration`
+            # checks against this same census.
+            ("/admin/patients/{patient_id}/logins", ("POST",)),
             ("/admin/patient-logins/{patient_login_id}/disabled", ("POST",)),
             ("/admin/audit", ("GET",)),
         }
@@ -496,10 +507,11 @@ class TestTheRouteCensus:
         # 11 at 863f07e; 13 from w135, which added the two patient report
         # routes; 14 from w136, which added the patient report series; 18 from
         # w152, which added the four administrative routes; 19 from w154,
-        # which added the role-revocation route. The number is checked against
+        # which added the role-revocation route; 20 from w155, which added
+        # patient credential issuance. The number is checked against
         # the EXPECTED set above, which is what actually names them — this row
         # exists only to refuse the empty and wrapper-shaped answers.
-        assert len(census) == 19, census
+        assert len(census) == 20, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

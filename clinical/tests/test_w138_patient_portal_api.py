@@ -874,7 +874,21 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
         leaves = self._leaves(clinical_dsn)
         served = {path for path, _ in leaves}
 
-        exempt = {"/admin/patient-logins/{patient_login_id}/disabled"}
+        exempt = {
+            "/admin/patient-logins/{patient_login_id}/disabled",
+            # w155 (WAVE 5). The second exemption. It names a PATIENT, not a
+            # credential, and it is exempt on exactly the property this
+            # class's docstring states and on nothing else: the principal
+            # there is STAFF and no patient session can reach it. The `for`
+            # loop below PROVES that for every exempt path rather than
+            # trusting this comment -- each must carry
+            # `clinical.endpoints._get_session`. The behavioural half is
+            # `test_w155_patient_administration.py::TestAdministratorOnlyEnrolment::
+            # test_a_live_patient_session_is_not_a_staff_credential`, which
+            # presents a REAL live portal session id to this exact route and
+            # gets the anonymous refusal.
+            "/admin/patients/{patient_id}/logins",
+        }
         assert exempt <= served, (
             f"the exemption names {sorted(exempt - served)}, which this app does not serve -- "
             "a stale exemption silently widens the filter below"
@@ -984,45 +998,74 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
                     "administrative router, with the staff dependency, or it is not administered at all"
                 )
 
-        # THE POSITIVE TWIN. w152 wired three of the six; the other three are
-        # carded and stopped (see hive/agents/god/w152-decision-cards.md:
-        # patient credential ISSUANCE is held on spec 16, TOTP enrolment on
-        # who supplies the secret). At least one must be present or the scan
-        # above is an absence over a vocabulary that no longer exists.
+        # THE POSITIVE TWIN. w152 wired three of the six; w155 wired patient
+        # credential ISSUANCE, which w152 had stopped on spec 16 and which the
+        # human's Wave 5 dispatch then instructed in terms (see
+        # hive/agents/god/w155-decision-cards.md, Card 3 -- the tension with
+        # 16 is recorded, not dissolved). TOTP enrolment is still stopped, on
+        # who supplies the secret and where the cipher key lives, and
+        # `terminate_session` still has no route. At least one must be present
+        # or the scan above is an absence over a vocabulary that no longer
+        # exists.
         admin_body = _body(clinical.admin_endpoints)
         wired = [name for name in administrative if f"dao.{name}" in admin_body]
-        assert wired == ["set_patient_login_disabled", "set_user_disabled", "assign_role"], wired
+        assert wired == [
+            "enrol_patient_login",
+            "set_patient_login_disabled",
+            "set_user_disabled",
+            "assign_role",
+        ], wired
 
-    def test_patient_credential_ISSUANCE_is_still_not_wired_anywhere(self, clinical_dsn):
+    def test_patient_credential_ISSUANCE_is_wired_ONLY_on_the_administrative_router(self, clinical_dsn):
         """
-        THE HALF THAT IS STILL HELD, and it is held on a product ruling
-        rather than on effort. `GEPER_CLINICAL_PLATFORM_SPEC.md` 16 reads
-        "Recommendation: no patient access in v1", and 33 still lists
-        "Patient portal access" as a decision required. `enrol_patient_login`
-        is the ONLY way a portal credential can come to exist -- its own
-        docstring says there is "no self-registration path of any kind" --
-        so wiring it is the act that would settle that ruling by
-        implementation. w152 wired the REVOCATION half, which only ever
-        contracts patient access, and stopped the issuance half.
+        RULE 3 APPLIED TO THIS ROW — fix the claim, not the code. RENAMED at
+        w155 from `test_patient_credential_ISSUANCE_is_still_not_wired_anywhere`.
 
-        This row is what makes that stop durable: it is the one
-        administrative patient-credential operation that must stay
-        unreachable until somebody answers 16.
+        WHAT IT USED TO SAY, AND WHY IT WAS RIGHT. `GEPER_CLINICAL_PLATFORM_SPEC.md`
+        16 reads "Recommendation: no patient access in v1" and 33 lists
+        "Patient portal access" as a decision required. `enrol_patient_login`
+        is the ONLY way a portal credential can come to exist, so w152 held
+        that wiring it would settle a product ruling BY IMPLEMENTATION, wired
+        the REVOCATION half (which only ever contracts access) and stopped
+        the issuance half. This row made the stop durable.
+
+        WHAT SUPERSEDED IT. The human's Wave 5 dispatch instructs "Wire
+        patient enrolment and credential operations through the
+        administrative surface" and sets eight requirements for it. A ruling
+        that was MADE, by the person entitled to make it, is not the same
+        object as one that is missing. 16 is still unedited and the tension
+        is RECORDED rather than dissolved -- see
+        `hive/agents/god/w155-decision-cards.md` Card 3 and
+        `clinical/admin_endpoints.py`'s module docstring.
+
+        WHAT THIS ROW PROVES NOW, AND IT IS NOT NOTHING. Issuance is wired in
+        EXACTLY ONE PLACE and that place is the administrative router. The
+        three NON-administrative route modules must never issue a credential:
+        one that did would inherit that module's dependency -- the PATIENT
+        one, in `portal_endpoints.py`, or NONE AT ALL in `auth_endpoints.py`
+        -- and would be public patient self-registration with no census
+        noticing. That is the property the human's requirement "no public
+        patient self-registration" actually names, and it is stronger than
+        the blanket ban was, because the blanket ban was satisfied by the
+        capability being unreachable rather than by it being reachable only
+        from the right place.
         """
         import clinical.admin_endpoints
         import clinical.auth_endpoints
         import clinical.endpoints
         import clinical.portal_endpoints
 
-        for module in (
-            clinical.endpoints,
-            clinical.auth_endpoints,
-            clinical.portal_endpoints,
-            clinical.admin_endpoints,
-        ):
+        def _code(module):
             source = pathlib.Path(inspect.getfile(module)).read_text(encoding="utf-8")
-            body = source.split('"""', 2)[-1] if source.lstrip().startswith('"""') else source
-            assert "dao.enrol_patient_login" not in body, (
-                f"{module.__name__} now issues a patient portal credential. That is the act spec 16 "
-                "speaks to and it needs a ruling, not a route -- see w152-decision-cards.md Card 6"
+            return source.split('"""', 2)[-1] if source.lstrip().startswith('"""') else source
+
+        for module in (clinical.endpoints, clinical.auth_endpoints, clinical.portal_endpoints):
+            assert "dao.enrol_patient_login" not in _code(module), (
+                f"{module.__name__} now issues a patient portal credential. Issuance belongs on the "
+                "administrative router behind the STAFF dependency, or it is public self-registration"
             )
+
+        # THE POSITIVE TWIN, without which the three absences above are an
+        # absence over a name nothing uses: the administrative module DOES
+        # issue, so the scan is looking for something that exists.
+        assert "dao.enrol_patient_login" in _code(clinical.admin_endpoints)

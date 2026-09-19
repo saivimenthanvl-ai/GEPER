@@ -146,6 +146,12 @@ AUTHENTICATED_STAFF_ROUTES = (
     # The role segment is a member of the closed seven-string vocabulary, not
     # an identifier, which is why `_shapes` has to reduce it; see there.
     ("DELETE", f"/admin/users/{_UNKNOWN_UUID}/roles/Approver", None),
+    # w155 (WAVE 5). Patient credential ISSUANCE. It belongs in this set for
+    # the same reason as every row above and one of its own: it is the route
+    # on this surface that NAMES A PATIENT, so a refusal that varied by
+    # session-lifecycle state here would be the first staff refusal that
+    # varied while a patient identifier was in the URL.
+    ("POST", f"/admin/patients/{_UNKNOWN_UUID}/logins", {"email": "x@y.example", "password": "a password"}),
 )
 
 
@@ -1522,10 +1528,11 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
     listed — which for this route is every session-lifecycle state, none of
     which was listed.
 
-    Eight cases x NINE routes = 72 observations, ONE pair. (Four routes and
+    Eight cases x TEN routes = 80 observations, ONE pair. (Four routes and
     32 observations until w152 mounted the administrative surface; eight and
-    64 until w154 added role revocation; the route list is derived from the
-    app rather than trusted -- see `_staff_authenticated_paths`.)
+    64 until w154 added role revocation; nine and 72 until w155 added patient
+    credential issuance; the route list is derived from the app rather than
+    trusted -- see `_staff_authenticated_paths`.)
     """
 
     def _cases(self, client, dao, conn, world):
@@ -1572,7 +1579,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         # w152: four, then eight. The number is a non-vacuity floor, not the
         # property -- the property is that the list matches what the app
         # serves, which the assertion below checks against the route census.
-        assert len(AUTHENTICATED_STAFF_ROUTES) == 9, "a staff route left the list without being probed"
+        assert len(AUTHENTICATED_STAFF_ROUTES) == 10, "a staff route left the list without being probed"
         assert any(path.startswith("/auth/logout") for _, path, _ in AUTHENTICATED_STAFF_ROUTES), (
             "the logout route left the list -- it is the entire reason this class exists"
         )
@@ -1595,7 +1602,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
                 response = _call(client, method, path, cookies, body)
                 observed[f"{name} | {method} {path}"] = (response.status_code, response.content)
 
-        assert len(observed) == 72, observed
+        assert len(observed) == 80, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 

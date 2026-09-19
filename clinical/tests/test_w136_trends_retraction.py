@@ -527,7 +527,22 @@ class TestTheHeldTrendsWorkIsNotServedHere:
         assert leaves, "the route walk found nothing — this row would pass vacuously"
         assert all(path.startswith("/") for path, _ in leaves), leaves
 
-        exempt = {"/admin/patient-logins/{patient_login_id}/disabled"}
+        exempt = {
+            "/admin/patient-logins/{patient_login_id}/disabled",
+            # w155 (WAVE 5). The SECOND exemption, and it is the harder one to
+            # justify because it names a PATIENT rather than a credential. It
+            # is exempt on the same property and only on that property: it is
+            # a STAFF route on the STAFF router, behind
+            # `clinical.endpoints._get_session`, so no patient session can
+            # reach it -- and the identifier's ORGANISATION comes from
+            # `Session.org_id`, never from the request, so naming it selects a
+            # row inside the caller's own tenant and can select nothing else.
+            # The behavioural halves are
+            # `test_w155_patient_administration.py::TestAdministratorOnlyEnrolment::
+            # test_a_live_patient_session_is_not_a_staff_credential` and
+            # `::TestCrossOrganisationEnrolmentIsRefused`.
+            "/admin/patients/{patient_id}/logins",
+        }
         served = {path for path, _ in leaves}
         assert exempt <= served, (
             f"the exemption names {sorted(exempt - served)}, which this app does not serve — "

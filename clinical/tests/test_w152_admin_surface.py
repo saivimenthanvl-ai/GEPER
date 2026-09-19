@@ -956,7 +956,15 @@ class TestNoCallerControlledOrganisationEscape:
         assert {"assign_role", "set_user_disabled", "set_patient_login_disabled", "read_audit"} <= set(handlers), (
             handlers
         )
-        assert sorted(request_models) == ["DisabledRequest", "RoleAssignmentRequest"], request_models
+        # w155 added `PatientLoginEnrolmentRequest`. It is in this list, and
+        # therefore inside the "no inbound organisation" scan, precisely
+        # because it is the newest place an `org_id` could be added by
+        # somebody who had not read this file.
+        assert sorted(request_models) == [
+            "DisabledRequest",
+            "PatientLoginEnrolmentRequest",
+            "RoleAssignmentRequest",
+        ], request_models
         assert offenders == [], offenders
 
     def test_the_twin_the_scan_finds_an_organisation_parameter_when_one_exists(self, tmp_path):
@@ -1121,6 +1129,12 @@ class TestTheHandlersComposeNoDecoratedCalls:
             # surface means growing the census, which is what this line is.
             "revoke_role",
             "set_user_disabled",
+            # w155 (WAVE 5). Patient credential ISSUANCE, the half w152
+            # stopped on spec §16 and the human's Wave 5 dispatch then
+            # instructed. One decorated call, like every other handler here:
+            # a version that read the patient back to echo its name would
+            # commit the enrolment's audit row and then fail.
+            "enrol_patient_login",
             "set_patient_login_disabled",
             "read_audit",
         }, per_handler

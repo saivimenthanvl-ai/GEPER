@@ -612,10 +612,33 @@ class TestTheRefusalStaysUniform:
 
     def test_the_anonymous_refusal_is_one_function_and_the_auth_module_uses_it(self):
         """A second hand-written `HTTPException(401, ...)` in the auth module
-        is how two refusals that differ by a byte begin."""
+        is how two refusals that differ by a byte begin.
+
+        THE "USES IT" HALF IS READ FROM THE SYNTAX TREE, NOT FROM A SUBSTRING
+        SCAN (w158, Rule 10). It was `assert "_anonymous_refusal" in source`,
+        and MEASURED at 9c63fc8 that line matches FOUR places in
+        `clinical/auth_endpoints.py`: the import (line 76), a module comment
+        (line 363) and the two real raise sites (400, 404). Delete both raise
+        sites AND the import and the assertion still passes, on the comment
+        alone — so the half of this row's name that says "and the auth module
+        uses it" was proved by prose. A substring scan credits prose as a
+        caller; `ast.Call` cannot.
+        """
         source = _source("clinical/auth_endpoints.py")
-        assert "_anonymous_refusal" in source
         tree = ast.parse(source)
+
+        raised = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_anonymous_refusal"
+        ]
+        # A FLOOR, NOT A COUNT: a guard that encodes today's number protects
+        # today's number. What must never be true is ZERO — an auth module
+        # that refuses by some other object is how two refusals diverge.
+        assert raised, (
+            "no CALL to _anonymous_refusal in clinical/auth_endpoints.py -- the module no longer "
+            "refuses through the shared object, and the HTTPException walk below cannot see that"
+        )
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "HTTPException":
                 keywords = {kw.arg: kw for kw in node.keywords}

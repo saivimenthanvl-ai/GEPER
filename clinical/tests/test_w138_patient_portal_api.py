@@ -945,7 +945,7 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
             "/portal/me/trends",
         }, served
 
-    def test_no_administrative_operation_is_reachable_from_a_NON_administrative_module(self, clinical_dsn):
+    def test_no_administrative_operation_is_reachable_from_a_NON_administrative_module(self):
         """
         RULE 3 APPLIED TO THIS DOCSTRING — fix the claim, not the code.
 
@@ -1016,7 +1016,7 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
             "assign_role",
         ], wired
 
-    def test_patient_credential_ISSUANCE_is_wired_ONLY_on_the_administrative_router(self, clinical_dsn):
+    def test_patient_credential_ISSUANCE_is_wired_ONLY_on_the_administrative_router(self):
         """
         RULE 3 APPLIED TO THIS ROW — fix the claim, not the code. RENAMED at
         w155 from `test_patient_credential_ISSUANCE_is_still_not_wired_anywhere`.

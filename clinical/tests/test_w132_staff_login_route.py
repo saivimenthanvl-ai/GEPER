@@ -436,11 +436,23 @@ class TestTheInProcessThrottle:
         _LOGIN_THROTTLE.reset()
         assert _login(client, seeded, password="wrong").status_code == 401
 
-    def test_the_window_expires_on_its_own(self, client, seeded):
+    def test_the_window_expires_on_its_own(self):
         """
         Driven on the throttle object with an injected clock rather than by
         sleeping: a test that waits sixty seconds gets deleted, and a test
         that sleeps for a shortened window is a flake on a loaded runner.
+
+        NO FIXTURES, AND THAT IS STANDING RULE 10 (w158). This row and the
+        three below it took `(self, client, seeded)` and used NEITHER -- the
+        signature was copied from their neighbours. `seeded` reaches
+        `clinical_dsn`, which calls `pytest.skip` when `CLINICAL_TEST_DSN` is
+        absent, so all four INHERITED the ability to skip. MEASURED at
+        9c63fc8: with `check()` replaced by `return None` -- the throttle
+        deleted outright -- and no DSN, this class reported `9 skipped` and
+        exit 0. A skip and a pass are the same green dot, so the rate-limiting
+        guard could not fail in any environment without a database, for a
+        subject that is pure in-process Python with an injected clock and
+        needs none.
         """
         from clinical.auth_endpoints import _InProcessLoginThrottle
 
@@ -449,7 +461,7 @@ class TestTheInProcessThrottle:
         assert throttle.check("1.2.3.4", now=3.0) is not None  # refused, still inside the window
         assert throttle.check("1.2.3.4", now=61.0) is None  # the first three have aged out
 
-    def test_two_sources_have_two_windows(self, client, seeded):
+    def test_two_sources_have_two_windows(self):
         from clinical.auth_endpoints import _InProcessLoginThrottle
 
         throttle = _InProcessLoginThrottle(max_attempts=2, window_seconds=60, max_tracked_sources=8)
@@ -458,7 +470,7 @@ class TestTheInProcessThrottle:
         assert throttle.check("1.2.3.4", now=0.2) is not None
         assert throttle.check("5.6.7.8", now=0.3) is None, "one source's window refused another's request"
 
-    def test_the_table_is_bounded(self, client, seeded):
+    def test_the_table_is_bounded(self):
         """
         An unbounded dict keyed on an attacker-chosen source address is
         itself a denial-of-service lever: the fix for one must not be the
@@ -469,9 +481,14 @@ class TestTheInProcessThrottle:
         throttle = _InProcessLoginThrottle(max_attempts=5, window_seconds=600, max_tracked_sources=16)
         for i in range(500):
             throttle.check(f"10.0.{i // 256}.{i % 256}", now=float(i))
-        assert len(throttle._windows) <= 16, len(throttle._windows)
+        # BOTH ENDS, Standing Rule 4 (w158). `<= 16` alone is satisfied by a
+        # throttle that records NOTHING -- measured: with `check()` replaced by
+        # `return None`, the three rows around this one failed and this one
+        # passed, on a table that was empty because the limiter had been
+        # deleted. A bound with no floor cannot see its own subject vanish.
+        assert 0 < len(throttle._windows) <= 16, len(throttle._windows)
 
-    def test_the_declared_weakness_a_second_instance_shares_nothing(self, client, seeded):
+    def test_the_declared_weakness_a_second_instance_shares_nothing(self):
         """
         THE HONEST ROW. The comment on `_InProcessLoginThrottle` says it is
         per-process and does not hold across workers. This asserts that

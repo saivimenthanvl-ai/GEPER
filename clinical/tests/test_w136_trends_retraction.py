@@ -514,7 +514,7 @@ class TestTheHeldTrendsWorkIsNotServedHere:
     rows assert that no patient session can.
     """
 
-    def test_no_served_path_names_a_patient(self, clinical_dsn):
+    def test_no_served_path_names_a_patient(self):
         """
         Catches: `GET /patients/{patient_id}/variant-trends` being mounted
         as-is — the exact shape Wave 8 was warned about, and the shape
@@ -1137,9 +1137,7 @@ class TestTheRetractionVerdict:
         from clinical.tests.test_w156_retraction_reachability import _first_role_gate
 
         source = pathlib.Path(inspect.getfile(clinical.data_access)).read_text(encoding="utf-8")
-        klass = next(
-            n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "DataAccess"
-        )
+        klass = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "DataAccess")
         defined = {n.name: n for n in klass.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
         for present in ("create_amendment", "_release_report", "retract_report"):
@@ -1147,9 +1145,7 @@ class TestTheRetractionVerdict:
         for absent in ("unapprove_report", "rescind_report"):
             assert absent not in defined, f"DataAccess.{absent} now exists — w136's retraction verdict needs revisiting"
 
-        assert _first_role_gate(defined["retract_report"]) == "Approver", ast.dump(
-            defined["retract_report"].body[1]
-        )
+        assert _first_role_gate(defined["retract_report"]) == "Approver", ast.dump(defined["retract_report"].body[1])
 
     def test_the_only_thing_that_keeps_a_report_out_of_the_series_is_release(self):
         """

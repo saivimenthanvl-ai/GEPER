@@ -157,6 +157,12 @@ AUTHENTICATED_STAFF_ROUTES = (
     # this one is Approver), which is why `_ADMIN_ROUTES_NOT_GATED_ON_ADMINISTRATOR`
     # below is a set rather than a single path comparison.
     ("POST", f"/admin/reports/{_UNKNOWN_UUID}/retraction", {"reason": "w156"}),
+    # w158 (WAVE 8). The two laboratory-bench routes w157 mounted on the staff
+    # session dependency. They belonged in this set the day they were served:
+    # the derived comparison below reported them as unprobed, which is the
+    # coverage hole this class exists to make impossible to keep.
+    ("POST", f"/lab/orders/{_UNKNOWN_UUID}/samples", {"sample_type": "blood"}),
+    ("POST", f"/lab/samples/{_UNKNOWN_UUID}/qc", {"qc_status": "pass"}),
 )
 
 # The administrative paths whose role gate is NOT Administrator. The fixture
@@ -1593,7 +1599,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         # property -- the property is that the list matches what the app
         # serves, which the assertion below checks against the route census.
         # 10 at w155; 11 from w156, which added the report-retraction route.
-        assert len(AUTHENTICATED_STAFF_ROUTES) == 11, "a staff route left the list without being probed"
+        assert len(AUTHENTICATED_STAFF_ROUTES) == 13, "a staff route left the list without being probed"
         assert any(path.startswith("/auth/logout") for _, path, _ in AUTHENTICATED_STAFF_ROUTES), (
             "the logout route left the list -- it is the entire reason this class exists"
         )
@@ -1618,7 +1624,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
 
         # eight cases across every staff route: 80 at w155, 88 from w156's
         # report-retraction route. The product, not a hand-kept number.
-        assert len(observed) == 8 * len(AUTHENTICATED_STAFF_ROUTES) == 88, observed
+        assert len(observed) == 8 * len(AUTHENTICATED_STAFF_ROUTES) == 104, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 
@@ -1710,6 +1716,24 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
                     "the administrative 404 echoes the identifier it was asked about -- that is the "
                     "oracle the exception routes are allowed and this surface is not"
                 )
+
+        # w158 (WAVE 8). THE LABORATORY ROUTES, added to the set above because
+        # w157 mounted them on the staff dependency and left them in no
+        # refusal-parity set anywhere in this repository -- which the DERIVED
+        # comparison at the top of this class caught, and which is the whole
+        # reason that comparison is derived from the app rather than hand-kept.
+        # `admin@a.example` holds Administrator and NOT Lab technician, so both
+        # answer 403 (authenticated, wrong role) and reuse `admin_endpoints`'s
+        # own constant -- no second refusal vocabulary. That is distinguishable
+        # from the anonymous 401, which is what makes the set above meaningful.
+        for method, path, body in AUTHENTICATED_STAFF_ROUTES:
+            if not path.startswith("/lab/"):
+                continue
+            response = _call(client, method, path, credential, body)
+            assert (response.status_code, response.content) != THE_REFUSAL, (path, response.text)
+            assert response.status_code == 403, (path, response.text)
+            assert response.json() == {"detail": ADMIN_FORBIDDEN}, (path, response.text)
+            assert _UNKNOWN_UUID not in response.text, (path, response.text)
 
         logout = client.post("/auth/logout", cookies=credential)
         assert (logout.status_code, logout.content) != THE_REFUSAL

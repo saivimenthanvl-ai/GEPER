@@ -135,8 +135,16 @@ def _staff_session(dao, conn, org_id, email, *, roles=("Administrator",)):
 
 @pytest.fixture()
 def admin_a(dao, conn, org_a):
-    """The acting Administrator -- the one who performs the offboarding."""
-    return _staff_session(dao, conn, org_a, "admin@a.example", roles=("Administrator", "Auditor"))
+    """The acting Administrator -- the one who performs the offboarding.
+
+    w162: "Orderer" joins the pair because this session registers the patient
+    whose credential `test_a_terminated_administrator_cannot_revoke_a_patient_credential`
+    acts on, and registration is now the ordering clinician's (human ruling
+    2026-09-19). Roles are additive and nothing here is relaxed: every claim
+    in this file is about a session ENDED by offboarding, and `victim` still
+    holds Administrator alone.
+    """
+    return _staff_session(dao, conn, org_a, "admin@a.example", roles=("Administrator", "Auditor", "Orderer"))
 
 
 @pytest.fixture()

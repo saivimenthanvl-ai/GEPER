@@ -169,9 +169,25 @@ def _orderable(dao, conn, session):
 
 
 @pytest.fixture
-def orderable_a(dao, conn, admin_a):
-    """Built by the Administrator: create_patient and record_consent are NOT ordering operations."""
-    return _orderable(dao, conn, admin_a)
+def orderable_a(dao, conn, orderer_a):
+    """
+    Built by the ORDERER, which changed at w162 and is the correct fix rather
+    than a convenience.
+
+    This fixture used to be built by `admin_a`, on the reasoning that
+    `create_patient` and `record_consent` were not ordering operations — true
+    of the tree as it then stood, where neither enforced any role at all. The
+    human ruled on 2026-09-19 that the ordering clinician owns registration
+    and consent, so both are now `Orderer`-gated and an Administrator cannot
+    build this. The fixture is given a correctly-roled session; the gate is
+    not weakened and the method is not bypassed.
+
+    IT DOES NOT WEAKEN THIS FILE'S OWN CLAIMS. Every row below asks whether a
+    principal may CREATE, PLACE or CANCEL an order, and `admin_a` is still the
+    Administrator-who-is-not-an-Orderer that those rows refuse. Only the
+    construction of the subject moved.
+    """
+    return _orderable(dao, conn, orderer_a)
 
 
 def _order_count(conn, org_id):

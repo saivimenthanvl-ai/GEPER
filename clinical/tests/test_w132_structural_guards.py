@@ -547,6 +547,32 @@ class TestTheRouteCensus:
             # accident. See clinical/workflow_endpoints.py.
             ("/lab/orders/{order_id}/samples", ("POST",)),
             ("/lab/samples/{sample_id}/qc", ("POST",)),
+            # w162. THE ORDERING CLINICIAN'S SURFACE, and the THIRD prefix
+            # this service serves. Patient registration and consent are the
+            # two acts that precede an order, and at 44d624b all three verbs
+            # behind these routes had ZERO production call sites AND no role
+            # gate of any kind -- every authenticated session in the
+            # organisation could mint a patient identity.
+            #
+            # ORDERER, NOT ADMINISTRATOR AND NOT LAB TECHNICIAN. The human
+            # ruled it on 2026-09-19 ("the ORDERER/CLINICIAN owns both"), and
+            # the token was resolved against `ROLES`, the vocabulary the
+            # schema's CHECK on `role_assignments.role` enumerates. The fourth
+            # distinct role to reach this service's surface.
+            #
+            # WHY NOT `/admin` OR `/lab`: the prefix names the surface, never
+            # the gate. `/admin` would encode in every access log the reading
+            # the ruling rejects -- that registering a patient is an
+            # administrative act -- and `/lab` names the bench, whose role the
+            # ruling explicitly bars from creating a patient identity.
+            #
+            # THE ORDER STAGE IS STILL DELIBERATELY NOT HERE, for w157's
+            # unchanged reason: `create_order` needs a `test_id` foreign key
+            # into `tests`, a table with no `DataAccess` writer of any kind.
+            # When that unblocks, `/clinic` is where it belongs.
+            ("/clinic/patients", ("POST",)),
+            ("/clinic/patients/{patient_id}/consents", ("POST",)),
+            ("/clinic/consents/{consent_id}/withdrawal", ("POST",)),
         }
     )
 
@@ -570,10 +596,11 @@ class TestTheRouteCensus:
         # which added the role-revocation route; 20 from w155, which added
         # patient credential issuance; 21 from w156, which added report
         # retraction; 23 from w157, which added the two laboratory bench
-        # routes. The number is checked against
+        # routes; 26 from w162, which added the three clinic routes —
+        # registration, consent and withdrawal. The number is checked against
         # the EXPECTED set above, which is what actually names them — this row
         # exists only to refuse the empty and wrapper-shaped answers.
-        assert len(census) == 23, census
+        assert len(census) == 26, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

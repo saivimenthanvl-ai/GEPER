@@ -115,11 +115,18 @@ def org_b(dao):
 def _admin_session(dao, conn, org_id, email):
     user_id = dao.create_user(org_id, email, "password")
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-            "VALUES (%s, %s, 'Administrator', %s, %s)",
-            (user_id, org_id, user_id, T0),
-        )
+        # w162. ORDERER ALONGSIDE ADMINISTRATOR, because this account builds
+        # the patient and consent the laboratory rows act on, and registration
+        # and consent are now the ordering clinician's (human ruling
+        # 2026-09-19). Nothing this file asserts is weakened: its subject is
+        # the LAB TECHNICIAN gate, and the Administrator is still not one —
+        # that refusal is exactly what these fixtures exist to prove.
+        for role in ("Administrator", "Orderer"):
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (user_id, org_id, role, user_id, T0),
+            )
     conn.commit()
     return dao.login(email, org_id, "password")
 

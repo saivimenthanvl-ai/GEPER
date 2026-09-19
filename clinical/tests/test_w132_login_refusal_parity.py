@@ -146,11 +146,16 @@ def seeded(clinical_dsn):
     mfa_id = dao.create_user(org_id, "mfa@a.example", STAFF_PASSWORD)
 
     with connection.cursor() as cur:
-        cur.execute(
-            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-            "VALUES (%s, %s, 'Administrator', %s, %s)",
-            (staff_id, org_id, staff_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
-        )
+        # w162. ORDERER ALONGSIDE ADMINISTRATOR: this account registers the
+        # patient this file enrols, and registration is now the ordering
+        # clinician's (human ruling 2026-09-19). Roles are additive; every
+        # claim here is about LOGIN refusals, which consult no role at all.
+        for role in ("Administrator", "Orderer"):
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (staff_id, org_id, role, staff_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+            )
         cur.execute("UPDATE organisations SET disabled = true WHERE org_id = %s", (disabled_org_id,))
         cur.execute("UPDATE users SET disabled = true WHERE user_id = %s", (disabled_staff_id,))
         cur.execute("UPDATE users SET is_system_account = true WHERE user_id = %s", (system_id,))

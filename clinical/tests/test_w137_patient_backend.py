@@ -151,7 +151,11 @@ def world(dao, conn):
         org_id = dao.create_organisation(name)
         staff_id = dao.create_user(org_id, f"admin@{tag}.example", PASSWORD)
         with conn.cursor() as cur:
-            for role in ("Administrator", "Auditor"):
+            # w162: "Orderer" joins the pair because this account registers the
+            # two patients below, and registration is now the ordering
+            # clinician's (human ruling 2026-09-19). Roles are additive and
+            # this file's claims are about the PATIENT axis, not staff roles.
+            for role in ("Administrator", "Auditor", "Orderer"):
                 cur.execute(
                     "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                     "VALUES (%s, %s, %s, %s, %s)",

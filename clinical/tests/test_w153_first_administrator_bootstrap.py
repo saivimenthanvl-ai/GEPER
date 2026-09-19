@@ -855,6 +855,12 @@ class TestTheShapeThatMakesItInert:
             # unscanned module is where a `provision_organisation` call would
             # go unnoticed.
             "clinical.workflow_endpoints",
+            # w162 (THE CLINIC SURFACE). THE SEVENTH, added for the reason the
+            # note above gives: this tuple IS the "every route this app serves
+            # is defined in one of these" claim, and a module missing from it
+            # is not scanned at all. `clinical/clinic_endpoints.py` defines the
+            # three clinician routes -- registration, consent, withdrawal.
+            "clinical.clinic_endpoints",
         ):
             try:
                 module = __import__(module_name, fromlist=["*"])

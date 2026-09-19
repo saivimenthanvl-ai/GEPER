@@ -42,11 +42,18 @@ separate things stop it, one inherited and one this wave's own:
      caller outside `data_access.py`. Every administrative route is exactly
      as reachable as an operator invoking that method directly. This wave's
      route does not change that in either direction.
-  2. The route NAMES a `patient_id`, and no route on this surface can create
-     one. `create_patient` is STOPPED and carded (see
-     `TestTheUngatedThreeAreStoppedAndNotWired`), so an Administrator
-     enrolling a patient must be handed a patient record some other path
-     made.
+  2. The route NAMES a `patient_id`, and no route on THIS surface can create
+     one. When w155 ran, `create_patient` was STOPPED and carded, so an
+     Administrator enrolling a patient had to be handed a patient record some
+     other path made — and there was no such path. THAT HALF CHANGED AT w162:
+     the human ruled that the ordering clinician owns registration, and
+     `POST /clinic/patients` now creates one. It is still not a route on this
+     surface and it still does not need an Administrator; what it means is
+     that the patient an Administrator enrols can now be produced by a
+     production path rather than only by a fixture. See
+     `TestTheUngatedThreeAreStoppedAndNotWired` below, which was inverted
+     rather than deleted, and
+     `clinical/tests/test_w162_registration_and_consent.py`.
 
 So: IMPLEMENTED + TESTED + NOT REACHABLE, in the report's own vocabulary.
 The Administrator below is provisioned by INSERTING THE ROLE ROW DIRECTLY,
@@ -282,21 +289,37 @@ def seeded(clinical_dsn):
     auditor_a = dao.create_user(org_a, "auditor@a.example", STAFF_PASSWORD)
     orderer_a = dao.create_user(org_a, "orderer@a.example", STAFF_PASSWORD)
     admin_b = dao.create_user(org_b, "admin@b.example", STAFF_PASSWORD)
+    # w162. ORGANISATION B NEEDS AN ORDERER TOO, because the patients this
+    # fixture plants are now registered by the ordering clinician rather than
+    # by an Administrator — see the note on the three `create_patient` calls
+    # below. Org A already had one, as the wrong-role principal for the rows
+    # about enrolment.
+    orderer_b = dao.create_user(org_b, "orderer@b.example", STAFF_PASSWORD)
 
     _grant(connection, admin_a, org_a, ("Administrator",))
     _grant(connection, auditor_a, org_a, ("Auditor",))
     _grant(connection, orderer_a, org_a, ("Orderer",))
     _grant(connection, admin_b, org_b, ("Administrator",))
+    _grant(connection, orderer_b, org_b, ("Orderer",))
     connection.commit()
 
     admin_a_session = dao.login("admin@a.example", org_a, STAFF_PASSWORD)
     auditor_a_session = dao.login("auditor@a.example", org_a, STAFF_PASSWORD)
     orderer_a_session = dao.login("orderer@a.example", org_a, STAFF_PASSWORD)
     admin_b_session = dao.login("admin@b.example", org_b, STAFF_PASSWORD)
+    orderer_b_session = dao.login("orderer@b.example", org_b, STAFF_PASSWORD)
 
-    patient_fresh = dao.create_patient(admin_a_session, "Fiona Fresh", dt.date(1980, 1, 1), "F")
-    patient_live = dao.create_patient(admin_a_session, "Leo Live", dt.date(1975, 6, 15), "M")
-    patient_b = dao.create_patient(admin_b_session, "Bianca Bell", dt.date(1990, 3, 3), "F")
+    # REGISTERED BY THE ORDERER, NOT BY THE ADMINISTRATOR (w162). These three
+    # calls used to take `admin_a_session` / `admin_b_session`, which worked
+    # because `create_patient` enforced no role at all. The human ruled on
+    # 2026-09-19 that the ordering clinician owns registration, so the fixture
+    # is given a correctly-roled session; the gate is not weakened and the
+    # method is not bypassed. Every row in this file is about ENROLMENT, which
+    # is still Administrator-only and unchanged — only the construction of the
+    # patients those rows act on moved.
+    patient_fresh = dao.create_patient(orderer_a_session, "Fiona Fresh", dt.date(1980, 1, 1), "F")
+    patient_live = dao.create_patient(orderer_a_session, "Leo Live", dt.date(1975, 6, 15), "M")
+    patient_b = dao.create_patient(orderer_b_session, "Bianca Bell", dt.date(1990, 3, 3), "F")
 
     # `patient_live` is enrolled through the DOMAIN METHOD in the fixture, so
     # that the revocation rows have a live session without depending on the
@@ -557,12 +580,23 @@ class TestTheGateRunsFirst:
         assert self._first_gate(probe.read_text(encoding="utf-8"), "m") == ("Administrator", 1)
 
     def test_the_twin_the_analyser_reports_none_when_there_is_no_gate(self):
-        """And the same instrument, on the same file, answers None for the
-        three ungated methods — which is the measurement the card rests on."""
+        """
+        And the same instrument, on the same file, answers None for a method
+        that has no gate at all.
+
+        THE SUBJECT OF THIS ROW CHANGED AT w162, AND THAT IS THE POINT OF THE
+        ROW RATHER THAN A WEAKENING OF IT. It used to name `create_patient`,
+        `record_consent` and `withdraw_consent`, which were ungated when w155
+        measured them; the human ruled on 2026-09-19 that the ordering
+        clinician owns registration and consent, so all three are now
+        `Orderer`-gated and can no longer serve as the negative control. The
+        control moved to `create_interpretation` and `create_report`, which
+        w157 measured as containing no `_require_role` anywhere and which are
+        unchanged — carded there, not gated here.
+        """
         source = DATA_ACCESS_MODULE.read_text(encoding="utf-8")
-        assert self._first_gate(source, "create_patient") is None
-        assert self._first_gate(source, "record_consent") is None
-        assert self._first_gate(source, "withdraw_consent") is None
+        assert self._first_gate(source, "create_interpretation") is None
+        assert self._first_gate(source, "create_report") is None
 
     def test_inspect_signature_on_the_decorated_method_is_a_wildcard(self):
         """
@@ -1306,29 +1340,42 @@ class TestPatientIdentityRemainsSeparateFromStaff:
 
 class TestTheUngatedThreeAreStoppedAndNotWired:
     """
-    `create_patient`, `record_consent` and `withdraw_consent` are STOPPED and
-    carded. The measurement, re-taken at 60c48d9: all three take a `Session`
-    and bind `org_id` from it, none contains `_require_role`, and none has a
-    production caller. So the gate would break no production caller — and
-    WHICH ROLE it should demand is a product decision nobody has made.
-    "Administrator-only enrolment" is a ruling about ENROLMENT, which in this
-    repository's vocabulary is `enrol_patient_login`; making clinical patient
-    registration and consent capture Administrator-only is a different and
-    much larger workflow ruling.
+    THE STOP w155 RECORDED HERE WAS LIFTED BY A RULING AT w162, AND THESE ROWS
+    NOW PIN THE ANSWER INSTEAD OF THE QUESTION.
 
-    These rows pin BOTH halves of the stop: no gate was invented, AND no route
-    was added. If a later wave adds either, these fail — which is the point.
+    What w155 measured at 60c48d9 was correct and is on the record: all three
+    of `create_patient`, `record_consent` and `withdraw_consent` took a
+    `Session` and bound `org_id` from it, none contained `_require_role`, and
+    none had a production caller — so the gate would break no production
+    caller, and WHICH ROLE it should demand was a product decision nobody had
+    made. w155 refused to guess, which was the right call.
+
+    The human ruled on 2026-09-19: "PATIENT REGISTRATION + CONSENT — the
+    ORDERER/CLINICIAN owns both. Do NOT make Administrator registration
+    mandatory. Do NOT make Lab Technician a patient identity creator." That
+    ruling is exactly what this stop was waiting on. w162 implemented it —
+    `_require_role(session, "Orderer")` as each method's first executable
+    statement — and wired the three through `clinical/clinic_endpoints.py`.
+
+    THE ROWS ARE INVERTED RATHER THAN DELETED, because the property w155 cared
+    about is still worth pinning: it cared that no gate was invented WITHOUT a
+    ruling and no route added WITHOUT one. The full behavioural suite for the
+    new state is `clinical/tests/test_w162_registration_and_consent.py`; what
+    is kept here is the narrow claim that the administrative surface did NOT
+    acquire these capabilities, which is the half the ruling explicitly
+    forbids.
     """
 
-    def test_the_three_methods_are_still_ungated(self):
+    def test_the_three_methods_are_now_gated_on_the_orderer(self):
         source = DATA_ACCESS_MODULE.read_text(encoding="utf-8")
         for name in ("create_patient", "record_consent", "withdraw_consent"):
-            assert TestTheGateRunsFirst._first_gate(source, name) is None, name
+            assert TestTheGateRunsFirst._first_gate(source, name) == ("Orderer", 0), name
 
     def test_the_three_methods_still_take_a_session_and_bind_the_organisation_from_it(self):
-        """The half that makes "ungated" survivable: they are not anonymous.
-        Read from the tree, because `inspect.signature` on a decorated method
-        is a wildcard."""
+        """The half that was already true and must stay true: the gate is not
+        a substitute for the tenant predicate, it is beside it. Read from the
+        tree, because `inspect.signature` on a decorated method is a
+        wildcard."""
         tree = ast.parse(DATA_ACCESS_MODULE.read_text(encoding="utf-8"))
         for name in ("create_patient", "record_consent", "withdraw_consent"):
             node = next(
@@ -1337,20 +1384,37 @@ class TestTheUngatedThreeAreStoppedAndNotWired:
             assert [a.arg for a in node.args.args][:2] == ["self", "session"], name
             assert "session.org_id" in ast.unparse(node), name
 
-    def test_no_route_reaches_any_of_the_three(self):
+    def test_the_only_route_reaching_any_of_the_three_is_the_clinic_router(self):
+        """NOT the administrative surface. A route onto registration from
+        `/admin` would encode the reading the ruling rejects."""
         callers = TestNoPublicPatientSelfRegistration._production_callers
         for name in ("create_patient", "record_consent", "withdraw_consent"):
-            assert callers(name) == [], (name, callers(name))
+            assert [path for path, _ in callers(name)] == ["clinical/clinic_endpoints.py"], (name, callers(name))
 
     def test_the_administrative_surface_has_no_patient_or_consent_write_route(self):
+        """
+        SCOPED TO `/admin`, WHICH IS WHAT THIS ROW'S NAME ALWAYS SAID. It used
+        to assert that NO served path anywhere contained "consent", which was
+        true when `/admin` and `/lab` were the only staff surfaces and became
+        wrong the moment the ruling put consent on `/clinic`. The claim worth
+        keeping is the one about the ADMINISTRATIVE prefix: the ruling forbids
+        making Administrator registration mandatory, so registration and
+        consent must not appear there.
+        """
         from clinical.app import app
         from clinical.tests.test_w132_structural_guards import served_routes
 
         paths = {path for path, _ in served_routes(app)}
-        assert "/admin/patients" not in paths, paths
-        assert not any("consent" in path for path in paths), paths
+        admin_paths = {path for path in paths if path.startswith("/admin")}
+        assert admin_paths, "no /admin path at all -- this census is blind"
+        assert "/admin/patients" not in admin_paths, admin_paths
+        assert not any("consent" in path for path in admin_paths), admin_paths
         # The twin: the one patient-scoped admin path that DOES exist.
         assert "/admin/patients/{patient_id}/logins" in paths, paths
+        # And the mirror twin: consent DOES live somewhere, on the clinician's
+        # own prefix. Without this the row above is satisfied by a tree in
+        # which the capability was deleted rather than moved.
+        assert any(path.startswith("/clinic") and "consent" in path for path in paths), paths
 
 
 class TestPatientMfaIsBlocked:

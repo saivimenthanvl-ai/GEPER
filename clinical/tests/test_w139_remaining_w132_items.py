@@ -163,6 +163,16 @@ AUTHENTICATED_STAFF_ROUTES = (
     # coverage hole this class exists to make impossible to keep.
     ("POST", f"/lab/orders/{_UNKNOWN_UUID}/samples", {"sample_type": "blood"}),
     ("POST", f"/lab/samples/{_UNKNOWN_UUID}/qc", {"qc_status": "pass"}),
+    # w162. The three clinic routes -- the ordering clinician's surface,
+    # `Orderer`-gated inside the domain method. They are here for the reason
+    # every row above is, and the derived comparison below is once again what
+    # said so: it reported them as unprobed the moment they were served, which
+    # is this class's whole job. The consent route NAMES A PATIENT, so a
+    # refusal that varied by session-lifecycle state on it would leak while a
+    # patient identifier sat in the URL -- the same argument w155's row makes.
+    ("POST", "/clinic/patients", {"name": "x", "dob": "1990-01-01", "sex": "F"}),
+    ("POST", f"/clinic/patients/{_UNKNOWN_UUID}/consents", {"scope": "testing"}),
+    ("POST", f"/clinic/consents/{_UNKNOWN_UUID}/withdrawal", None),
 )
 
 # The administrative paths whose role gate is NOT Administrator. The fixture
@@ -259,11 +269,17 @@ def world(dao, conn):
 
     with conn.cursor() as cur:
         for user_id, org_id in ((staff_id, org_a), (admin_b_id, org_b)):
-            cur.execute(
-                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-                "VALUES (%s, %s, 'Administrator', %s, %s)",
-                (user_id, org_id, user_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
-            )
+            # w162. ORDERER ALONGSIDE ADMINISTRATOR: `admin@a.example`
+            # registers the two patients below, and registration is now the
+            # ordering clinician's (human ruling 2026-09-19). Roles are
+            # additive; every claim in this file is about login refusals,
+            # cookie policy and refusal parity, none of which reads a role.
+            for role in ("Administrator", "Orderer"):
+                cur.execute(
+                    "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (user_id, org_id, role, user_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+                )
         cur.execute(
             "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
             "VALUES (%s, %s, 'Administrator', %s, %s)",
@@ -1598,8 +1614,10 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         # w152: four, then eight. The number is a non-vacuity floor, not the
         # property -- the property is that the list matches what the app
         # serves, which the assertion below checks against the route census.
-        # 10 at w155; 11 from w156, which added the report-retraction route.
-        assert len(AUTHENTICATED_STAFF_ROUTES) == 13, "a staff route left the list without being probed"
+        # 10 at w155; 11 from w156, which added the report-retraction route;
+        # 13 from w158, which added the two laboratory-bench routes; 16 from
+        # w162, which added the three clinic routes.
+        assert len(AUTHENTICATED_STAFF_ROUTES) == 16, "a staff route left the list without being probed"
         assert any(path.startswith("/auth/logout") for _, path, _ in AUTHENTICATED_STAFF_ROUTES), (
             "the logout route left the list -- it is the entire reason this class exists"
         )
@@ -1623,8 +1641,9 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
                 observed[f"{name} | {method} {path}"] = (response.status_code, response.content)
 
         # eight cases across every staff route: 80 at w155, 88 from w156's
-        # report-retraction route. The product, not a hand-kept number.
-        assert len(observed) == 8 * len(AUTHENTICATED_STAFF_ROUTES) == 104, observed
+        # report-retraction route, 104 from w158's two bench routes, 128 from
+        # w162's three clinic routes. The product, not a hand-kept number.
+        assert len(observed) == 8 * len(AUTHENTICATED_STAFF_ROUTES) == 128, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 

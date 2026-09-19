@@ -243,12 +243,17 @@ def seeded(clinical_dsn):
     admin_b = dao.create_user(org_b, "admin@b.example", STAFF_PASSWORD)
     auditor_b = dao.create_user(org_b, "auditor@b.example", STAFF_PASSWORD)
     target_b = dao.create_user(org_b, "target@b.example", STAFF_PASSWORD)
+    # w162. ORGANISATION B NEEDS AN ORDERER TOO: the patients this fixture
+    # plants are now registered by the ordering clinician (human ruling
+    # 2026-09-19), and org A already had one as the wrong-role principal.
+    orderer_b = dao.create_user(org_b, "orderer@b.example", STAFF_PASSWORD)
 
     _grant(connection, admin_a, org_a, ("Administrator",))
     _grant(connection, auditor_a, org_a, ("Auditor",))
     _grant(connection, orderer_a, org_a, ("Orderer",))
     _grant(connection, admin_b, org_b, ("Administrator",))
     _grant(connection, auditor_b, org_b, ("Auditor",))
+    _grant(connection, orderer_b, org_b, ("Orderer",))
     connection.commit()
 
     admin_a_session = dao.login("admin@a.example", org_a, STAFF_PASSWORD)
@@ -256,12 +261,18 @@ def seeded(clinical_dsn):
     orderer_a_session = dao.login("orderer@a.example", org_a, STAFF_PASSWORD)
     admin_b_session = dao.login("admin@b.example", org_b, STAFF_PASSWORD)
     auditor_b_session = dao.login("auditor@b.example", org_b, STAFF_PASSWORD)
+    orderer_b_session = dao.login("orderer@b.example", org_b, STAFF_PASSWORD)
 
     # The patient credentials. A's exists so the route has a same-organisation
     # positive twin; B's exists so the cross-organisation attempt has a REAL
     # row to name and a live credential to prove untouched afterwards.
-    patient_a = dao.create_patient(admin_a_session, "Alice Anderson", dt.date(1980, 1, 1), "F")
-    patient_b = dao.create_patient(admin_b_session, "Bianca Bell", dt.date(1975, 6, 15), "F")
+    # REGISTERED BY THE ORDERER, NOT THE ADMINISTRATOR (w162). These two calls
+    # used to take the Administrator sessions, which worked because
+    # `create_patient` enforced no role at all. The gate is not weakened and
+    # the method is not bypassed; every claim in this file is about the
+    # ADMINISTRATIVE routes, and only the construction of their targets moved.
+    patient_a = dao.create_patient(orderer_a_session, "Alice Anderson", dt.date(1980, 1, 1), "F")
+    patient_b = dao.create_patient(orderer_b_session, "Bianca Bell", dt.date(1975, 6, 15), "F")
     login_a = dao.enrol_patient_login(admin_a_session, patient_a, "alice@portal.example", PATIENT_PASSWORD)
     login_b = dao.enrol_patient_login(admin_b_session, patient_b, "bianca@portal.example", PATIENT_PASSWORD)
 
@@ -376,16 +387,31 @@ class TestTheSurfaceIsMounted:
         added one, which is the guard working, and the fix is a declaration
         rather than a relaxation.
 
+        w162 ADDED THE SIXTH FAMILY, AND THE GUARD FIRED AGAIN — which is the
+        guard working a second time. `/clinic/` is the ordering clinician's
+        surface: `POST /clinic/patients`, `POST
+        /clinic/patients/{patient_id}/consents` and `POST
+        /clinic/consents/{consent_id}/withdrawal`, all `Orderer`-gated inside
+        the domain method (human ruling 2026-09-19: the ordering clinician
+        owns patient registration and consent). It is declared here rather
+        than absorbed by a looser predicate, for the same reason `/lab/` was.
+
+        AND IT IS NOT ADMINISTRATIVE, which is the point of the family being
+        separate. The ruling forbids making Administrator registration
+        mandatory, so filing these under `/admin/` would have encoded in the
+        URL the reading the ruling rejects.
+
         The historical claim the row exists to protect is UNCHANGED and is
         still true: at w150 zero of the seventeen served routes were
-        administrative. `/lab/` is not administrative either.
+        administrative. Neither `/lab/` nor `/clinic/` is administrative
+        either.
         """
         from clinical.app import app
         from clinical.tests.test_w132_structural_guards import served_routes
 
         non_admin = {path for path, _ in served_routes(app) if not path.startswith("/admin/")}
         assert non_admin and all(
-            path.startswith(("/auth/", "/portal/", "/exceptions/", "/lab/", "/healthz", "/readyz"))
+            path.startswith(("/auth/", "/portal/", "/exceptions/", "/lab/", "/clinic/", "/healthz", "/readyz"))
             for path in non_admin
         ), sorted(non_admin)
 

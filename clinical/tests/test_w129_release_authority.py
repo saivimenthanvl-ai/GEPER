@@ -91,11 +91,17 @@ def org_b(dao):
 def _admin_session(dao, conn, org_id, email):
     user_id = dao.create_user(org_id, email, "password")
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-            "VALUES (%s, %s, 'Administrator', %s, %s)",
-            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
-        )
+        # w162. ORDERER ALONGSIDE ADMINISTRATOR, because this account builds
+        # the patient and consent the report lineage hangs off, and
+        # registration and consent are now the ordering clinician's (human
+        # ruling 2026-09-19). Nothing here is weakened: this file's subject is
+        # the APPROVER gate on release, and the Administrator is still not one.
+        for role in ("Administrator", "Orderer"):
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (user_id, org_id, role, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+            )
     conn.commit()
     return dao.login(email, org_id, "password")
 

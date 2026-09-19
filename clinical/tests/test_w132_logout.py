@@ -132,11 +132,17 @@ def world(dao, conn):
     b_user_id = dao.create_user(org_b, "user@b.example", PASSWORD)
 
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-            "VALUES (%s, %s, 'Administrator', %s, %s)",
-            (admin_id, org_a, admin_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
-        )
+        # w162. ORDERER ALONGSIDE ADMINISTRATOR, because this account registers
+        # the two patients below and registration is now the ordering
+        # clinician's (human ruling 2026-09-19). Roles are additive and nothing
+        # here is relaxed: the account whose refusals this file asserts is
+        # `plain@a.example`, which still holds no role at all.
+        for role in ("Administrator", "Orderer"):
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (admin_id, org_a, role, admin_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+            )
     conn.commit()
 
     admin_session = dao.login("admin@a.example", org_a, PASSWORD)

@@ -209,11 +209,16 @@ def world(dao, conn):
     org_id = dao.create_organisation("Org A")
     staff_id = dao.create_user(org_id, "admin@a.example", PASSWORD)
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (staff_id, org_id, "Administrator", staff_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
-        )
+        # w162. ORDERER ALONGSIDE ADMINISTRATOR: this account registers the
+        # three patients below, and registration is now the ordering
+        # clinician's (human ruling 2026-09-19). Roles are additive; this
+        # file's subject is the PATIENT surface, which consults no staff role.
+        for role in ("Administrator", "Orderer"):
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (staff_id, org_id, role, staff_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+            )
     conn.commit()
     staff = dao.login("admin@a.example", org_id, PASSWORD)
 
@@ -888,6 +893,18 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
             # presents a REAL live portal session id to this exact route and
             # gets the anonymous refusal.
             "/admin/patients/{patient_id}/logins",
+            # w162. THE THIRD, and it is exempt on the SAME property and on
+            # nothing else: `POST /clinic/patients/{patient_id}/consents` is a
+            # STAFF route behind `clinical.endpoints._get_session`, which the
+            # `for` loop below PROVES for it rather than taking on trust. The
+            # identifier's organisation comes from `Session.org_id` and never
+            # from the request, so it selects a row inside the caller's own
+            # tenant and can select nothing else. The behavioural halves are
+            # `test_w162_registration_and_consent.py::
+            # TestOnlyTheClinicianMayRecordConsent` and
+            # `::TestTheOtherOrganisationIsNotAddressable`, which plants a real
+            # patient in the other organisation and names it.
+            "/clinic/patients/{patient_id}/consents",
         }
         assert exempt <= served, (
             f"the exemption names {sorted(exempt - served)}, which this app does not serve -- "

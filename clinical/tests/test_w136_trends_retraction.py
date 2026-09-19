@@ -556,6 +556,21 @@ class TestTheHeldTrendsWorkIsNotServedHere:
             # test_a_live_patient_session_is_not_a_staff_credential` and
             # `::TestCrossOrganisationEnrolmentIsRefused`.
             "/admin/patients/{patient_id}/logins",
+            # w162. THE THIRD EXEMPTION, on exactly the same property and on
+            # nothing else. `POST /clinic/patients/{patient_id}/consents` is a
+            # STAFF route on the clinic router, behind
+            # `clinical.endpoints._get_session`, and `record_consent` binds
+            # `WHERE patient_id = %s AND org_id = %s` with `org_id` from
+            # `Session.org_id` -- so naming the identifier selects a row inside
+            # the caller's own tenant and can select nothing else, and a real
+            # patient in another organisation is byte-identically not found.
+            # The behavioural halves are in
+            # `test_w162_registration_and_consent.py`:
+            # `TestOnlyTheClinicianMayRecordConsent` (a patient identifier
+            # tells a non-Orderer nothing) and
+            # `TestTheOtherOrganisationIsNotAddressable` (the collision is
+            # constructed and refused).
+            "/clinic/patients/{patient_id}/consents",
         }
         served = {path for path, _ in leaves}
         assert exempt <= served, (

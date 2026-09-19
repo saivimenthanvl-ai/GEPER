@@ -1650,10 +1650,19 @@ class TestTheRouteCensusGrewByExactlyTwo:
             "clinical/portal_endpoints.py",
             "clinical/auth_endpoints.py",
             "clinical/workflow_endpoints.py",
+            # w162. THE SEVENTH MODULE — the ordering clinician's surface,
+            # `POST /clinic/patients` and the two consent routes. It is added
+            # here because THIS SET IS THE THING THAT KEEPS THE NEEDLE HONEST:
+            # `_release_report` is searched for in the modules that define
+            # served routes, so a module missing from the set is a module the
+            # needle never looks in. Adding a route family without adding it
+            # here would silently narrow the search.
+            "clinical/clinic_endpoints.py",
         }
         # The route census keeps that list honest: every served route is
-        # defined in one of those six.
-        assert len(served_routes(app)) == 23, served_routes(app)
+        # defined in one of those seven. 23 at 44d624b; 26 from w162, which
+        # added registration, consent and withdrawal.
+        assert len(served_routes(app)) == 26, served_routes(app)
         sites = {path for path, _ in _call_sites("_release_report")}
         assert sites & modules == set(), sites
         # The needle's single origin, proved rather than asserted.

@@ -2357,10 +2357,62 @@ class DataAccess:
         self,
         session: Session,
         name: str,
-        dob: _datetime.date,
+        dob: "_datetime.date | str",
         sex: str,
     ) -> uuid.UUID:
-        """Create a patient record in this organisation."""
+        """
+        Create a patient record in this organisation.
+
+        REQUIRES THE ORDERER ROLE (w162, human ruling 2026-09-19: "PATIENT
+        REGISTRATION + CONSENT -- the ORDERER/CLINICIAN owns both. Do NOT make
+        Administrator registration mandatory. Do NOT make Lab Technician a
+        patient identity creator.").
+
+        THE TOKEN IS READ OFF THE VOCABULARY, NOT CHOSEN. `ROLES` is what the
+        schema's CHECK on `role_assignments.role` enumerates, and exactly one
+        of its seven names a clinician -- the same one `create_order` already
+        names for the same reason ("Ordering a test is the clinical decision
+        the Orderer role names"). Registration and consent are the acts that
+        precede an order and they belong to the principal who places it.
+
+        NO HIERARCHY IS INTRODUCED, which is the half a later reader will be
+        tempted to undo. An Administrator is NOT implicitly an Orderer here,
+        exactly as `create_order` already says: the ruling gives Administrator
+        organisation/staff administration, and a role that silently subsumes
+        the others is the RBAC redesign the same ruling forbids. The ruling
+        forbids MANDATORY Administrator registration and is silent on whether
+        Administrator may ALSO register; the narrower reading is implemented
+        and the widening is carded, because widening a gate later is a line
+        and a test while narrowing one after deployment withdraws a
+        capability somebody is using.
+
+        UNTIL w162 THIS METHOD ENFORCED NO ROLE AT ALL. Every authenticated
+        session in the organisation could mint a patient identity, and w155
+        correctly refused to guess a role without a ruling. The ruling is now
+        in force and this is it.
+
+        `dob` ACCEPTS A `date` OR AN ISO-8601 STRING, AND THE PARSE IS BELOW
+        THE GATE. That is not a convenience: `clinical/clinic_endpoints.py`
+        takes the date as a `str` because Pydantic runs BEFORE the handler and
+        therefore before this gate, so a `datetime.date` annotation on the
+        request model would answer "that is not a date" to a caller whose
+        authorisation had not been evaluated. The format check belongs where
+        the `sex` vocabulary already is -- after the gate -- so it lives here.
+        Existing callers passing a `date` are unaffected.
+
+        THE ORDER MATTERS AND IS PINNED BY A TEST: the role gate is the FIRST
+        EXECUTABLE STATEMENT, above the format parse and above the sex
+        vocabulary, so an unauthorised caller's refusal cannot vary with the
+        content of the body.
+        """
+        self._require_role(session, "Orderer")
+
+        if isinstance(dob, str):
+            try:
+                dob = _datetime.date.fromisoformat(dob)
+            except ValueError:
+                raise ValueError(f"Date of birth must be an ISO-8601 date (YYYY-MM-DD), not {dob!r}")
+
         if sex not in ("M", "F", "O", "U"):
             raise ValueError(f"Sex must be one of M/F/O/U, not {sex!r}")
 
@@ -2390,7 +2442,30 @@ class DataAccess:
         scope: str,
         supersedes_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
-        """Record a new consent. Optionally supersedes an old one."""
+        """
+        Record a new consent. Optionally supersedes an old one.
+
+        REQUIRES THE ORDERER ROLE (w162, the same ruling `create_patient`
+        carries in full). Consent capture is the second half of the act the
+        ruling names, and the tree already treats it as the ordering
+        clinician's: `create_order` re-reads this row, checks its scope
+        against the order's `required_scope`, and refuses without an active
+        one. Gating creation while leaving capture open would move the hole
+        rather than close it -- the argument `place_order` already makes.
+
+        THE GATE IS THE FIRST EXECUTABLE STATEMENT, above the patient lookup,
+        so an unauthorised caller's 403 is a function of its own roles alone
+        and carries no information about whether the named patient exists --
+        in this organisation or in another.
+
+        `recorded_by` IS `session.user_id` AND IS NOT A PARAMETER. The actor
+        is derived from the authenticated principal, never claimed by the
+        caller: under ISO 15189 the record of who performed an action is
+        evidence, and a claimed actor is indistinguishable in the log from a
+        verified one.
+        """
+        self._require_role(session, "Orderer")
+
         # Validate patient exists in this org
         patient = self._query_one(
             "SELECT patient_id FROM patients WHERE patient_id = %s AND org_id = %s",
@@ -2463,12 +2538,17 @@ class DataAccess:
         a role that silently subsumes the others is the RBAC redesign the
         same ruling forbids.
 
-        create_patient, record_consent and withdraw_consent are NOT gated
-        here. They are patient-registration and consent operations, they act
-        on `patients` and `consents` rather than `orders`, and no role in the
-        vocabulary names them; inventing one from create_order's proximity
-        would be reading the model off a workflow diagram instead of off the
-        code.
+        SUPERSEDED AT w162, AND THE OLD TEXT IS REPLACED RATHER THAN LEFT TO
+        ROT. This docstring used to say that `create_patient`,
+        `record_consent` and `withdraw_consent` were NOT gated "because no
+        role in the vocabulary names them, and inventing one from
+        create_order's proximity would be reading the model off a workflow
+        diagram instead of off the code". That reasoning was correct while it
+        stood and it is no longer the state of the tree: the human ruled on
+        2026-09-19 that the ordering clinician owns registration and consent,
+        and all three are now `_require_role(session, "Orderer")` as their
+        first executable statement. The role was not inferred from proximity;
+        it was RULED, and the token was then resolved against `ROLES`.
         """
         self._require_role(session, "Orderer")
 
@@ -2756,7 +2836,37 @@ class DataAccess:
     )
     @transactional
     def withdraw_consent(self, session: Session, consent_id: uuid.UUID) -> None:
-        """Withdraw an active consent."""
+        """
+        Withdraw an active consent.
+
+        REQUIRES THE ORDERER ROLE (w162, the same ruling `create_patient`
+        carries in full). Withdrawal is the third and last of the consent
+        operations this file defines -- counted by scanning every method
+        definition, not by grepping for a word -- and it is the inverse of
+        `record_consent`, so it answers to the same principal. A withdrawal
+        open to anyone authenticated would let a role that may not record
+        consent destroy the basis for an order.
+
+        THE GATE IS THE FIRST EXECUTABLE STATEMENT, above the consent lookup,
+        for the reason `record_consent` states.
+
+        WHAT THIS IS NOT: a deletion. The row stays and `withdrawn_at` /
+        `withdrawn_by` are stamped on it, so the consent remains readable as
+        the historical fact it is. The `withdrawn_at IS NULL` predicate below
+        is also why withdrawing an already-withdrawn consent is NOT FOUND
+        rather than a distinct refusal -- it is simply not among the active
+        ones, and a distinct status would tell a caller that a consent it may
+        not act on nevertheless exists.
+
+        WHETHER WITHDRAWAL IS RETROACTIVE -- what it means for orders already
+        placed against this consent -- IS NOT DECIDED HERE AND IS NOT DECIDED
+        ANYWHERE IN THIS TREE. This method touches `consents` and nothing
+        else; no order state moves, no report is recalled. That is the
+        behaviour as shipped, it is unchanged by w162, and changing it would
+        be a product ruling nobody has made. Carded, not guessed.
+        """
+        self._require_role(session, "Orderer")
+
         consent = self._query_one(
             "SELECT consent_id FROM consents WHERE consent_id = %s AND org_id = %s AND withdrawn_at IS NULL",
             (consent_id, session.org_id),

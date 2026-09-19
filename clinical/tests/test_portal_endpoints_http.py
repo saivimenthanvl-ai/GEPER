@@ -79,11 +79,16 @@ def seeded(clinical_dsn):
     org_id = dao.create_organisation("Org A")
     staff_id = dao.create_user(org_id, "admin@a.example", STAFF_PASSWORD)
     with connection.cursor() as cur:
-        cur.execute(
-            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
-            "VALUES (%s, %s, 'Administrator', %s, %s)",
-            (staff_id, org_id, staff_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
-        )
+        # w162. ORDERER ALONGSIDE ADMINISTRATOR: this account registers the
+        # patients below, and registration is now the ordering clinician's
+        # (human ruling 2026-09-19). Roles are additive; this file's subject is
+        # the PATIENT surface and none of its claims is about staff roles.
+        for role in ("Administrator", "Orderer"):
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (staff_id, org_id, role, staff_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+            )
     connection.commit()
 
     staff = dao.login("admin@a.example", org_id, STAFF_PASSWORD)

@@ -70,6 +70,7 @@ from fastapi.responses import JSONResponse
 
 from clinical import migrate
 from clinical.admin_endpoints import router as admin_router
+from clinical.clinic_endpoints import router as clinic_router
 from clinical.auth_endpoints import router as auth_router
 from clinical.endpoints import router, session_router
 from clinical.portal_endpoints import router as portal_router
@@ -183,6 +184,41 @@ app.include_router(admin_router)
 # that way. See clinical/workflow_endpoints.py for the full measurement and for
 # what this wave STOPPED, release included.
 app.include_router(workflow_router)
+
+# w162. THE ORDERING CLINICIAN'S SURFACE -- patient registration and consent,
+# the two acts that precede an order, and the THIRD prefix this service
+# serves.
+#
+# Measured at 44d624b by an ast.Call census over every non-test module:
+# `create_patient`, `record_consent` and `withdraw_consent` each had ZERO
+# production call sites AND no `_require_role` of any kind, while each already
+# took a Session and bound `org_id` from it. w155 met all three and correctly
+# REFUSED to invent a role without a ruling. The human ruled on 2026-09-19 --
+# the ordering clinician owns both, not a mandatory Administrator and never a
+# Lab Technician -- so the gate is now `_require_role(session, "Orderer")`
+# inside each method, as its first executable statement, and these three
+# routes are the outermost link that was missing.
+#
+# WHY A THIRD PREFIX rather than `/admin` or `/lab`: the prefix names the
+# SURFACE and never the gate (`/admin/audit` is Auditor, retraction is
+# Approver, `/lab` is Lab technician). `/admin` would encode in every access
+# log and route census the reading the ruling rejects -- that registering a
+# patient is an administrative act -- and `/lab` names the bench, whose role
+# the ruling explicitly bars from creating a patient identity. `/clinic` is
+# also where the Order stage belongs when the `tests` catalogue unblocks it.
+#
+# Mounted ALONGSIDE, never through, exactly as every router above. It adds no
+# dependency to any of them and none of them imports it. What it DOES import
+# is `clinical.endpoints`'s `_get_session`/`_get_data_access` and
+# `clinical.admin_endpoints`'s three refusal helpers -- the SAME staff
+# dependency and the SAME refusals, so there is no second security policy and
+# no second refusal vocabulary.
+#
+# THE FIRST-ADMINISTRATOR DEADLOCK IS UNCHANGED, so an Orderer session is
+# still exactly as reachable as an operator invoking `provision_organisation`
+# directly. What has changed is that these three verbs are no longer
+# unreachable BY DESIGN. See clinical/clinic_endpoints.py.
+app.include_router(clinic_router)
 
 
 @app.get("/healthz", tags=["health"], summary="Liveness probe")

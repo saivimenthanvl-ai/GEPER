@@ -410,6 +410,16 @@ RETRACTION_GENERATION_INVARIANTS: Tuple[CatalogInvariant, ...] = (
 # is destructive), and an invariant asserting them would reject a database that
 # is correctly at this generation -- the same defect, in the other direction,
 # that the baseline list avoids by not asserting `amends_event_id` itself.
+#
+# STILL ABSENT AFTER w161, AND FOR THE SAME REASON RATHER THAN BY OVERSIGHT.
+# Migration 0005 (`exception_amendment_vocabulary`) has since widened the CHECK
+# to admit `'amend_resolution'`. That does NOT belong in 0004's list: a
+# database stopped at version 4 is CORRECTLY at version 4 and has the
+# three-verb vocabulary, and an invariant here would report it as drifted.
+# 0005 carries its own post-condition, in its own header, where it reads the
+# constraint DEFINITION out of `pg_constraint` -- which is why this table gains
+# no `(5, ...)` entry: a migration whose header can state its strongest
+# post-condition has no business here, exactly as the block above says.
 AMENDMENT_GENERATION_INVARIANTS: Tuple[CatalogInvariant, ...] = (
     _column_invariant("exception_events", "amends_event_id"),
     _constraint_invariant("exception_events", "exception_events_amends_event_fk"),

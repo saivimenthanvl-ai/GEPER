@@ -1690,7 +1690,39 @@ CREATE TABLE exception_events (
     exception_id UUID NOT NULL,
     actor TEXT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
-    action TEXT NOT NULL CHECK (action IN ('open', 'resolve', 'reopen')),
+    -- w161 (migration 0005): THE AMENDMENT ACTION VOCABULARY. Four verbs, not
+    -- three. `'amend_resolution'` is APPENDED rather than inserted, and the
+    -- order matters: `pg_get_constraintdef` renders the list in the order it
+    -- was written, and migration 0005 re-creates this constraint with the same
+    -- four tokens in this same order so that a fresh database and an upgraded
+    -- one carry one identical definition. Change the order here and the drift
+    -- detector in test_w126m_schema_equivalence.py will report the two
+    -- databases as different, correctly.
+    --
+    -- THE CONSTRAINT IS UNNAMED HERE AND NAMED IN 0005, ON PURPOSE. PostgreSQL
+    -- names this `exception_events_action_check` -- it is the only unnamed
+    -- CHECK on this table -- and 0005 DROPs and re-ADDs that exact name, so
+    -- neither path invents an identifier the other does not have.
+    --
+    -- THE TOKEN CAME FROM THE HELD BRANCH w126-reresolve-amendment (95a33be),
+    -- which names `'amend_resolution'` in its own schema.sql and in
+    -- ExceptionEventAction.AMEND_RESOLUTION. Nothing else about that branch is
+    -- imported. See 0005's header for the full derivation.
+    --
+    -- WHAT IS STILL NOT HERE: the held branch's
+    -- `exception_events_amendment_names_its_target CHECK ((action =
+    -- 'amend_resolution') = (amends_event_id IS NOT NULL))`. That is a
+    -- SEMANTIC rule about what an amendment must carry, not a vocabulary, and
+    -- it cannot be settled without ruling on the amendment verb -- which this
+    -- wave is not authorised to do. It is carded for the verb's wave, where it
+    -- is still additive: every row this schema can hold today satisfies the
+    -- biconditional already.
+    --
+    -- AND STILL NOTHING WRITES ONE. `'amend_resolution'` is now a value the
+    -- database will accept; no code in this repository produces it. The verb
+    -- is the next authorisation's, exactly as `amends_event_id` was left by
+    -- migration 0004.
+    action TEXT NOT NULL CHECK (action IN ('open', 'resolve', 'reopen', 'amend_resolution')),
     action_note TEXT,
 
     -- w149 (migration 0004): THE AMENDMENT RELATIONSHIP, AND IT CARRIES THE
@@ -1713,11 +1745,17 @@ CREATE TABLE exception_events (
     -- to evade MATCH SIMPLE is to null a referencing column, and nulling
     -- amends_event_id is nulling the amendment itself.
     --
-    -- WHAT IS NOT HERE. The held branch also adds 'amend_resolution' to the
-    -- action CHECK and a CHECK tying the two together. Widening an inline CHECK
-    -- is DROP-then-ADD, which is destructive, and migration 0004 drops nothing;
-    -- the vocabulary and its CHECK are the next authorisation's. Until then no
-    -- action value denotes an amendment, so nothing in this platform writes one.
+    -- THE VOCABULARY ARRIVED IN 0005, THE PAIRING CHECK HAS NOT. This comment
+    -- used to read "no action value denotes an amendment"; that stopped being
+    -- true when migration 0005 (w161) widened the action CHECK above to admit
+    -- `'amend_resolution'`, which is why it is rewritten here rather than left
+    -- to rot. What the held branch ALSO carries and this schema still does not
+    -- is `exception_events_amendment_names_its_target CHECK ((action =
+    -- 'amend_resolution') = (amends_event_id IS NOT NULL))` -- a semantic rule
+    -- about what an amendment must name, carded for the wave that rules the
+    -- amendment verb. So an amendment event is now EXPRESSIBLE and still
+    -- UNWRITTEN: `amends_event_id` appears in no INSERT in this repository
+    -- outside the migration tests.
     amends_event_id UUID,
 
     CONSTRAINT exception_events_org_exception_fk
@@ -2289,4 +2327,5 @@ INSERT INTO schema_migrations (version, name, checksum) VALUES
     (1, 'schema_migrations', '00d8c90bb0eaba561d843cde7a45eca5af4d594aca6a3e230938aef27286f559'),
     (2, 'baseline',          'cc842c3943b7aa1e5786d638eff742f63fd47ce5a5048d7321036234a5290af8'),
     (3, 'report_retraction', 'd0e0ae8d149aa20aea64e18e47424f48efb63d0a7ccdd5cbfd9b3f8016202204'),
-    (4, 'exception_amendment', 'a379abc3cf0a81da3af438f4bc092648ab196d1c53e5039cef106a02200743a0');
+    (4, 'exception_amendment', 'a379abc3cf0a81da3af438f4bc092648ab196d1c53e5039cef106a02200743a0'),
+    (5, 'exception_amendment_vocabulary', 'b2569f6f9927c82e8dd3c66142b053cd25efa8100abeeec607fc625fcc626de0');

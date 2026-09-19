@@ -1106,6 +1106,19 @@ class TestTheSixRequiredRows:
         a whole-file search would be satisfied by deleting that invariant --
         the exact shape of a test that is satisfied by the broken state.
 
+        NARROWED TO PRODUCTION BY w161, AND THE CLAIM IS UNWEAKENED. The scan
+        used to exclude one file by NAME -- this one -- which was enough while
+        this was the only suite that wrote an amendment. Migration 0005's suite
+        writes one too, legitimately: proving an amendment row can be written
+        at all is the whole point of that wave, and it could not be proved
+        without writing one. Excluding tests by DIRECTORY rather than adding a
+        second filename keeps the claim exactly where it was always aimed --
+        `production cannot write an amendment` -- and stops the exclusion list
+        being a thing every later wave has to append to, which is the decay
+        this floor keeps paying for. The three production INSERT sites in
+        `clinical/data_access.py` are still scanned, and the non-vacuity floor
+        below is what proves it.
+
         NON-VACUITY: the search must find the INSERT statements it is scanning
         at all, or a typo in the marker makes this row pass for ever.
         """
@@ -1114,7 +1127,7 @@ class TestTheSixRequiredRows:
         offenders = []
         scanned = 0
         for path in sorted(list((root / "clinical").rglob("*.py")) + list((root / "geper").rglob("*.py"))):
-            if path.name == pathlib.Path(__file__).name:
+            if "tests" in path.parts:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             start = text.find(marker)
@@ -1256,19 +1269,37 @@ class TestTheCatalogueSaysWhatTheBehaviourProved:
             assert cur.fetchone()[0] is True
         conn.rollback()
 
-    def test_the_action_vocabulary_is_UNCHANGED_by_this_migration(self, conn):
+    def test_the_action_vocabulary_is_UNCHANGED_by_THIS_migration(self, conn):
         """
-        THE SCOPE BOUNDARY, ASSERTED SO IT CANNOT DRIFT IN QUIETLY. The held
-        branch adds `'amend_resolution'` to the action CHECK. This wave does
-        not, because widening an inline CHECK is DROP-then-ADD and 0004 drops
-        nothing -- the derivation MEASURED that this is precisely where the
-        held branch stops being additive.
+        THE SCOPE BOUNDARY, AND IT HAS BEEN DELIBERATELY RE-AIMED -- w161,
+        2026-09-19, with the human's authorisation, which is exactly what the
+        previous version of this docstring asked for:
 
-        So this row asserts the vocabulary is still the three verbs, and its
-        failure is the CORRECT signal for the wave that brings the vocabulary
-        across: it should change this row deliberately, with the human's
-        authorisation, rather than discover it changed.
+            "its failure is the CORRECT signal for the wave that brings the
+            vocabulary across: it should change this row deliberately, with the
+            human's authorisation, rather than discover it changed."
+
+        WHAT CHANGED AND WHY THE ROW IS STILL NEEDED. Migration 0005 widened
+        the action CHECK to admit `'amend_resolution'`, so the DATABASE-side
+        half of this row ("the vocabulary is still three verbs") is now false
+        and asserting it would be asserting the past. The claim that was ever
+        0004's to make is about 0004's OWN BYTES: this migration drops nothing
+        and changes no vocabulary. That claim is unchanged, is the reason 0004
+        could be additive at all, and is now asserted where it belongs -- on
+        the file -- rather than on a database whose shape a later migration is
+        entitled to change.
+
+        The database-side assertion is kept in the weaker, durable form: the
+        three original verbs are still admitted. Losing one of them is a defect
+        no matter which migration did it, and 0005's own suite
+        (`test_w161_migration_0005_vocabulary.py`) owns the positive half.
         """
+        vocabulary_ddl = "\n".join(
+            line for line in _the_migration().sql.splitlines() if not line.strip().startswith("--")
+        )
+        assert "amend_resolution" not in vocabulary_ddl, "0004's DDL must not touch the vocabulary"
+        assert "CHECK" not in vocabulary_ddl.upper(), "0004 adds no CHECK constraint of any kind"
+
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
@@ -1278,7 +1309,6 @@ class TestTheCatalogueSaysWhatTheBehaviourProved:
         conn.rollback()
         joined = " ".join(checks)
         assert "'open'" in joined and "'resolve'" in joined and "'reopen'" in joined
-        assert "amend_resolution" not in joined, "the action vocabulary is not this wave's to change"
 
     def test_no_other_org_scoped_table_gained_a_composite_key(self, conn):
         """

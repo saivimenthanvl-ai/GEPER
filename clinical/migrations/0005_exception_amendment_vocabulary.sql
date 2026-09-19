@@ -1,0 +1,231 @@
+-- clinical/migrations/0005_exception_amendment_vocabulary.sql
+-- ───────────────────────────────────────────────────────────
+-- THE EXCEPTION-AMENDMENT ACTION VOCABULARY. One object changed and nothing
+-- else: the CHECK on `exception_events.action` is widened from three verbs to
+-- four, so that an amendment event CAN EXIST. Migration 0004 landed the
+-- RELATIONSHIP -- `exception_events_org_event_unique`, `amends_event_id` and
+-- the composite self-foreign key `exception_events_amends_event_fk` -- and
+-- deliberately stopped short of the vocabulary, because widening an inline
+-- CHECK is DROP-then-ADD and 0004's whole property was that it dropped
+-- nothing. This file is that step, taken on its own, with the care the first
+-- destructive verb in this migration stack is owed.
+--
+-- THE APPROVED DECISION, in the human's words: "EXCEPTION AMENDMENT -- ONLY
+-- the Approver may amend a previously resolved exception. Same organisation ·
+-- composite tenant-safe relationship · composite uniqueness · composite FK ·
+-- audited · no unsafe single-column cross-tenant relationship. If the current
+-- migration stack requires migration 0005, implement it safely."
+--
+-- IT DOES REQUIRE ONE. Before this file, `action TEXT NOT NULL CHECK (action
+-- IN ('open', 'resolve', 'reopen'))` means NO value denotes an amendment, so
+-- the relationship 0004 landed is unreachable by construction: a row carrying
+-- `amends_event_id` would have to claim to be an `open`, a `resolve` or a
+-- `reopen`. The relationship exists and nothing can use it. That is the gap,
+-- and it is a SCHEMA gap.
+--
+--
+-- ─── WHICH TOKEN, AND WHAT DECIDED IT ──────────────────────────────────────
+--
+-- `'amend_resolution'`. Four sources were read and they do not conflict:
+--
+--   1. THE HELD BRANCH `w126-reresolve-amendment` (95a33be) NAMES IT, in both
+--      places it would have to: `clinical/schema.sql` there writes `CHECK
+--      (action IN ('open', 'resolve', 'reopen', 'amend_resolution'))`, and
+--      `clinical/models/exception.py` there writes
+--      `AMEND_RESOLUTION = "amend_resolution"`. THIS IS WHAT DECIDED IT. The
+--      branch is held and its application layer is not being imported, but the
+--      token is the one piece of it this wave is authorised to bring across,
+--      and bringing a DIFFERENT one would guarantee a rename when that branch
+--      is finally reconciled.
+--
+--   2. THIS BRANCH ALREADY COMMITTED TO IT IN PROSE. `0004_exception_
+--      amendment.sql` names `'amend_resolution'` three times as the value the
+--      next authorisation brings, and `clinical/schema.sql`'s own comment on
+--      `amends_event_id` says "the held branch also adds 'amend_resolution' to
+--      the action CHECK ... the vocabulary and its CHECK are the next
+--      authorisation's". Choosing anything else would falsify two committed
+--      files.
+--
+--   3. THE PYTHON ENUM AT THE TIP (`ExceptionEventAction`) is SILENT on the
+--      token -- it holds OPEN/RESOLVE/REOPEN and nothing more. What it does
+--      settle is the STYLE: lowercase, snake_case, the value equal to the
+--      member name lowered. `'amend_resolution'` is the only candidate that
+--      obeys it. The one honest difference from the three incumbents is that
+--      they are single words and this is two; `ResolutionAction` in the same
+--      module is already `retry_check` / `accept_failure`, so a two-word
+--      lowercase token is not novel in this vocabulary family.
+--
+--   4. `GEPER_CLINICAL_PLATFORM_SPEC.md` IS SILENT. Its section 15.2
+--      "Amendment" governs the amendment of a REPORT ("amendment creates a new
+--      report referencing the original"), which is a different object from an
+--      exception event and names no action token at all. It neither supports
+--      nor contradicts the choice; it is recorded here so that nobody reads it
+--      later as agreement.
+--
+-- Sources 1 and 2 decided it. Nothing was invented and nothing was picked by
+-- taste.
+--
+--
+-- ─── WHAT THIS FILE DELIBERATELY DOES NOT DO ───────────────────────────────
+--
+--   * NO DOMAIN VERB AND NO ROUTE. `amend_resolution` becomes WRITABLE by this
+--     file and nothing in this repository writes it, exactly as 0004 left
+--     `amends_event_id` structurally possible and unwritten. The Approver-only
+--     rule the human stated is an AUTHORISATION rule; it lives with the verb,
+--     not in a CHECK constraint, and inventing it here would be inventing
+--     behaviour. 0003 and 0004 were both landed this way.
+--
+--   * NO `exception_events_amendment_names_its_target CHECK ((action =
+--     'amend_resolution') = (amends_event_id IS NOT NULL))`. The held branch
+--     carries it and `0004_exception_amendment.sql`'s header says it "belongs
+--     with the vocabulary", so its absence here is a DIVERGENCE FROM THIS
+--     BRANCH'S OWN EARLIER EXPECTATION and is recorded as one rather than
+--     passed over. The reason it is not here: it is not vocabulary. It is a
+--     SEMANTIC rule -- "an amendment always names a target, and only an
+--     amendment may name one" -- and whether that biconditional is the right
+--     rule cannot be settled without ruling on what the amendment verb does
+--     (may a reopen carry a reference? may an amendment stand without one?).
+--     This wave is authorised to widen the vocabulary and is explicitly not
+--     authorised to rule the verb's semantics, so the constraint is CARDED for
+--     the verb's wave rather than guessed at here. It would be additive then
+--     and no existing row would block it: every row this schema can currently
+--     hold has `amends_event_id IS NULL` and an action other than
+--     `'amend_resolution'`, which satisfies the biconditional already.
+--
+--   * NO CHANGE TO ANY OTHER TABLE, COLUMN, CONSTRAINT, INDEX OR GRANT.
+--
+--
+-- ─── THE DESTRUCTIVE STEP, AND WHY IT IS SAFE ──────────────────────────────
+--
+-- PostgreSQL cannot widen a CHECK in place. There is no ALTER CONSTRAINT for a
+-- CHECK's expression, so the only path is DROP CONSTRAINT then ADD CONSTRAINT,
+-- and that is the FIRST DESTRUCTIVE VERB IN THIS MIGRATION STACK. Three
+-- separate properties are what make it acceptable, and each is asserted by a
+-- row in `clinical/tests/test_w161_migration_0005_vocabulary.py`:
+--
+--   1. ATOMICITY. `clinical/migrate.py::_apply` sends this ENTIRE FILE as ONE
+--      `cur.execute` and commits ONCE; PostgreSQL has transactional DDL, so
+--      both statements below are in one transaction and the history row is in
+--      it too. There is NO window -- not even transiently between statements,
+--      and not even to another session -- in which `exception_events` has no
+--      action CHECK. A concurrent reader sees three verbs or four, never none.
+--      If the ADD fails, the DROP is undone with it and the database is
+--      exactly as it was.
+--
+--   2. NOTHING EXISTING IS REJECTED. The new vocabulary is a strict SUPERSET:
+--      'open', 'resolve' and 'reopen' are all still admitted, in that order,
+--      with `'amend_resolution'` APPENDED. ADD CONSTRAINT without NOT VALID
+--      makes PostgreSQL verify every existing row as part of this transaction,
+--      so if any row could not satisfy the new CHECK the migration fails
+--      rather than silently leaving an unenforced constraint. The tests plant
+--      rows carrying each of the three old verbs BEFORE this file runs and
+--      read them back afterwards, because a superset proved only on an empty
+--      table is a superset proved against nothing.
+--
+--   3. FRESH AND UPGRADED CONVERGE, BYTE FOR BYTE. A fresh database takes its
+--      shape from `clinical/schema.sql`, where this CHECK is written INLINE on
+--      the column and PostgreSQL names it `exception_events_action_check`.
+--      This file DROPs that same auto-generated name and re-adds it
+--      EXPLICITLY, with the same four tokens in the same order, so the server
+--      renders one identical `pg_get_constraintdef` on both paths.
+--      `clinical/tests/test_w126m_schema_equivalence.py` is the mechanism that
+--      proves it -- it diffs `pg_get_constraintdef` across the whole schema
+--      between a database built from `schema.sql` and one built from these
+--      migrations -- and this wave adds a row that asserts the equality for
+--      THIS constraint directly, by name, so the claim does not rest on a
+--      whole-catalogue diff nobody reads.
+--
+-- THE NAME IS NOT GUESSED. `exception_events_action_check` is what PostgreSQL
+-- generates for the single unnamed column CHECK on `exception_events.action`,
+-- in `clinical/schema.sql` and identically in the frozen
+-- `0002_baseline.sql` -- it is the only unnamed CHECK on that table in either.
+-- It was MEASURED from a real database built each way, not assumed from the
+-- naming algorithm, and the measurement is itself a test row: a DROP of a name
+-- that does not exist raises 42704 and takes this migration down with it, so
+-- the failure mode is loud rather than silent.
+--
+-- FORWARD-ONLY, as this whole mechanism is. Narrowing the vocabulary again
+-- would be a new migration that must first deal with any row using the token,
+-- which is precisely the reversal this module's header declines to automate.
+--
+--
+-- ─── THE POST-CONDITION, AND WHY IT IS THIS ONE ────────────────────────────
+--
+-- w160 made declaring one MANDATORY: a migration that declares nothing in
+-- either channel is refused by `_refuse_undeclared` before anything is applied.
+-- This is the first migration written under that rule, and the rule was
+-- proved to BITE on this very file before the line below was trusted: the
+-- file with its `MIGRATION-ASSERT` line stripped -- byte-identical otherwise
+-- -- was handed to `migrate()`, which refused the whole set with
+-- MigrationNotVerifiable and applied NOTHING. That is wrong-version A, and it
+-- is also the cheapest available confirmation that w160's work is
+-- load-bearing rather than decorative.
+--
+-- A `to_regclass('exception_events')` probe WOULD SATISFY THE RULE AND WOULD BE
+-- WORTHLESS HERE. The table already exists -- in this generation, in the
+-- retraction generation, in the baseline generation and in the pre-security
+-- generation w143 measured. It would be true before this migration and true
+-- after it, so it could not tell the widened vocabulary from the old one, and
+-- readiness would be re-evaluating a fact that no failure of this migration
+-- could disturb.
+--
+-- So the post-condition reads the CONSTRAINT DEFINITION out of `pg_catalog`
+-- (`pg_constraint` / `pg_get_constraintdef`, never `information_schema`, which
+-- is privilege-filtered and which `/readyz` evaluates as a deliberately
+-- narrowed role). It is FALSE on every generation before this one and TRUE
+-- after, which is the property that makes it a measurement. It asserts FOUR
+-- things at once, and each corresponds to a wrong version this wave built and
+-- ran:
+--
+--   * the constraint EXISTS and is a CHECK (contype 'c')  -- catches the
+--     version that DROPs and never re-ADDs, where the column would accept any
+--     string at all;
+--   * its definition names 'amend_resolution'             -- catches the
+--     version whose post-condition is satisfied by the OLD definition and so
+--     proves nothing;
+--   * its definition still names 'open', 'resolve' and 'reopen' -- catches the
+--     version that recreates the constraint WITHOUT the existing tokens, which
+--     would reject every row already in the table.
+--
+-- ONE CHANNEL, NOT TWO, AND THAT IS DELIBERATE. `clinical/migrate.py`'s
+-- generation-invariant map exists for migrations whose own bytes cannot carry
+-- their strongest post-condition -- `0002_baseline.sql`, whose checksum is
+-- stamped by `clinical/schema.sql` and therefore frozen. This file's bytes are
+-- not frozen against anything yet, a `MIGRATION-ASSERT` line is an arbitrary
+-- boolean SQL expression, and the expression below is the strongest statement
+-- there is to make about this migration. migrate.py's own comment on that map
+-- says it plainly: "a migration whose header carries a MIGRATION-ASSERT line
+-- and which needs nothing stronger has no business here." So `migrate.py` is
+-- NOT edited by this wave, and the post-condition lives with the DDL it
+-- describes. Both channels are read by the same `post_conditions()` tuple and
+-- evaluated by the same `_failed_assertions` loop on every `inspect_state`, so
+-- `/readyz` sees this exactly as it sees 0004's.
+--
+-- MIGRATION-ASSERT: EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass('exception_events') AND conname = 'exception_events_action_check' AND contype = 'c' AND strpos(pg_get_constraintdef(oid), '''amend_resolution''') > 0 AND strpos(pg_get_constraintdef(oid), '''open''') > 0 AND strpos(pg_get_constraintdef(oid), '''resolve''') > 0 AND strpos(pg_get_constraintdef(oid), '''reopen''') > 0)
+
+
+-- ─── w161: the old vocabulary comes off ─────────────────────────────────────
+--
+-- `exception_events_action_check` is PostgreSQL's own name for the unnamed
+-- column CHECK in `clinical/schema.sql`. Dropping it is the destructive half,
+-- and it is destructive for exactly as long as the next statement takes,
+-- inside one transaction that either lands both or neither.
+ALTER TABLE exception_events
+    DROP CONSTRAINT exception_events_action_check;
+
+
+-- ─── w161: the widened vocabulary goes back on, under the SAME name ─────────
+--
+-- SAME NAME, because a fresh database gets that name from PostgreSQL and the
+-- two paths must not differ by so much as an identifier. SAME ORDER with the
+-- new token APPENDED, because `pg_get_constraintdef` renders the list in the
+-- order it was written and `clinical/schema.sql` writes it this way -- a
+-- different order is a different rendered definition and the drift detector
+-- would report the two databases as unequal, correctly.
+--
+-- NOT `NOT VALID`. The default is to validate against every existing row now,
+-- in this transaction, which is what turns "nothing existing is rejected" from
+-- a claim into something PostgreSQL enforces before it lets this commit.
+ALTER TABLE exception_events
+    ADD CONSTRAINT exception_events_action_check
+        CHECK (action IN ('open', 'resolve', 'reopen', 'amend_resolution'));

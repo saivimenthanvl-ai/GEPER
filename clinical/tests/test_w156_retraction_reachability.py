@@ -13,8 +13,13 @@ definition, and this floor has already had a guard fire on a docstring):
                                 "implemented but unreachable". ABSENT.
   * exception AMENDMENT verb  — ZERO definitions. Migration `0004` landed the
                                 tenant-safe composite relationship;
-                                `exception_events.action` is still CHECKed to
+                                `exception_events.action` was still CHECKed to
                                 exactly ('open', 'resolve', 'reopen').
+                                UPDATED w161: migration `0005` widened that
+                                CHECK to admit 'amend_resolution', so the verb
+                                is no longer stopped on the schema — it is
+                                stopped on being unwritten. STILL ZERO
+                                definitions.
   * `read_audit`              — DEFINED (`clinical/data_access.py`) and
                                 REACHABLE: `GET /admin/audit` calls it,
                                 Auditor-gated, wired in w152 (WAVE 2).
@@ -119,7 +124,6 @@ import pytest
 from clinical.tests.test_w135_patient_report_access import (  # noqa: E402
     PASSWORD,
     RETRACTION_REASON_MARKER,
-    RUN_DOCUMENT,
     T0,
     VCF_TEXT,
     _catalogue_test,
@@ -489,30 +493,43 @@ class TestThePremiseThisWaveTested:
         assert "retract_report" in methods, "retract_report is gone — Wave 6's verb has been undone"
 
         # The exception-amendment verb is STILL absent, and this wave did not
-        # write one. Writing it needs 'amend_resolution' in the action CHECK,
-        # which is a destructive schema change this wave was told not to make.
+        # write one. When this was written, writing it ALSO needed
+        # 'amend_resolution' in the action CHECK -- a destructive schema change
+        # Wave 6 was told not to make. w161's migration 0005 has since made it,
+        # so the schema half of the blockage is gone and only the verb is left.
         for absent in ("amend_exception", "amend_exception_resolution", "reopen_exception"):
             assert absent not in methods, (
                 f"DataAccess.{absent} now exists — the exception-amendment card is resolved and "
                 "this row needs revisiting"
             )
 
-    def test_the_exception_action_vocabulary_is_still_three_values(self, conn):
+    def test_the_exception_amendment_is_now_stopped_on_the_VERB_and_no_longer_on_the_SCHEMA(self, conn):
         """
-        WHY THE AMENDMENT CAPABILITY IS STOPPED AND NOT MERELY UNBUILT, read
-        from `pg_catalog` rather than from the schema file: an amendment verb
-        needs an action value to write, and the vocabulary does not contain
-        one. That is a SCHEMA question, and this wave adds no schema.
+        REVISITED BY w161, WHICH IS WHAT THIS ROW ASKED FOR. Its previous form
+        asserted the vocabulary was still three values and said, in its own
+        failure message, "the exception-amendment card may be resolvable, and
+        this row needs revisiting". Migration 0005 widened the CHECK to admit
+        `'amend_resolution'`, so it has been revisited rather than discovered.
 
-        Catches: a later wave adding the verb without the migration, which
-        would fail at the CHECK rather than at review. Vacuous against: a
-        vocabulary widened in the same commit as the verb — which is the
-        authorised path, and would fail here loudly, which is the intent.
+        WHY THE ROW SURVIVES AT ALL INSTEAD OF BEING DELETED. Its subject was
+        never the vocabulary; it was WHY WAVE 6 STOPPED. That answer has
+        CHANGED, and recording the change is more useful than removing the
+        question:
 
-        NOT A DUPLICATE of `test_w149_migration_0004_amendment.py
-        ::test_the_action_vocabulary_is_UNCHANGED_by_this_migration`: that row
-        is about what migration 0004 did. This one is about why WAVE 6
-        stopped.
+          * THEN: stopped on the SCHEMA. No action value denoted an amendment,
+            so the verb could not be written even if someone wanted to.
+          * NOW: stopped on the VERB. The value exists, the tenant-safe
+            relationship 0004 landed is reachable, and nothing in production
+            writes either. What remains is a domain decision — the human's
+            Approver-only rule — and not a migration.
+
+        So the two halves are asserted in the polarity they actually have now:
+        the vocabulary DOES contain the amendment value, and the verb is STILL
+        absent. The second half is the one that must not quietly flip.
+
+        NOT A DUPLICATE of `test_w161_migration_0005_vocabulary.py`: that file
+        proves the migration is correct and safe. This row is the reachability
+        ledger — what is stopped, and on what.
         """
         with conn.cursor() as cur:
             cur.execute(
@@ -525,10 +542,19 @@ class TestThePremiseThisWaveTested:
         joined = " ".join(defs)
         for value in ("'open'", "'resolve'", "'reopen'"):
             assert value in joined, joined
-        assert "amend_resolution" not in joined, (
-            "the action vocabulary now contains an amendment value — the exception-amendment card "
-            "may be resolvable, and this row needs revisiting"
+        assert "amend_resolution" in joined, (
+            "the action vocabulary has LOST its amendment value — migration 0005 has been undone"
         )
+
+        # AND THE VERB IS STILL ABSENT. Without this half the row above would
+        # be a celebration of a schema change and would say nothing about
+        # reachability, which is this file's whole subject.
+        methods = _data_access_methods()
+        for absent in ("amend_exception", "amend_exception_resolution", "amend_resolution"):
+            assert absent not in methods, (
+                f"DataAccess.{absent} now exists — the exception-amendment card is resolved and "
+                "this row needs revisiting"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -573,9 +599,7 @@ class TestTheVerbIsShapedTheWayTheHouseRequires:
         handler_names = {a.arg for a in handler.args.args} | {a.arg for a in handler.args.kwonlyargs}
         assert handler_names == {"report_id", "body", "session", "dao"}, handler_names
 
-        model = next(
-            n for n in admin_tree.body if isinstance(n, ast.ClassDef) and n.name == "RetractionRequest"
-        )
+        model = next(n for n in admin_tree.body if isinstance(n, ast.ClassDef) and n.name == "RetractionRequest")
         fields = {n.target.id for n in model.body if isinstance(n, ast.AnnAssign)}
         assert fields == {"reason", "replacement_report_id"}, fields
 
@@ -651,9 +675,7 @@ class TestTheVerbIsShapedTheWayTheHouseRequires:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "retract_report"
         )
         called = {
-            n.func.attr
-            for n in ast.walk(handler)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            n.func.attr for n in ast.walk(handler) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
         }
         assert "_require_role" not in called, called
 
@@ -873,9 +895,7 @@ class TestTheCrossOrganisationRetractionIsRefused:
             "organisation A's refused call wrote a retraction into organisation B"
         )
 
-    def test_the_positive_twin_the_same_report_is_retractable_by_its_own_organisation(
-        self, client, world, reader
-    ):
+    def test_the_positive_twin_the_same_report_is_retractable_by_its_own_organisation(self, client, world, reader):
         """
         Standing Rule 4: without this the row above passes against a route
         that refuses every report everywhere. Same report, same body, an
@@ -886,9 +906,7 @@ class TestTheCrossOrganisationRetractionIsRefused:
         assert _retract_over_http(client, cookie, b["released_report"]).status_code == 201
         assert _retractions_of(reader, b["auditor"].session_id, b["released_report"]) is not None
 
-    def test_a_replacement_in_the_other_organisation_is_refused_and_nothing_lands(
-        self, client, world, reader
-    ):
+    def test_a_replacement_in_the_other_organisation_is_refused_and_nothing_lands(self, client, world, reader):
         """
         THE SECOND IDENTIFIER CHANNEL, which a test written only against the
         path target would miss entirely. `replacement_report_id` is the one
@@ -908,18 +926,14 @@ class TestTheCrossOrganisationRetractionIsRefused:
         """
         a, b = world["a"], world["b"]
         cookie = _staff_cookie(client, a["org_id"], a["approver_email"])
-        response = _retract_over_http(
-            client, cookie, a["released_report"], replacement=b["released_report"]
-        )
+        response = _retract_over_http(client, cookie, a["released_report"], replacement=b["released_report"])
         assert _pair(response) == NOT_FOUND, response.text
         assert _retractions_of(reader, a["auditor"].session_id, a["released_report"]) is None
 
     def test_the_positive_twin_a_same_organisation_replacement_is_accepted(self, client, world, reader):
         a = world["a"]
         cookie = _staff_cookie(client, a["org_id"], a["approver_email"])
-        response = _retract_over_http(
-            client, cookie, a["released_report"], replacement=a["replacement_report"]
-        )
+        response = _retract_over_http(client, cookie, a["released_report"], replacement=a["replacement_report"])
         assert response.status_code == 201, response.text
         assert _retractions_of(reader, a["auditor"].session_id, a["released_report"]) is not None
 
@@ -930,9 +944,7 @@ class TestTheCrossOrganisationRetractionIsRefused:
 
 
 class TestTheAuditRowNamesTheRightActorOrganisationAndReport:
-    def test_the_retraction_is_attributed_to_the_acting_approver_in_their_own_organisation(
-        self, client, world, reader
-    ):
+    def test_the_retraction_is_attributed_to_the_acting_approver_in_their_own_organisation(self, client, world, reader):
         """
         (C) A RETRACTION THAT LANDS BUT WRITES NO AUDIT ROW, or one naming the
         wrong organisation. Read back through `read_audit` — the DOMAIN
@@ -980,9 +992,7 @@ class TestTheAuditRowNamesTheRightActorOrganisationAndReport:
         session = reader.session_valid(b["auditor"].session_id)
         assert reader.read_audit(session, ["report_retracted"], 100) == []
 
-    def test_a_refused_attempt_is_recorded_against_the_caller_not_the_target_tenant(
-        self, client, world, reader
-    ):
+    def test_a_refused_attempt_is_recorded_against_the_caller_not_the_target_tenant(self, client, world, reader):
         """
         An Approver of A naming B's report is refused. Whatever the audit path
         records, it must not appear in B's trail — an authorisation failure in
@@ -1193,16 +1203,12 @@ class TestThePatientSurfacesHoldAfterTheVerbExists:
         assert set(mine[0]) == {"report_id", "order_id", "released_at", "is_retracted"}, mine[0]
         assert mine[0]["is_retracted"] is True, mine[0]
 
-        single = client.get(
-            f"/portal/me/reports/{a['released_report']}", cookies={PATIENT_COOKIE: patient}
-        )
+        single = client.get(f"/portal/me/reports/{a['released_report']}", cookies={PATIENT_COOKIE: patient})
         assert single.status_code == 200, single.text
         assert set(single.json()) == {"report_id", "order_id", "released_at", "is_retracted"}, single.json()
         assert single.json()["is_retracted"] is True, single.json()
 
-    def test_no_reason_no_retractor_and_no_replacement_identifier_is_anywhere_in_any_body(
-        self, client, world
-    ):
+    def test_no_reason_no_retractor_and_no_replacement_identifier_is_anywhere_in_any_body(self, client, world):
         """
         (D) A PATIENT SURFACE LEAKING THE REASON OR THE REPLACEMENT
         IDENTIFIER ONCE RETRACTION EXISTS — the wrong version this catches is
@@ -1313,9 +1319,10 @@ class TestThePatientSurfacesHoldAfterTheVerbExists:
 
         assert {r["report_id"] for r in before} == {r["report_id"] for r in after}, (before, after)
         assert str(a["released_report"]) in {r["report_id"] for r in after}
-        assert client.get(
-            f"/portal/me/reports/{a['released_report']}", cookies={PATIENT_COOKIE: patient}
-        ).status_code == 200
+        assert (
+            client.get(f"/portal/me/reports/{a['released_report']}", cookies={PATIENT_COOKIE: patient}).status_code
+            == 200
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

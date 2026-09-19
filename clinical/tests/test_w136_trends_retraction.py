@@ -42,12 +42,17 @@ added anywhere. E4's optional replacement edge, which §5's row named as a
 possibility, was refused.
 
 WHAT THIS FILE DELIBERATELY DOES NOT TEST, AND WHY EACH IS ABSENT:
-  * A RETRACTION CREATED THROUGH A WRITER. There is none: re-counted at
-    2de2fef, `def retract_report` does not exist, and
-    `enforce_content_immutability` still refuses to walk an approved report
-    back at the database. §7 ARRANGES the row by direct insert — legitimate,
-    because its subject is a reader — and §5 asserts the verb's continued
-    absence.
+  * A RETRACTION CREATED THROUGH A WRITER. RE-MEASURED AT w156 AND THE CLAIM
+    IS FIXED RATHER THAN LEFT STANDING (Rule 3): there IS one now —
+    `DataAccess.retract_report`, written in w156 (WAVE 6) and Approver-gated.
+    §7 still ARRANGES its rows by direct insert, which stays legitimate
+    because every subject in §7 is a READER and `_retract` only puts a row in
+    a table; changing them would re-test the writer in a file about readers.
+    The writer-driven version of the same property — a retraction made
+    through the verb and through `POST /admin/reports/{id}/retraction`, then
+    read back over `/portal/me/trends` — lives in
+    `test_w156_retraction_reachability.py`. §5 no longer asserts the verb's
+    absence; it asserts the verb's existence AND its gate.
   * A VARIANT CLASSIFICATION ANYWHERE. Refused — §6 proves the refusal holds
     behaviourally, with a marker that cannot arrive by coincidence.
   * A PRODUCTION PATH THAT REACHES ANY OF THIS. `_release_report` has ZERO
@@ -384,10 +389,19 @@ def _retract(conn, org_id, report_id, reason, replacement_report_id=None, from_s
     expectation below is read back through `GET /portal/me/trends`. The raw
     SQL only puts a row in a table.
 
-    IT IS RAW SQL BECAUSE THERE IS NO WRITER. `def retract_report` does not
-    exist in clinical/data_access.py — the row below asserts that, it is
-    green, and w148 deliberately did not bring the verb across. When one
-    arrives these calls become calls to it.
+    IT WAS RAW SQL BECAUSE THERE WAS NO WRITER, AND IT STAYS RAW SQL NOW
+    THAT THERE IS ONE. w156 (WAVE 6) wrote `DataAccess.retract_report`, so
+    the original sentence here ("`def retract_report` does not exist") is
+    false and is corrected rather than left to decay. These calls are NOT
+    converted to it, for a reason: the subject of every row that uses this
+    helper is a READER, and `_retract` is ARRANGEMENT. Driving the arrangement
+    through the writer would also import the writer's OWN preconditions —
+    the Approver gate, ruling E1's state rule, E5's already-retracted refusal
+    — into rows that are about none of them, and `from_state="approved"` on
+    an approved-but-never-released report is exactly the arrangement E1's
+    refusal would make harder to state. The writer-driven proof is a separate
+    file (`test_w156_retraction_reachability.py`), which is where a writer
+    belongs.
 
     `retracted_from_state` is CHECKed to ('approved', 'released') by ruling E1.
     """
@@ -1088,29 +1102,54 @@ class TestTheRetractionVerdict:
     answer. E4's optional `replacement_report_id`, which that row also named as
     a possibility, was REFUSED by the same decision.
 
-    What remains here is the half that has NOT moved: no verb in this
-    repository can retract anything, and release is still the only thing that
-    keeps a report out of the series.
+    THE SECOND HALF HAS NOW MOVED TOO. w156 (WAVE 6) wrote `retract_report`,
+    which is what the row below said "needs revisiting" if it ever appeared.
+    It is RE-AUTHORED INTO THE POSITIVE ROW the behaviour now needs, not
+    deleted and not skipped: the verb must exist, must be Approver-gated at
+    its first statement, and the two state-walk-back verbs must still not
+    exist. What has NOT moved, and is unchanged below, is the reader
+    property: release is still the only thing that keeps a report out of the
+    series, because rulings E3/E7 forbid a retraction filter.
     """
 
-    def test_the_clinical_layer_still_has_no_operation_that_retracts_an_approval(self):
+    def test_the_clinical_layer_retracts_by_a_gated_verb_and_the_series_still_has_no_filter(self):
         """
-        THE OTHER HALF, at the code rather than the schema, and the reason the
-        first is not merely an omission: the database FORBIDS walking an
-        approved report back (`enforce_content_immutability`), so retraction
-        cannot be simulated by moving `state` either.
+        RE-AUTHORED AT w156 FROM `..._still_has_no_operation_that_retracts_an_approval`.
 
-        Non-vacuity: the same search is asserted to FIND the corrective verb
-        that DOES exist — `create_amendment`, which this wave's edge is built
-        on — so a typo fails here rather than passing silently.
+        BY SYNTAX TREE, NOT BY SUBSTRING, and that is the difference that
+        matters here rather than a preference. The original row searched the
+        file text for `"def retract_report"`. w156 added roughly a hundred
+        lines of DOCSTRING naming that verb, and a substring row of the
+        opposite polarity — "the verb is present" — would have been satisfied
+        by the prose alone. Wave 5 found a live guard on this floor firing on
+        a docstring; this walks `DataAccess`'s own body and looks at
+        `FunctionDef` nodes.
+
+        Catches: the verb deleted; its Approver gate removed; its gate moved
+        below the report lookup (which would make an unauthorised caller's
+        refusal depend on whether the report exists); a walk-back verb added.
+        Vacuous against: nothing — both polarities are asserted, and the
+        helper's own non-vacuity twin lives in
+        `test_w135_patient_report_access.py`.
         """
         import clinical.data_access
 
+        from clinical.tests.test_w156_retraction_reachability import _first_role_gate
+
         source = pathlib.Path(inspect.getfile(clinical.data_access)).read_text(encoding="utf-8")
-        for present in ("def create_amendment", "def _release_report"):
-            assert present in source, f"{present!r} spells nothing — the search is broken"
-        for absent in ("def retract_report", "def unapprove_report", "def rescind_report"):
-            assert absent not in source, f"{absent} now exists — w136's retraction verdict needs revisiting"
+        klass = next(
+            n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "DataAccess"
+        )
+        defined = {n.name: n for n in klass.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        for present in ("create_amendment", "_release_report", "retract_report"):
+            assert present in defined, f"DataAccess.{present} is not defined — the tree walk is reading nothing"
+        for absent in ("unapprove_report", "rescind_report"):
+            assert absent not in defined, f"DataAccess.{absent} now exists — w136's retraction verdict needs revisiting"
+
+        assert _first_role_gate(defined["retract_report"]) == "Approver", ast.dump(
+            defined["retract_report"].body[1]
+        )
 
     def test_the_only_thing_that_keeps_a_report_out_of_the_series_is_release(self):
         """

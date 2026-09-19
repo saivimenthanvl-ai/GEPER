@@ -960,9 +960,16 @@ class TestNoCallerControlledOrganisationEscape:
         # therefore inside the "no inbound organisation" scan, precisely
         # because it is the newest place an `org_id` could be added by
         # somebody who had not read this file.
+        # w156 added `RetractionRequest`, and it is the sharpest case this
+        # scan has had: it is the first request model on this surface with a
+        # second IDENTIFIER field (`replacement_report_id`, optional by ruling
+        # E4), so it is the newest place both an `org_id` and a
+        # caller-supplied actor could be added by somebody who had not read
+        # this file.
         assert sorted(request_models) == [
             "DisabledRequest",
             "PatientLoginEnrolmentRequest",
+            "RetractionRequest",
             "RoleAssignmentRequest",
         ], request_models
         assert offenders == [], offenders
@@ -1137,6 +1144,14 @@ class TestTheHandlersComposeNoDecoratedCalls:
             "enrol_patient_login",
             "set_patient_login_disabled",
             "read_audit",
+            # w156 (WAVE 6). Report retraction — the verb did not exist at
+            # 7bb6f8c and was written this wave, so this is a handler for a
+            # capability that was ABSENT rather than implemented-unreachable.
+            # It is APPROVER-gated, which makes it the second route on this
+            # surface whose role is not Administrator (`read_audit` is
+            # Auditor): the /admin prefix names the surface, not the role.
+            # One decorated call, like every other handler here.
+            "retract_report",
         }, per_handler
         for handler, calls in per_handler.items():
             assert len(calls) == 1, (handler, calls)

@@ -487,6 +487,28 @@ class TestTheRouteCensus:
             ("/admin/patients/{patient_id}/logins", ("POST",)),
             ("/admin/patient-logins/{patient_login_id}/disabled", ("POST",)),
             ("/admin/audit", ("GET",)),
+            # w156 (WAVE 6). REPORT RETRACTION, and it is the first route on
+            # this surface for a capability that was ABSENT rather than
+            # implemented-and-unreachable: at 7bb6f8c `def retract_report` had
+            # ZERO definitions in production (measured by syntax tree over all
+            # 299 non-test modules), while migration 0003 had already landed
+            # `report_retractions` and `retraction_notifications`. The verb was
+            # written this wave, in this tree's idiom, and NOT lifted from the
+            # held branch `w122-retraction` — see the note above the method in
+            # clinical/data_access.py for the reasoning and for which rulings
+            # (E1, E3-E8) the schema had already settled.
+            #
+            # APPROVER, NOT ADMINISTRATOR. The second route here whose role is
+            # not Administrator (`/admin/audit` is Auditor): the prefix names
+            # the surface, not the gate. Every verb in this platform that acts
+            # on an approved report is Approver-gated, so this one is too, and
+            # no eighth role was invented.
+            #
+            # THE EXCEPTION-AMENDMENT ROUTE IS DELIBERATELY NOT HERE. That verb
+            # cannot be written without widening `exception_events.action`'s
+            # CHECK, which is a destructive schema change; w156 STOPPED and
+            # carded it rather than inventing a vocabulary.
+            ("/admin/reports/{report_id}/retraction", ("POST",)),
         }
     )
 
@@ -508,10 +530,11 @@ class TestTheRouteCensus:
         # routes; 14 from w136, which added the patient report series; 18 from
         # w152, which added the four administrative routes; 19 from w154,
         # which added the role-revocation route; 20 from w155, which added
-        # patient credential issuance. The number is checked against
+        # patient credential issuance; 21 from w156, which added report
+        # retraction. The number is checked against
         # the EXPECTED set above, which is what actually names them — this row
         # exists only to refuse the empty and wrapper-shaped answers.
-        assert len(census) == 20, census
+        assert len(census) == 21, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

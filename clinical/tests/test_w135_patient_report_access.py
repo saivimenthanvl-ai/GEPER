@@ -65,10 +65,15 @@ not constructible, and a row below asserted it. RE-COUNTED at 2de2fef:
 
   * `report_retractions` DOES exist in schema.sql — migration 0003 brought it
     across, and the measurement row fired exactly as designed.
-  * `clinical/data_access.py` STILL has no unapprove/retract/rescind method,
-    and enforce_content_immutability() still FORBIDS walking an approved
-    report back at the database. There is no writer, in production or in a
-    test, that can create a retraction through this layer.
+  * `clinical/data_access.py` had no unapprove/retract/rescind method. THAT
+    HALF MOVED AT w156 (WAVE 6) AND THE CLAIM IS FIXED RATHER THAN LEFT
+    STANDING (Rule 3): `DataAccess.retract_report` now exists, is
+    Approver-gated, and is reachable at
+    `POST /admin/reports/{report_id}/retraction`. What has NOT moved is the
+    rest of the sentence — there is still no unapprove and no rescind, and
+    `enforce_content_immutability()` still FORBIDS walking an approved report
+    back at the database, which is why retraction is a ROW and not a sixth
+    `reports.state`.
 
 So w148 implements the HUMAN'S DECISION 1: the report responses carry a simple
 `is_retracted` boolean and nothing else — no reason, no retractor, no
@@ -368,11 +373,20 @@ def _retract(conn, org_id, report_id, reason, replacement_report_id=None, from_s
     `list_my_report_trend` — and every expectation is read back through the
     HTTP route. The raw SQL only puts a row in a table.
 
-    IT IS RAW SQL BECAUSE THERE IS NO WRITER, NOT BECAUSE ONE WAS AVOIDED.
-    `def retract_report` does not exist in clinical/data_access.py; the row
-    below this file's retraction class asserts that, it is green, and w148
-    deliberately did not bring the verb across. When a writer arrives these
-    calls become calls to it and nothing else in these rows changes.
+    IT WAS RAW SQL BECAUSE THERE WAS NO WRITER; THERE IS ONE NOW AND THIS
+    STAYS RAW SQL. `DataAccess.retract_report` was written in w156 (WAVE 6),
+    so the sentence that used to stand here is false and is corrected rather
+    than left to decay (Rule 3). These calls are deliberately NOT converted:
+    the subject of every row that uses this helper is a READER, and driving
+    the arrangement through the writer would import the writer's own
+    preconditions — the Approver gate, E1's state rule, E5's
+    already-retracted refusal — into rows that are about none of them. One
+    row below needs `from_state="approved"` on a report that was never
+    released, which is arrangement the writer would make harder to state
+    rather than easier. The writer-driven proof of the SAME patient
+    properties — retraction made through the verb and through
+    `POST /admin/reports/{id}/retraction`, then read back over `/portal/` —
+    is in `test_w156_retraction_reachability.py`, where a writer belongs.
 
     `retracted_from_state` is CHECKed to ('approved', 'released') by ruling
     E1, so this helper cannot be asked to retract a draft.
@@ -1099,33 +1113,117 @@ class TestTheRetractionQuestionAsItStandsAtThisSHA:
     2de2fef the answer was NOT APPLICABLE: the table did not exist and the
     first row here said so.
 
-    IT IS APPLICABLE NOW. Migration 0003 brought `report_retractions` into the
-    schema, this class's schema probe failed exactly as designed, and the
-    human decided what the patient sees. The behavioural answer lives in
-    `TestTheRetractedReportIsShownAndFlagged` below. What remains HERE is the
-    half of the measurement that has NOT moved: there is still no verb in this
-    repository that can retract anything, and release is still the only
-    predicate that decides what a patient can reach.
+    IT BECAME APPLICABLE AT THE SCHEMA in 2de2fef (migration 0003), and it
+    became applicable AT THE CODE in w156 (WAVE 6), which wrote
+    `retract_report`. This class's two original rows were both ABSENCE rows,
+    and they were both green until w156. RE-AUTHORED, NOT DELETED AND NOT
+    WEAKENED -- their own failure messages said the verdict "needs
+    revisiting", and this is the revisiting:
+
+      * the verb row now asserts the verb EXISTS AND IS GATED, by syntax
+        tree rather than by substring, and still asserts that the two
+        state-walk-back verbs do NOT exist;
+      * the reader row below is UNCHANGED, because what it pins did not
+        move: release is still the only predicate that decides what a
+        patient can reach, and rulings E3/E7 forbid a retraction filter.
+
+    The behavioural answer -- what a patient is told about a retracted
+    report -- lives in `TestTheRetractedReportIsShownAndFlagged` below, and
+    w156 added the rows that drive it through the VERB rather than through
+    `_retract`'s direct INSERT.
     """
 
-    def test_the_clinical_layer_has_no_operation_that_retracts_an_approval(self):
-        """
-        THE OTHER HALF OF THE SAME MEASUREMENT, at the code rather than the
-        schema, and the reason the first is not merely an omission: the
-        database FORBIDS walking an approved report back
-        (enforce_content_immutability), so retraction cannot be simulated by
-        moving `state` either.
+    def _data_access_class(self):
+        """The `DataAccess` class node, parsed from the file.
 
-        Non-vacuity: the same search is asserted to FIND the verbs that do
-        exist, so a typo fails here rather than passing silently.
+        AST, NOT `inspect.signature` AND NOT A SUBSTRING SCAN, and both
+        exclusions are measured hazards of this floor rather than taste:
+
+          * `@auditable` carries no `functools.wraps`, so signature
+            inspection on a decorated method answers `(self, *args,
+            **kwargs)` and `inspect.getsource` returns the DECORATOR's body
+            (w138 measured that, and the comment at
+            `test_the_two_methods_share_one_sql_text` says so).
+          * a substring scan credits PROSE as a definition. w156's own
+            docstrings mention `retract_report` a dozen times; a row that
+            searched for the text would pass against a file that only talks
+            about the verb. This walks the tree and looks at `FunctionDef`
+            nodes.
         """
         import clinical.data_access
 
         source = pathlib.Path(inspect.getfile(clinical.data_access)).read_text(encoding="utf-8")
-        for present in ("def approve_report", "def _release_report", "def create_amendment"):
-            assert present in source, f"{present!r} spells nothing -- the search is broken"
-        for absent in ("def retract_report", "def unapprove_report", "def rescind_report"):
-            assert absent not in source, f"{absent} now exists -- w135's retraction verdict needs revisiting"
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "DataAccess":
+                return node
+        raise AssertionError("DataAccess is not a class in clinical/data_access.py -- this row is reading nothing")
+
+    def test_the_clinical_layer_retracts_by_a_gated_verb_and_still_cannot_walk_an_approval_back(self):
+        """
+        RE-AUTHORED AT w156 FROM `..._has_no_operation_that_retracts_an_approval`.
+
+        THE HALF THAT MOVED: `retract_report` now exists, and this row
+        asserts it exists AND that its FIRST executable statement is the
+        Approver gate. The ordering is the property, not a style: a gate
+        placed after the report lookup would make an unauthorised caller's
+        refusal vary with whether the identifier names anything, which is an
+        existence oracle for reports.
+
+        THE HALF THAT DID NOT MOVE, and is why the original row is not simply
+        deleted: the database FORBIDS walking an approved report back
+        (`enforce_content_immutability`), so retraction must NOT be simulated
+        by moving `state`. `unapprove_report` and `rescind_report` are still
+        asserted absent, by the same tree walk, so a later implementer who
+        adds one fails here.
+
+        Catches: the verb losing its gate, the gate sliding below the lookup,
+        or a state-walk-back verb arriving. Vacuous against: nothing -- the
+        positive half fails if the verb is deleted and the negative half
+        fails if a walk-back verb appears.
+
+        Non-vacuity twin: `test_the_twin_the_tree_walk_sees_a_gate_that_is_not_first`.
+        """
+        from clinical.tests.test_w156_retraction_reachability import _first_role_gate
+
+        klass = self._data_access_class()
+        defined = {n.name: n for n in klass.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        for present in ("approve_report", "_release_report", "create_amendment", "retract_report"):
+            assert present in defined, f"DataAccess.{present} is not defined -- the tree walk is reading nothing"
+
+        for absent in ("unapprove_report", "rescind_report"):
+            assert absent not in defined, (
+                f"DataAccess.{absent} now exists -- an approval may not be walked back "
+                "(enforce_content_immutability), and w135's verdict needs revisiting again"
+            )
+
+        assert _first_role_gate(defined["retract_report"]) == "Approver", ast.dump(defined["retract_report"].body[1])
+
+    def test_the_twin_the_tree_walk_sees_a_gate_that_is_not_first(self):
+        """
+        Standing Rule 4: without this, the row above is satisfied by a helper
+        that returns `"Approver"` for anything. Two probes -- a method whose
+        gate is the second statement, and a method with no gate at all --
+        must both come back as something other than the answer the row above
+        accepts.
+        """
+        from clinical.tests.test_w156_retraction_reachability import _first_role_gate
+
+        late = ast.parse(
+            "def m(self, session, report_id):\n"
+            '    """doc"""\n'
+            "    row = self._query_one('SELECT 1')\n"
+            "    self._require_role(session, 'Approver')\n"
+        ).body[0]
+        none_at_all = ast.parse("def m(self, session):\n    return 1\n").body[0]
+        assert _first_role_gate(late) is None, "a gate below the first statement is being credited as first"
+        assert _first_role_gate(none_at_all) is None, "a method with no gate is being credited with one"
+
+        wrong_role = ast.parse(
+            "def m(self, session):\n    self._require_role(session, 'Administrator')\n"
+        ).body[0]
+        assert _first_role_gate(wrong_role) == "Administrator", "the helper is not reading the role it finds"
 
     def test_the_only_thing_that_hides_a_report_from_its_owner_is_release_state(self):
         """

@@ -152,7 +152,20 @@ AUTHENTICATED_STAFF_ROUTES = (
     # session-lifecycle state here would be the first staff refusal that
     # varied while a patient identifier was in the URL.
     ("POST", f"/admin/patients/{_UNKNOWN_UUID}/logins", {"email": "x@y.example", "password": "a password"}),
+    # w156 (WAVE 6). Report retraction. It is the SECOND route on this surface
+    # gated on a role that is not Administrator (`/admin/audit` is Auditor;
+    # this one is Approver), which is why `_ADMIN_ROUTES_NOT_GATED_ON_ADMINISTRATOR`
+    # below is a set rather than a single path comparison.
+    ("POST", f"/admin/reports/{_UNKNOWN_UUID}/retraction", {"reason": "w156"}),
 )
+
+# The administrative paths whose role gate is NOT Administrator. The fixture
+# principal in this file holds Administrator and nothing else, so these answer
+# 403 (authenticated, wrong role) where the rest answer 404 (authenticated,
+# right role, target does not exist in this organisation). Both are
+# distinguishable from the anonymous 401, which is the property the set above
+# is for.
+_ADMIN_ROUTES_NOT_GATED_ON_ADMINISTRATOR = ("/admin/audit", "/retraction")
 
 
 # ─── fixtures ────────────────────────────────────────────────────────────────
@@ -1579,7 +1592,8 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         # w152: four, then eight. The number is a non-vacuity floor, not the
         # property -- the property is that the list matches what the app
         # serves, which the assertion below checks against the route census.
-        assert len(AUTHENTICATED_STAFF_ROUTES) == 10, "a staff route left the list without being probed"
+        # 10 at w155; 11 from w156, which added the report-retraction route.
+        assert len(AUTHENTICATED_STAFF_ROUTES) == 11, "a staff route left the list without being probed"
         assert any(path.startswith("/auth/logout") for _, path, _ in AUTHENTICATED_STAFF_ROUTES), (
             "the logout route left the list -- it is the entire reason this class exists"
         )
@@ -1602,7 +1616,9 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
                 response = _call(client, method, path, cookies, body)
                 observed[f"{name} | {method} {path}"] = (response.status_code, response.content)
 
-        assert len(observed) == 80, observed
+        # eight cases across every staff route: 80 at w155, 88 from w156's
+        # report-retraction route. The product, not a hand-kept number.
+        assert len(observed) == 8 * len(AUTHENTICATED_STAFF_ROUTES) == 88, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 
@@ -1666,12 +1682,13 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         assert (patch.status_code, patch.content) != THE_REFUSAL
         assert patch.status_code == 404, patch.text
 
-        # w152. THE FOUR ADMINISTRATIVE ROUTES, each with its OWN shape and
+        # w152. THE ADMINISTRATIVE ROUTES, each with its OWN shape and
         # none of them the authentication refusal. `admin@a.example` holds
-        # Administrator in this fixture and does NOT hold Auditor, so the
-        # three Administrator routes answer 404 (an authenticated caller,
-        # naming a target that does not exist in its organisation) and the
-        # audit route answers 403 (authenticated, wrong role). Both are
+        # Administrator in this fixture and does NOT hold Auditor or Approver,
+        # so the Administrator routes answer 404 (an authenticated caller,
+        # naming a target that does not exist in its organisation) while the
+        # audit route (Auditor) and, from w156, the retraction route
+        # (Approver) answer 403 (authenticated, wrong role). Both are
         # distinguishable from the 401 an anonymous caller gets, which is what
         # makes the set above meaningful — and neither varies with anything
         # the caller is not entitled to know (that is proved in
@@ -1683,7 +1700,7 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
                 continue
             response = _call(client, method, path, credential, body)
             assert (response.status_code, response.content) != THE_REFUSAL, (path, response.text)
-            if path == "/admin/audit":
+            if any(marker in path for marker in _ADMIN_ROUTES_NOT_GATED_ON_ADMINISTRATOR):
                 assert response.status_code == 403, response.text
                 assert response.json() == {"detail": ADMIN_FORBIDDEN}, response.text
             else:

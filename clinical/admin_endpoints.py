@@ -302,12 +302,27 @@ oversight. See `hive/agents/god/w152-decision-cards.md`.
   secret-generation ruling, and for patients a schema change. No cryptography
   was invented here. See the card.
 
-* EXCEPTION AMENDMENT and REPORT RETRACTION. `create_amendment` exists and is
-  Approver-gated; the exception-amendment verb does not — `ExceptionEventAction`
-  is still exactly open/resolve/reopen and `amends_event_id` has zero writers.
-  `retract_report` does not exist at all: the `0003` schema landed and the
-  domain method did not. WAVE 6, and one of them is ABSENT rather than
-  unreachable.
+* REPORT RETRACTION. RESOLVED AT w156 (WAVE 6), and the claim above is
+  corrected rather than left standing. `retract_report` did not exist at
+  7bb6f8c — the `0003` schema landed and the domain method did not — so it was
+  WRITTEN, in this tree's idiom rather than lifted from the held branch
+  `w122-retraction` (read, never merged; the reasoning is in the long note
+  above the method in `clinical/data_access.py`). It is reachable at
+  `POST /admin/reports/{report_id}/retraction`, APPROVER-gated, which makes it
+  the second route here whose role is not Administrator.
+
+* EXCEPTION AMENDMENT. STILL BLOCKED, re-measured at 7bb6f8c: `create_amendment`
+  (report amendment) exists and is Approver-gated with zero production callers;
+  the exception-AMENDMENT verb does not exist, and cannot be written here,
+  because `exception_events.action` is CHECKed to exactly
+  ('open', 'resolve', 'reopen') and an amendment needs a value the vocabulary
+  does not contain. Widening an inline CHECK is DROP + ADD — a destructive
+  statement — so it is a MIGRATION, which migration `0004`'s own header says is
+  exactly where the held branch stops being additive. w156 was instructed to
+  add no schema and STOPPED rather than guessing. The relationship itself is
+  landed and proved (`test_w149_migration_0004_amendment.py`): same-org
+  accepted, cross-org refused by the database with SQLSTATE 23503, and
+  `amends_event_id` still has zero writers anywhere.
 """
 
 from __future__ import annotations
@@ -489,6 +504,59 @@ class PatientLoginEnrolled(BaseModel):
     already hold."""
 
     patient_login_id: str
+
+
+class RetractionRequest(BaseModel):
+    """
+    w156 (WAVE 6). The body of `POST /admin/reports/{report_id}/retraction`.
+
+    THERE IS NO `org_id` FIELD, NO `report_id` FIELD AND NO `retracted_by`
+    FIELD, and all three absences are the design, the same as every other
+    request model on this surface. The report is the PATH TARGET, resolved
+    inside the caller's own organisation; the organisation is
+    `Session.org_id`; the retractor is `session.user_id`, written to
+    `report_retractions.retracted_by` by `retract_report` itself. A
+    caller-supplied retractor would be a claim, and this repository already
+    settled that the field is REMOVED rather than validated
+    (`ResolutionRequest` in `clinical/endpoints.py`).
+
+    NEITHER FIELD IS VALIDATED HERE, AND THAT IS LOAD-BEARING. Pydantic runs
+    BEFORE the handler and therefore before the role gate inside the domain
+    method. A `min_length=1` on `reason` would be a 422 answered to a caller
+    holding no Approver role, so the refusal would vary with the CONTENT of
+    the body at a point where the caller's authorisation had not been
+    evaluated -- the same defect `_target` was rewritten not to have for the
+    SHAPE of an identifier. The non-empty rule lives in `retract_report`,
+    after the gate, and is reached only by an Approver.
+
+    `replacement_report_id` is `Optional[str]` rather than
+    `Optional[uuid.UUID]` for exactly that reason: a declared UUID is parsed
+    by Pydantic, pre-gate, and a malformed one would answer 422 to a caller
+    who should have seen 403. It goes through `_target` in the handler, which
+    turns a malformed identifier into one that names nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+    # HUMAN RULING E4: optional. NULL means "no replacement report has been
+    # issued", which is a statement the schema's nullable column already
+    # makes; a required field would force a false row into existence.
+    replacement_report_id: Optional[str] = None
+
+
+class RetractionCreated(BaseModel):
+    """
+    The retraction's identifier, and nothing else.
+
+    NOT the reason, not the retractor, not the from-state -- not because a
+    staff Approver may not see them (they may; they just sent one of them),
+    but because a response that re-derived them would be a second view of a
+    row the caller can already read, and this surface renders rather than
+    interprets.
+    """
+
+    retraction_id: str
 
 
 class RoleAssignmentCreated(BaseModel):
@@ -898,3 +966,69 @@ async def read_audit(
         )
         for row in rows
     ]
+
+
+@router.post(
+    "/reports/{report_id}/retraction",
+    status_code=status.HTTP_201_CREATED,
+    response_model=RetractionCreated,
+    summary="Retract a report in the CALLER'S OWN organisation (Approver)",
+    responses={
+        201: {"description": "The retraction is recorded"},
+        400: {
+            "model": ErrorResponse,
+            "description": "Not retractable from this state, empty reason, or already retracted",
+        },
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        403: {"model": ErrorResponse, "description": "Not permitted"},
+        404: {"model": ErrorResponse, "description": "Not found"},
+    },
+)
+async def retract_report(
+    report_id: str,
+    body: RetractionRequest,
+    session: Session = Depends(_get_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> RetractionCreated:
+    """
+    `DataAccess.retract_report`, and nothing else.
+
+    APPROVER, NOT ADMINISTRATOR -- the second route on this surface with a
+    gate of its own, and the gate is the domain method's, unchanged.
+    `/admin/audit` already established that a prefix naming the surface does
+    not dictate the role behind it: that one is Auditor. Retraction is an act
+    on an approved report, and every verb in this platform that acts on an
+    approved report is Approver-gated. The prefix is here so the route is
+    visibly administrative in a census and in an access log, which is what
+    the prefix is for.
+
+    NO CONDITION IS REPEATED HERE. The Approver check, the E1 state rule, the
+    non-empty reason, the E5 already-retracted refusal, the E4 replacement
+    rules and every organisation predicate are all in the domain method. If
+    this handler re-checked the state there would be two answers to "is this
+    retractable", and the day they disagreed the HTTP one would win silently.
+
+    THE 400 CARRIES THE DOMAIN'S OWN MESSAGE, and the check that this is safe
+    is the same one `assign_role` made: every `ValueError` `retract_report`
+    raises is raised strictly AFTER the Approver gate, so only an Approver of
+    THIS organisation can see one. The already-retracted message names the
+    `report_id` THE CALLER JUST SENT, and the state message names a state of
+    a report in the caller's own organisation. Neither names another tenant,
+    another row, or an identifier the caller did not supply.
+
+    THE REPLACEMENT IDENTIFIER GOES THROUGH `_target` for the reason that
+    function's docstring gives: a malformed one becomes an identifier that
+    names nothing, so it takes the same path as an id that exists nowhere,
+    and the role gate still runs first.
+    """
+    target = _target(report_id)
+    replacement = _target(body.replacement_report_id) if body.replacement_report_id is not None else None
+    try:
+        retraction_id = dao.retract_report(session, target, body.reason, replacement)
+    except AuthorizationError:
+        raise _forbidden()
+    except NotFoundError:
+        raise _not_found()
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return RetractionCreated(retraction_id=str(retraction_id))

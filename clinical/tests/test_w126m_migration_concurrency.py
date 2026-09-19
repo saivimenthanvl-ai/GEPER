@@ -162,7 +162,19 @@ class TestOnlyOneRunnerAtATime:
         directory = tmp_path / "m"
         directory.mkdir()
         (directory / "0001_history.sql").write_text(history_sql, encoding="utf-8")
-        (directory / "0002_bad.sql").write_text("SELECT no_such_function();\n", encoding="utf-8")
+        # DECLARES A POST-CONDITION even though it can never satisfy one: since
+        # the 2026-09-19 ruling `migrate` refuses a set holding an undeclared
+        # migration, and it refuses BEFORE taking the advisory lock -- so
+        # without this line the `pytest.raises(Exception)` below would catch a
+        # refusal instead of the server's error, the lock would never have been
+        # taken at all, and "the lock was released after a failure" would be
+        # proved by a run that never locked anything. Measured: without it this
+        # row fails at the last assertion with `(1,) == ()`, because migration
+        # 1 was never applied either.
+        (directory / "0002_bad.sql").write_text(
+            "-- MIGRATION-ASSERT: to_regclass('w126m_never_created') IS NOT NULL\nSELECT no_such_function();\n",
+            encoding="utf-8",
+        )
         migrations = migrate.discover(directory)
 
         def advisory_locks_here(connection) -> int:

@@ -306,8 +306,21 @@ class TestMigratingFromEmpty:
             tmp_path / "m",
             {
                 "0001_history.sql": (migrate.MIGRATIONS_DIR / "0001_schema_migrations.sql").read_text(encoding="utf-8"),
-                "0002_create.sql": "CREATE TABLE w126m_order (a INT);",
-                "0003_alter.sql": "ALTER TABLE w126m_order ADD COLUMN b INT;",
+                # Each declares a post-condition because since the 2026-09-19
+                # ruling every migration must, `migrate` refuses a set where
+                # one does not, and a fixture that could not be applied would
+                # make this row test nothing. The declarations are real ones:
+                # 0003's names the COLUMN, which is the object in-order
+                # application is what produces.
+                "0002_create.sql": (
+                    "-- MIGRATION-ASSERT: to_regclass('w126m_order') IS NOT NULL\nCREATE TABLE w126m_order (a INT);"
+                ),
+                "0003_alter.sql": (
+                    "-- MIGRATION-ASSERT: EXISTS (SELECT 1 FROM pg_attribute WHERE "
+                    "attrelid = to_regclass('w126m_order') AND attname = 'b' "
+                    "AND attnum > 0 AND NOT attisdropped)\n"
+                    "ALTER TABLE w126m_order ADD COLUMN b INT;"
+                ),
             },
         )
         migrations = migrate.discover(directory)
@@ -483,7 +496,19 @@ class TestFailureIsObservableAndNeverRecordedAsSuccess:
                 "0001_history.sql": history_sql,
                 # The table is created and THEN the step fails, so a runner
                 # without a transaction leaves the table behind.
+                #
+                # IT DECLARES A POST-CONDITION, AND THAT IS LOAD-BEARING RATHER
+                # THAN CEREMONIAL. Since the 2026-09-19 ruling `migrate`
+                # refuses a set holding an undeclared migration -- and the
+                # refusal would be swallowed by the `pytest.raises(Exception)`
+                # below, leaving this row green while measuring the wrong
+                # failure entirely: nothing would be applied, so of course the
+                # object and the history row would be absent. Measured, not
+                # reasoned: without this line the row fails two assertions
+                # later on `relation "schema_migrations" does not exist`,
+                # because migration 1 never ran either.
                 "0002_half.sql": (
+                    "-- MIGRATION-ASSERT: to_regclass('w126m_half') IS NOT NULL\n"
                     "CREATE TABLE w126m_half (a INT);\n"
                     "ALTER TABLE w126m_half ADD CONSTRAINT impossible CHECK (no_such_column > 0);\n"
                 ),
@@ -508,6 +533,7 @@ class TestFailureIsObservableAndNeverRecordedAsSuccess:
             {
                 "0001_history.sql": history_sql,
                 "0002_whole.sql": (
+                    "-- MIGRATION-ASSERT: to_regclass('w126m_half') IS NOT NULL\n"
                     "CREATE TABLE w126m_half (a INT);\nALTER TABLE w126m_half ADD CONSTRAINT possible CHECK (a > 0);\n"
                 ),
             },
@@ -594,7 +620,10 @@ class TestFailureIsObservableAndNeverRecordedAsSuccess:
             tmp_path / "m",
             {
                 "0001_history.sql": history_sql,
-                "0002_seed.sql": ("CREATE TABLE w126m_e (note TEXT);\nINSERT INTO w126m_e (note) VALUES ('first');\n"),
+                "0002_seed.sql": (
+                    "-- MIGRATION-ASSERT: to_regclass('w126m_e') IS NOT NULL\n"
+                    "CREATE TABLE w126m_e (note TEXT);\nINSERT INTO w126m_e (note) VALUES ('first');\n"
+                ),
             },
         )
         migrations = migrate.discover(directory)
@@ -660,12 +689,26 @@ class TestFailureIsObservableAndNeverRecordedAsSuccess:
         history_sql = (migrate.MIGRATIONS_DIR / "0001_schema_migrations.sql").read_text(encoding="utf-8")
         directory = _write_migrations(
             tmp_path / "m",
-            {"0001_history.sql": history_sql, "0002_thing.sql": "CREATE TABLE w126m_thing (a INT);\n"},
+            {
+                "0001_history.sql": history_sql,
+                # BOTH spellings declare, and the edited one must: since the
+                # 2026-09-19 ruling `migrate` refuses an undeclared set BEFORE
+                # it compares checksums, so an edited file that dropped its
+                # declaration would raise MigrationNotVerifiable and this row
+                # would never reach the refusal it is about.
+                "0002_thing.sql": (
+                    "-- MIGRATION-ASSERT: to_regclass('w126m_thing') IS NOT NULL\nCREATE TABLE w126m_thing (a INT);\n"
+                ),
+            },
         )
         with scratch_database() as dsn, connect(dsn) as connection:
             migrate.migrate(connection, migrate.discover(directory))
 
-            (directory / "0002_thing.sql").write_text("CREATE TABLE w126m_thing (a INT, b INT);\n", encoding="utf-8")
+            (directory / "0002_thing.sql").write_text(
+                "-- MIGRATION-ASSERT: to_regclass('w126m_thing') IS NOT NULL\n"
+                "CREATE TABLE w126m_thing (a INT, b INT);\n",
+                encoding="utf-8",
+            )
             edited = migrate.discover(directory)
 
             with pytest.raises(migrate.MigrationChecksumMismatch):

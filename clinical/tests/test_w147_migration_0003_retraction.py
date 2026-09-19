@@ -241,10 +241,21 @@ class TestTheMigrationIsOnDiskAndTheSetStillOrders:
     def test_0003_declares_generation_invariants_and_they_are_not_all_table_probes(self):
         """
         CATCHES: WRONG A, at the level of the declaration -- a third migration
-        that adds objects and declares nothing, which is the limitation w146
-        wrote down ("the list is hand-maintained and nothing forces a new
-        migration to declare one"). Keyed by `(version, name)`, so this row
-        also fails if the file is renamed without the key moving with it.
+        that adds objects and declares nothing in the MAP. Keyed by
+        `(version, name)`, so this row also fails if the file is renamed
+        without the key moving with it.
+
+        THE LIMITATION w146 WROTE DOWN IS GONE, and the quotation that used to
+        stand here ("the list is hand-maintained and nothing forces a new
+        migration to declare one") is no longer true of this tree. The human
+        ruled on 2026-09-19 that every migration must declare at least one
+        checkable post-condition, and `clinical/migrate.py::_refuse_undeclared`
+        now enforces it in `migrate`, `adopt_existing` and `inspect_state`.
+        This row survives the ruling because it is stricter than it: the
+        ruling is satisfied by 0003's four `MIGRATION-ASSERT` header lines
+        alone, and those are the bare `to_regclass` vocabulary w143 measured to
+        be blind across generations. What this row demands is the column and
+        constraint probes, which only the map can carry.
 
         NON-VACUITY: a set of table probes alone would be exactly the
         vocabulary w143 measured to be blind, so the column and constraint

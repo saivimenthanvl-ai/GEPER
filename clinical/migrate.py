@@ -114,17 +114,39 @@ DEFAULT_LOCK_TIMEOUT = "30s"
 
 _FILENAME = re.compile(r"^(\d{4})_([a-z0-9][a-z0-9_]*)\.sql$")
 
-# A migration may state, in its own header, what must be TRUE OF THE CATALOG
-# once it has run:
+# EVERY MIGRATION MUST STATE AT LEAST ONE CHECKABLE POST-CONDITION -- what
+# must be TRUE OF THE CATALOG once it has run. A migration states it in its own
+# header:
 #
 #     -- MIGRATION-ASSERT: to_regclass('schema_migrations') IS NOT NULL
 #
-# This is the answer to the sharpest failure this mechanism can have: the
-# history says a version is applied and the database does not have the thing
-# that version was for. A history row is a claim; the assertion is the
-# measurement, read from pg_catalog, and `inspect_state` re-evaluates every
-# applied migration's assertions on every call -- so `/readyz` reports a
-# database whose history lies as NOT ready rather than as ready.
+# or in `_GENERATION_INVARIANTS` below, keyed by (version, name), for a
+# migration whose bytes are frozen. EITHER CHANNEL SATISFIES THE RULE, and
+# `post_conditions()` is the single place that reads both: today
+# `0001_schema_migrations` declares only in its header and holds no map entry,
+# which is correct and must stay legal, while `0002_baseline`'s strongest
+# post-conditions can only live in the map because its bytes are frozen by the
+# `schema.sql` stamp. A rule keyed on either channel ALONE would reject one of
+# those two legitimate migrations.
+#
+# A MIGRATION THAT DECLARES NOTHING IN EITHER CHANNEL IS REFUSED. That is a
+# HUMAN RULING (2026-09-19) and it reverses what this block used to say -- it
+# said "a migration MAY state", and w151 recorded the contradiction rather than
+# guessing past it.
+#
+# WHY THE RULING IS THE RIGHT SHAPE FOR THIS MECHANISM. Post-conditions are the
+# answer to the sharpest failure this module can have: the history says a
+# version is applied and the database does not have the thing that version was
+# for. A history row is a CLAIM; the post-condition is the MEASUREMENT, read
+# from pg_catalog, and `inspect_state` re-evaluates every applied migration's
+# post-conditions on every call -- so `/readyz` reports a database whose
+# history lies as NOT ready rather than as ready. A migration that declares
+# nothing has nothing to re-evaluate, so for that version "ok" degrades to
+# "a row exists", which is the precise failure this mechanism was built to end.
+# MEASURED, not argued: a fifth migration declaring nothing was applied to a
+# scratch database, its table was dropped, and `inspect_state` still answered
+# ok=True at current_version=5. The same vandalism against the same migration
+# carrying ONE header line is caught as `schema_drift` naming the object.
 _ASSERT = re.compile(r"^--\s*MIGRATION-ASSERT:\s*(.+?)\s*$", re.MULTILINE)
 
 
@@ -151,9 +173,16 @@ _ASSERT = re.compile(r"^--\s*MIGRATION-ASSERT:\s*(.+?)\s*$", re.MULTILINE)
 # checksum, break the stamp, force a `schema.sql` edit, and make every
 # already-adopted database raise MigrationChecksumMismatch. The cost of
 # keeping them here instead is that the post-conditions of a migration are no
-# longer all in one file: a future migration that wants generation invariants
-# must add them to this table as well as its own header. That cost is paid
-# knowingly and the non-vacuity test below pins it.
+# longer all in one file: a migration whose post-conditions must be stronger
+# than its own header can carry adds them to this table as well. That cost is
+# paid knowingly and the non-vacuity test below pins it.
+#
+# WHAT IS NOT OPTIONAL IS DECLARING SOMEWHERE. Since the 2026-09-19 ruling a
+# migration must declare at least one post-condition in ONE of the two
+# channels, and `_refuse_undeclared` enforces it. This table is one of the two,
+# not the mandatory one: a migration whose header carries a MIGRATION-ASSERT
+# line and which needs nothing stronger has no business here, and
+# `0001_schema_migrations` is exactly that migration.
 #
 # KEYED BY (version, name), NOT BY VERSION ALONE: the test suite discovers
 # throwaway migration sets from tmp_path that also number their files 0001 and
@@ -398,6 +427,69 @@ def generation_invariants(migration: "Migration") -> Tuple[CatalogInvariant, ...
     return _GENERATION_INVARIANTS.get((migration.version, migration.name), ())
 
 
+# The `kind` a MIGRATION-ASSERT header line gets once it is lifted into a
+# `CatalogInvariant`. It is deliberately NOT "table"/"column"/"constraint":
+# those three say what a probe can SEE, and a header line is an arbitrary
+# boolean expression whose strength this module cannot know.
+ASSERT_KIND = "assert"
+
+
+def post_conditions(migration: "Migration") -> Tuple[CatalogInvariant, ...]:
+    """
+    EVERY checkable post-condition this migration declares, BOTH CHANNELS, as
+    ONE tuple -- and it is the same tuple `_failed_assertions` evaluates and
+    `_refuse_undeclared` counts.
+
+    THAT SHARING IS THE POINT AND NOT A TIDY-UP. The refusal and the evaluation
+    must not be able to disagree about what "declared" means. Two independent
+    readers is how a migration ends up with a post-condition that is
+    syntactically present and never evaluated: the counter sees one, the
+    evaluator iterates a different list and sees none, the migration passes the
+    refusal, and readiness measures nothing -- the original defect wearing a
+    declaration. Counting exactly what the evaluator will iterate makes that
+    state unrepresentable rather than merely untested.
+
+    A header line becomes a `CatalogInvariant` whose `description` IS its
+    expression, which is how `_failed_assertions` has always reported these --
+    so the detail text of `schema_drift` is unchanged by the unification.
+    """
+    from_header = tuple(
+        CatalogInvariant(kind=ASSERT_KIND, description=expression, expression=expression)
+        for expression in migration.assertions
+    )
+    return from_header + generation_invariants(migration)
+
+
+def undeclared(migrations: Sequence["Migration"]) -> Tuple[str, ...]:
+    """Which of these migrations declare no post-condition in EITHER channel."""
+    return tuple(f"{m.version:04d}_{m.name}" for m in migrations if not post_conditions(m))
+
+
+def _undeclared_detail(names: Sequence[str]) -> str:
+    return (
+        "migration(s) "
+        + ", ".join(names)
+        + " declare no catalog post-condition: no `-- MIGRATION-ASSERT:` line in the file "
+        "and no entry in clinical/migrate.py's generation-invariant table. There is "
+        "nothing for this runner to measure against the database for them, so a history "
+        "row claiming they are applied cannot be checked and readiness would report "
+        "'ok' on the strength of that row alone. EVERY migration must declare at least "
+        "one checkable post-condition."
+    )
+
+
+def _refuse_undeclared(migrations: Sequence["Migration"]) -> None:
+    """
+    THE RULING, AS A REFUSAL. Raised by `migrate` and `adopt_existing` BEFORE
+    the advisory lock is taken and before any DDL runs, so a set containing an
+    undeclared migration applies nothing at all rather than applying part of
+    itself and failing verification afterwards.
+    """
+    names = undeclared(migrations)
+    if names:
+        raise MigrationNotVerifiable(_undeclared_detail(names) + " Nothing was applied.")
+
+
 class MigrationError(Exception):
     """Base for every refusal this module makes."""
 
@@ -416,6 +508,20 @@ class MigrationLockUnavailable(MigrationError):
 
 class MigrationChecksumMismatch(MigrationError):
     """An already-applied migration file has been edited since it ran."""
+
+
+class MigrationNotVerifiable(MigrationError):
+    """
+    A migration cannot be checked against a database: it declares no
+    post-condition at all, or it declares one this database cannot evaluate.
+
+    HUMAN RULING, 2026-09-19 -- "every migration must declare at least one
+    checkable post-condition; a migration declaring zero is not allowed". It is
+    its own class rather than a `MigrationSetError` because the set may be
+    perfectly well formed -- correctly named, correctly ordered, no duplicate
+    version -- and still be unverifiable, and an operator has to be able to
+    tell "your filenames are wrong" from "your migration cannot be checked".
+    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -557,10 +663,51 @@ def read_history(connection) -> Tuple[AppliedMigration, ...]:
     return tuple(AppliedMigration(version=r[0], name=r[1], checksum=r[2]) for r in rows)
 
 
+# The savepoint `_evaluate` evaluates each post-condition inside. One constant
+# name, re-used: RELEASE and ROLLBACK TO both act on the most recent savepoint
+# of that name, and the evaluations are strictly sequential.
+_ASSERT_SAVEPOINT = "clinical_migrate_post_condition"
+
+
 def _evaluate(connection, expression: str) -> bool:
+    """
+    Evaluate ONE post-condition, and never let a bad one poison the caller's
+    transaction.
+
+    A DECLARED POST-CONDITION CAN ITSELF BE WRONG -- a typo, a function that
+    does not exist, a catalog view renamed between major versions. Without the
+    savepoint that error aborts the whole transaction, and the damage lands
+    somewhere other than the cause: `adopt_existing` evaluates these INSIDE the
+    transaction it is about to commit, so one malformed header line would
+    surface as an InFailedSqlTransaction from its `commit()`, and `/readyz`
+    -- which reports the exception TYPE and never its text (clinical/app.py) --
+    would answer `schema_state_unreadable` naming a class and nothing else.
+    With the savepoint the failure is caught where it happened and named:
+    which migration, which expression.
+
+    THE SAVEPOINT ONLY WHERE THERE IS A TRANSACTION TO PROTECT. Under
+    autocommit each statement stands alone, so there is nothing to poison --
+    and `SAVEPOINT` outside a transaction block is itself an error (25P01),
+    which would turn this guard into the failure it exists to prevent.
+    """
+    nested = not bool(getattr(connection, "autocommit", False))
     with connection.cursor() as cur:
-        cur.execute(f"SELECT ({expression})")  # noqa: S608 -- from the repo's own files
-        row = cur.fetchone()
+        if nested:
+            cur.execute(f"SAVEPOINT {_ASSERT_SAVEPOINT}")
+        try:
+            cur.execute(f"SELECT ({expression})")  # noqa: S608 -- from the repo's own files
+            row = cur.fetchone()
+        except Exception as exc:  # noqa: BLE001 -- re-raised as a domain error below
+            if nested:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {_ASSERT_SAVEPOINT}")
+            raise MigrationNotVerifiable(
+                f"the post-condition {expression!r} cannot be evaluated against this "
+                f"database: {type(exc).__name__}. A post-condition that does not run is "
+                "not a post-condition -- it is a declaration that satisfies the "
+                "declare-something rule and measures nothing. Fix the expression."
+            ) from exc
+        if nested:
+            cur.execute(f"RELEASE SAVEPOINT {_ASSERT_SAVEPOINT}")
     return bool(row and row[0] is True)
 
 
@@ -575,14 +722,20 @@ def _failed_assertions(connection, migration: Migration) -> Tuple[str, ...]:
     `/readyz`: `inspect_state` calls this for every applied migration on every
     call, so a database that was stamped by an older build of this runner, or
     by a hand-written history row, is reported `schema_drift` instead of ready.
+
+    THE LOOP IS OVER `post_conditions(migration)`, which is the SAME tuple the
+    declare-at-least-one refusal counts. A migration cannot be declared to the
+    refusal and invisible to this loop.
+
+    RAISES `MigrationNotVerifiable` if a declared post-condition cannot be
+    evaluated at all -- see `_evaluate`. "Not true" and "not checkable" are
+    different findings and are not collapsed into one another.
     """
-    failed = [expression for expression in migration.assertions if not _evaluate(connection, expression)]
-    failed.extend(
+    return tuple(
         invariant.description
-        for invariant in generation_invariants(migration)
+        for invariant in post_conditions(migration)
         if not _evaluate(connection, invariant.expression)
     )
-    return tuple(failed)
 
 
 def inspect_state(connection, migrations: Optional[Sequence[Migration]] = None) -> MigrationState:
@@ -591,11 +744,12 @@ def inspect_state(connection, migrations: Optional[Sequence[Migration]] = None) 
 
     It is not enough to compare how MANY rows the history has against how many
     files are on disk; that number is equal in a database whose history was
-    written by a runner that never ran the DDL. So this asks four separate
+    written by a runner that never ran the DDL. So this asks five separate
     questions, in the order in which each makes the next meaningful, and the
     last one reads the CATALOG:
 
-      1. does the history table exist at all?
+      0. does every migration DECLARE a post-condition at all?
+      1. does the history table exist?
       2. is every migration on disk recorded as applied?
       3. does every recorded row's checksum match the bytes on disk?
       4. is every applied migration's stated post-condition actually TRUE of
@@ -604,8 +758,42 @@ def inspect_state(connection, migrations: Optional[Sequence[Migration]] = None) 
     Question 4 is the one that costs a query per assertion and it is the one
     worth having: 1-3 can all be satisfied by a history table somebody filled
     in by hand.
+
+    QUESTION 0 IS NEW (human ruling, 2026-09-19) AND IT IS ASKED FIRST BECAUSE
+    IT IS NOT A QUESTION ABOUT THE DATABASE. It is a fact about the migration
+    SET -- about the code this service is shipping -- so it has the same answer
+    on every database and needs no connection to reach it. Asked last it would
+    be shadowed: a fresh database would answer `schema_not_initialised`, a
+    behind one `schema_migrations_pending`, and the undeclared migration would
+    only become visible once everything else was already right.
+
+    AND THIS IS WHY THE REFUSAL LIVES HERE RATHER THAN IN `migrate`.
+    `clinical/schema.sql` stamps the history itself, in its own transaction, so
+    a FRESH database reaches the current version without `migrate` ever being
+    called. `inspect_state` is the one chokepoint BOTH paths cross -- it is
+    what `/readyz` calls on every probe and what the CLI prints for every
+    verdict -- so a check placed here sees the fresh database, the upgraded
+    one, and the one some older build of this runner stamped years ago.
+    `migrate` and `adopt_existing` refuse as well, earlier and harder (nothing
+    is applied), but neither of them can see a database they never touched.
+
+    The three database-derived fields are deliberately EMPTY in the question-0
+    verdict: no history has been read at that point, and reporting an `applied`
+    tuple nobody measured would be the same kind of unearned claim this whole
+    module exists to refuse.
     """
     on_disk = tuple(migrations) if migrations is not None else discover()
+
+    silent = undeclared(on_disk)
+    if silent:
+        return MigrationState(
+            ok=False,
+            reason="schema_migration_not_verifiable",
+            detail=_undeclared_detail(silent),
+            applied=(),
+            pending=(),
+            current_version=None,
+        )
 
     if not history_table_exists(connection):
         return MigrationState(
@@ -656,7 +844,27 @@ def inspect_state(connection, migrations: Optional[Sequence[Migration]] = None) 
             )
 
     for migration in on_disk:
-        failed = _failed_assertions(connection, migration)
+        try:
+            failed = _failed_assertions(connection, migration)
+        except MigrationNotVerifiable as exc:
+            # A DECLARED-BUT-UNRUNNABLE post-condition is the same verdict as
+            # an undeclared one and deliberately shares its `reason`: in both
+            # cases nothing about this migration has been measured. It is a
+            # SEPARATE detail because the fix is different -- one migration
+            # needs a post-condition written, the other needs its expression
+            # corrected -- and it is NOT `schema_drift`, which would tell an
+            # operator the database is wrong when the repository is.
+            return MigrationState(
+                ok=False,
+                reason="schema_migration_not_verifiable",
+                detail=(
+                    f"migration {migration.version} ({migration.name}) declares a "
+                    f"post-condition that cannot be evaluated: {exc}"
+                ),
+                applied=tuple(sorted(applied)),
+                pending=(),
+                current_version=current,
+            )
         if failed:
             return MigrationState(
                 ok=False,
@@ -782,8 +990,15 @@ def migrate(
     applied (a clean failure, but an opaque one); stamping it silently would
     be a runner deciding on its own that an unknown database is at a known
     version. `--adopt-existing` is that decision made by a person, once.
+
+    REFUSES AN UNVERIFIABLE SET BEFORE IT TOUCHES ANYTHING (human ruling,
+    2026-09-19). The check is first -- ahead of the pre-mechanism probe, ahead
+    of the advisory lock -- so a set containing a migration that declares no
+    post-condition applies NOTHING, rather than applying the declared ones and
+    leaving a half-upgraded database carrying a verdict that will not clear.
     """
     on_disk = tuple(migrations) if migrations is not None else discover()
+    _refuse_undeclared(on_disk)
 
     if not history_table_exists(connection) and schema_is_present(connection):
         raise MigrationStateError(
@@ -852,8 +1067,18 @@ def adopt_existing(
         that a database of the earlier generation cannot have -- so adoption
         proves the database IS this generation rather than merely holding
         tables of the right names.
+
+    A FOURTH REFUSAL SINCE 2026-09-19: an unverifiable migration set. Adoption
+    STAMPS rather than runs, so it is the one path where a migration's
+    post-conditions are the ONLY evidence that the database holds what is being
+    recorded -- an undeclared migration here would be a version stamped on no
+    evidence whatsoever. Checked over the whole set and before anything is
+    touched, for the same reason `migrate` checks the whole set: the code being
+    shipped is unverifiable, and which migration happens to be stamped today
+    does not change that.
     """
     on_disk = tuple(migrations) if migrations is not None else discover()
+    _refuse_undeclared(on_disk)
     by_version = {m.version: m for m in on_disk}
     if BASELINE_VERSION not in by_version or 1 not in by_version:
         raise MigrationSetError(

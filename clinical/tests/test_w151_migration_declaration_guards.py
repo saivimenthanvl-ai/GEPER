@@ -18,35 +18,41 @@ THE SECOND PROBLEM IS A PRODUCTION INTEGRITY PROBLEM AND A SOURCE SCAN IS A
 WEAKER ANSWER TO IT. `clinical/migrate.py::_GENERATION_INVARIANTS` is a
 hand-written `{(version, name): …}` map, so for a migration that is not in it,
 *absence of a declaration is indistinguishable from a declaration that nothing
-is required* — and `inspect_state` reports such a database `ok`. A fifth
-migration that declares nothing therefore leaves `/readyz` answering 200 on a
-database no one has checked. `TestEveryMigrationDeclaresAPostCondition` fails
+is required* — and `inspect_state` reported such a database `ok`. A fifth
+migration that declares nothing therefore left `/readyz` answering 200 on a
+database no one had checked. `TestEveryMigrationDeclaresAPostCondition` fails
 in CI when that happens. **It does not make a deployment refuse**, and the
-difference is the whole point: CI catches a migration somebody wrote, a
-deployment catches a database somebody has.
+difference was the whole point of keeping it: CI catches a migration somebody
+wrote, a deployment catches a database somebody has.
 
-WHY THE RUNNER IS NOT CHANGED BY THIS WAVE, AND IT IS A RECORDED STOP, NOT AN
-OVERSIGHT. Making `inspect_state` treat "declares nothing" as NOT VERIFIABLE
-is a behaviour change to the production readiness path, and it turns on a
-question this tree answers in the opposite direction, three times:
+THE STOP THIS FILE RECORDED IS ANSWERED — DECISION w151-D1, RULED 2026-09-19.
+w151 declined to make the runner refuse, because doing so contradicted three
+places where the tree documented the declaration as OPTIONAL, and recorded the
+question instead of guessing. The human then ruled: "EVERY migration MUST
+declare at least ONE checkable post-condition. A migration declaring zero
+post-conditions is NOT allowed." w160 implemented it, and corrected all of
+those places rather than leaving them to decay:
 
-  * `clinical/migrate.py` (the `_ASSERT` block): "A migration MAY state, in its
-    own header, what must be TRUE OF THE CATALOG once it has run."
-  * `clinical/migrate.py` (the generation-invariants block): "a future
-    migration that WANTS generation invariants must add them to this table as
-    well as its own header."
-  * `clinical/tests/test_w149_migration_0004_amendment.py:256`: "Nothing forces
-    a migration to declare a generation invariant."
+  * `clinical/migrate.py` (the `_ASSERT` block) — said "A migration MAY state";
+    now states the requirement and why either channel satisfies it.
+  * `clinical/migrate.py` (the generation-invariants block) — said "a future
+    migration that WANTS generation invariants"; now separates the choice of
+    CHANNEL, which is free, from declaring at all, which is not.
+  * `clinical/tests/test_w149_migration_0004_amendment.py` — said "Nothing
+    forces a migration to declare a generation invariant."
+  * `clinical/tests/test_w147_migration_0003_retraction.py` — quoted w146's
+    "nothing forces a new migration to declare one". w160 found this fourth
+    one; the brief named three.
 
-So "a migration that declares no post-condition" is, as the tree stands,
-LEGITIMATE — and a runner that refused readiness for one would be refusing a
-case the module documents as allowed. Whether it should remain legitimate is a
-product decision, it is not derivable from the tree, and it is recorded in
-`TestTheRunnerStillAnswersOkAndThatIsTheOpenDECISION` below rather than
-guessed at. Note also that migration `0001_schema_migrations` has no
-`_GENERATION_INVARIANTS` entry today and is entirely correct: a guard keyed on
-map-membership alone would fail on a legitimate migration, which is why the
-guard here reads BOTH declaration channels.
+WHAT REMAINS TRUE, AND IT IS THE REASON THE GUARD BELOW READS BOTH CHANNELS:
+migration `0001_schema_migrations` has no `_GENERATION_INVARIANTS` entry and is
+entirely correct, while `0002_baseline`'s strongest post-conditions can only
+live in the map because its bytes are frozen. A rule keyed on map-membership
+ALONE would reject `0001`; one keyed on the file alone would under-read
+`0002`. `clinical/migrate.py::post_conditions` is now the single production
+function that reads both, and `_failed_assertions` evaluates exactly what it
+returns — so a migration cannot be declared to the refusal and invisible to the
+evaluator.
 
 WHAT EACH GUARD IS VACUOUS AGAINST — stated, because a guard nobody has seen
 fail is decoration:
@@ -221,8 +227,10 @@ def _synthetic_set(tmp_path: pathlib.Path, fifth_sql: str) -> pathlib.Path:
     set -- the day a real `0005` lands this builds a six-migration world.
     NO FILE IS CREATED UNDER `clinical/migrations/`.
     """
+    # parents=True so a caller can build TWO sets under one tmp_path by
+    # passing tmp_path / "silent" and tmp_path / "declared".
     directory = tmp_path / "migrations"
-    directory.mkdir()
+    directory.mkdir(parents=True)
     for path in sorted(migrate.MIGRATIONS_DIR.iterdir()):
         if path.is_file():
             (directory / path.name).write_bytes(path.read_bytes())
@@ -284,41 +292,66 @@ class TestTheSyntheticFifthMigration:
 
 class TestTheRunnerStillAnswersOkAndThatIsTheOpenDECISION:
     """
-    THE MEASUREMENT BEHIND THE STOP, taken against a real database rather than
-    argued from the source.
+    RE-AUTHORED BY w160, WHICH IS THE WAVE THAT OWNS THE CHANGE — the class
+    above asked for exactly that and the class name is kept so the history is
+    followable from the commit that recorded the gap to the one that closed it.
 
-    A database at the silent fifth migration is reported `ok` by
-    `inspect_state` with `current_version` at the fifth — which is precisely
-    the human's sentence: "readiness reports the database healthy merely
-    because the migration version is current". This row asserts TODAY'S
-    behaviour on purpose, so that the gap is measured and visible rather than
-    described.
+    DECISION w151-D1 IS ANSWERED. The human ruled on 2026-09-19: "EVERY
+    migration MUST declare at least ONE checkable post-condition. A migration
+    declaring zero post-conditions is NOT allowed." So `inspect_state` now
+    returns `schema_migration_not_verifiable` and `migrate` refuses outright,
+    and the rows below are INVERTED rather than deleted — deleting them would
+    remove the only live evidence that the gap was ever there, and would leave
+    nothing that fails if the refusal is ever backed out.
 
-    WHEN DECISION w151-D1 IS ANSWERED, THIS ROW IS RE-AUTHORED. If the answer
-    is "a migration that declares nothing is not verifiable", `inspect_state`
-    gains a `schema_migration_not_verifiable` refusal, this row inverts, and
-    the wave that makes that change is the one that owns it. It must not be
-    deleted quietly: deleting it removes the only live evidence that the gap
-    was ever there.
+    WHAT THE GAP WAS, as measured by w151 and reproduced by w160 before the
+    fix: a fifth migration declaring nothing was applied to a scratch database,
+    its table was dropped, and `inspect_state` still answered `ok=True` at
+    `current_version=5`, `pending=()`. The same vandalism against a fifth
+    migration carrying ONE header line was caught as `schema_drift` naming the
+    object. The first two rows below are the two halves of that measurement,
+    each now asserting the refusal instead of the silence.
     """
 
-    def test_a_database_at_the_silent_fifth_migration_is_reported_healthy(self, tmp_path):
+    def test_a_database_at_the_silent_fifth_migration_can_no_longer_be_created(self, tmp_path):
+        """
+        INVERTED. This row used to assert `state.ok is True` on a database at a
+        silent fifth migration. `migrate` now refuses the set before the
+        advisory lock, so the database cannot reach that state at all.
+
+        CATCHES: wrong-first A — a guard that accepts a migration declaring
+        nothing. Both channels of the refusal are asserted, the exception type
+        and the named migration, because "it raised" is satisfied by a runner
+        that raises for any reason at all.
+
+        VACUOUS AGAINST: a database somebody else already stamped — nothing
+        here re-reads an existing history. That is the row two below.
+        """
         directory = _synthetic_set(tmp_path, SILENT_FIFTH_SQL)
         five = migrate.discover(directory)
         fifth = max(m.version for m in five)
 
+        assert undeclared(five), "the fifth migration is not the silent one -- this row proves nothing"
+
         with scratch_database("w151_silent") as dsn, connect(dsn) as connection:
-            applied = migrate.migrate(connection, five)
+            with pytest.raises(migrate.MigrationNotVerifiable) as excinfo:
+                migrate.migrate(connection, five)
+            connection.rollback()
+
+            # NOTHING WAS APPLIED -- the refusal is before the lock, not after
+            # a partial run. Asserted against the database, not the exception.
+            assert not migrate.history_table_exists(connection)
+            assert not migrate.schema_is_present(connection)
+
+            # ...and the verdict names the same thing, so /readyz says it too.
             state = migrate.inspect_state(connection, five)
             connection.rollback()
 
-        assert applied == tuple(m.version for m in five), applied
-        # The declaration guard sees it...
-        assert undeclared(five), "the fifth migration is not the silent one -- this row proves nothing"
-        # ...and the runner does not.
-        assert state.ok is True, state.detail
-        assert state.current_version == fifth
-        assert state.pending == ()
+        assert f"{fifth:04d}_{SILENT_FIFTH_NAME}" in str(excinfo.value)
+        assert "Nothing was applied." in str(excinfo.value)
+        assert state.ok is False
+        assert state.reason == "schema_migration_not_verifiable"
+        assert f"{fifth:04d}_{SILENT_FIFTH_NAME}" in (state.detail or "")
 
     def test_the_positive_twin_a_declared_fifth_migration_is_also_healthy(self, tmp_path):
         """
@@ -360,25 +393,70 @@ class TestTheRunnerStillAnswersOkAndThatIsTheOpenDECISION:
         assert declared_state.reason == "schema_drift"
         assert "w151_silent_fifth" in (declared_state.detail or "")
 
-    def test_the_silent_fifth_migration_is_not_evaluated_at_all(self, tmp_path):
+    def test_the_silent_fifth_migration_is_caught_even_on_a_database_already_stamped(self, tmp_path):
         """
-        THE MIRROR, and it is the finding stated as a measurement: the same
-        vandalism against the SILENT fifth migration leaves readiness saying
-        ok. Nothing in this file can fix that; only the runner can.
+        INVERTED, AND IT IS THE HALF THAT MATTERS MOST. This row used to say:
+        drop the silent fifth migration's table and readiness still answers
+        `ok=True` at the fifth version. "Nothing in this file can fix that;
+        only the runner can" — the runner now does.
+
+        THE DATABASE IS BUILT WITH THE DECLARED TWIN AND THEN VERIFIED AGAINST
+        THE SILENT ONE, which is the only way to reach the state at all now
+        that `migrate` refuses the silent set. It is also the REAL scenario
+        rather than a contrivance: a database stamped by a build of this
+        runner that predates the ruling, sitting under a build that carries it.
+        Such a database exists in the world and `migrate` can never see it,
+        because it has nothing pending — `inspect_state` is the only thing that
+        can, which is exactly why the refusal lives there.
+
+        CATCHES: wrong-first E — a readiness probe that still reports healthy
+        for a zero-post-condition migration; and, with the row above, wrong-
+        first C, since a refusal placed in `discover()` would have made this
+        state unreachable for the wrong reason (it would also have broken
+        `--status`, which is asserted separately in the w160 file).
+
+        VACUOUS AGAINST: the strength of a declaration. A fifth migration
+        declaring `SELECT true` satisfies the refusal and measures nothing;
+        that limit is stated in this file's header and is not closed here.
         """
-        directory = _synthetic_set(tmp_path, SILENT_FIFTH_SQL)
-        five = migrate.discover(directory)
+        silent = migrate.discover(_synthetic_set(tmp_path / "silent", SILENT_FIFTH_SQL))
+        declared = migrate.discover(_synthetic_set(tmp_path / "declared", DECLARED_FIFTH_SQL))
+
+        # The two sets differ in ONE header line and in nothing else: same
+        # versions, same names, same DDL. Without this the row could be
+        # comparing two unrelated worlds.
+        assert [m.version for m in silent] == [m.version for m in declared]
+        assert [m.name for m in silent] == [m.name for m in declared]
+        assert undeclared(silent) and undeclared(declared) == []
 
         with scratch_database("w151_nodrift") as dsn, connect(dsn) as connection:
-            migrate.migrate(connection, five)
+            migrate.migrate(connection, declared)
+            # the database is genuinely at the fifth version and genuinely ok
+            healthy = migrate.inspect_state(connection, declared)
+
+            # THE HISTORY IS RESTAMPED with the SILENT file's own checksum, so
+            # this row measures the declaration rule and not the checksum
+            # check. Without it the two files differ, and
+            # `schema_migration_checksum_mismatch` would fire first and make
+            # the row green for a reason that has nothing to do with the
+            # ruling -- measured, by sabotaging the refusal and watching it
+            # report exactly that. This is also what an older build of the
+            # runner would genuinely have written.
+            fifth = max(silent, key=lambda m: m.version)
             with connection.cursor() as cur:
-                cur.execute("DROP TABLE w151_silent_fifth")
+                cur.execute(
+                    f"UPDATE {migrate.HISTORY_TABLE} SET name = %s, checksum = %s WHERE version = %s",
+                    (fifth.name, fifth.checksum, fifth.version),
+                )
             connection.commit()
-            state = migrate.inspect_state(connection, five)
+
+            state = migrate.inspect_state(connection, silent)
             connection.rollback()
 
-        assert state.ok is True, state.detail
-        assert state.current_version == max(m.version for m in five)
+        assert healthy.ok is True, healthy.detail
+        assert state.ok is False, "a stamped database at a silent migration is still reported ready"
+        assert state.reason == "schema_migration_not_verifiable"
+        assert f"{max(m.version for m in silent):04d}_{SILENT_FIFTH_NAME}" in (state.detail or "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

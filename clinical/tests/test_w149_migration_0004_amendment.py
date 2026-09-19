@@ -253,9 +253,19 @@ class TestTheMigrationIsOnDiskAndTheSetStillOrders:
     def test_0004_declares_generation_invariants_and_one_of_them_is_the_foreign_key(self):
         """
         WRONG E, and it is a row about `clinical/migrate.py`, not about the
-        DDL. Nothing forces a migration to declare a generation invariant; a
-        0004 that declared none would pass every other row in this file,
-        because the objects would all be there.
+        DDL. A 0004 that declared no GENERATION INVARIANT would pass every
+        other row in this file, because the objects would all be there.
+
+        CORRECTED 2026-09-19 (human ruling, implemented by w160): it is no
+        longer true that "nothing forces a migration to declare" — every
+        migration must declare at least one post-condition in ONE of the two
+        channels, and `clinical/migrate.py::_refuse_undeclared` enforces it.
+        This row is still needed and is NOT that rule: 0004 satisfies the rule
+        through its own header lines alone, so the ruling would be met by a
+        0004 with an empty `_GENERATION_INVARIANTS` entry. What this row
+        demands is the STRONGER declaration — the composite foreign key, which
+        no `to_regclass` header line can express. The rule sets a floor; this
+        row sets 0004's ceiling.
 
         The FK invariant is asserted specifically because it is the strong
         one: it cannot be satisfied without the unique key either (PostgreSQL

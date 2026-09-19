@@ -509,6 +509,44 @@ class TestTheRouteCensus:
             # CHECK, which is a destructive schema change; w156 STOPPED and
             # carded it rather than inventing a vocabulary.
             ("/admin/reports/{report_id}/retraction", ("POST",)),
+            # w157 (WAVE 7). THE LABORATORY BENCH SURFACE -- the first routes
+            # this service has ever served for ANY operational stage of the
+            # `Order -> Sample -> Processing -> QC -> Interpretation -> Review
+            # -> Report` chain. Before them the served surface touched exactly
+            # one stage of that chain, and only its last verb (retraction).
+            #
+            # Measured at 764d646 by an ALIAS-RESOLVING ast.Call census over
+            # every non-test module -- a bare-name scan misses `from x import
+            # f as _f`, and grep credits prose -- `receive_sample` and
+            # `record_qc` each had ZERO production call sites while both were
+            # already gated, state-checking, audited and domain-tested.
+            #
+            # LAB TECHNICIAN, NOT ADMINISTRATOR AND NOT APPROVER. The third
+            # distinct role to reach this service's surface, and the prefix
+            # `/lab` names the surface rather than the gate, exactly as
+            # `/admin` does for `/admin/audit` (Auditor) and the retraction
+            # route (Approver).
+            #
+            # THE ORDER STAGE IS DELIBERATELY NOT HERE. `create_order`,
+            # `place_order` and `cancel_order` are all Orderer-gated, complete
+            # and callerless, but `create_order` requires a `test_id` foreign
+            # key into `tests` -- a table with no `DataAccess` method of any
+            # kind, measured over every method of the class by syntax tree. Who
+            # may define a test panel is a product decision nobody has made, so
+            # w157 STOPPED and carded the Order stage rather than mounting the
+            # middle of a severed chain.
+            #
+            # AND THE RELEASE ROUTE IS DELIBERATELY NOT HERE EITHER, which is
+            # the larger absence. `_release_report` still has zero production
+            # call sites, so the three patient report surfaces still return
+            # empty for every patient. Who may release and from which state are
+            # both derivable; the `consumer` is not, and `schema.sql`'s own
+            # comment on that column says why -- "free text pending the
+            # delivery paths of a later commit; enumerating it now would fix a
+            # vocabulary before the paths exist". w157 declined to fix it by
+            # accident. See clinical/workflow_endpoints.py.
+            ("/lab/orders/{order_id}/samples", ("POST",)),
+            ("/lab/samples/{sample_id}/qc", ("POST",)),
         }
     )
 
@@ -531,10 +569,11 @@ class TestTheRouteCensus:
         # w152, which added the four administrative routes; 19 from w154,
         # which added the role-revocation route; 20 from w155, which added
         # patient credential issuance; 21 from w156, which added report
-        # retraction. The number is checked against
+        # retraction; 23 from w157, which added the two laboratory bench
+        # routes. The number is checked against
         # the EXPECTED set above, which is what actually names them — this row
         # exists only to refuse the empty and wrapper-shaped answers.
-        assert len(census) == 21, census
+        assert len(census) == 23, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

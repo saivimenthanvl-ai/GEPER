@@ -809,6 +809,16 @@ class TestTheShapeThatMakesItInert:
             "clinical.admin_endpoints",
             "clinical.portal_endpoints",
             "clinical.auth_endpoints",
+            # w157 (WAVE 7). THE SIXTH. This list is the "every route this app
+            # serves is defined in one of these" claim above, and that claim is
+            # a CENSUS -- so it grows with the surface or it silently stops
+            # covering it. `clinical/workflow_endpoints.py` defines the two
+            # laboratory bench routes; adding it here would NOT have failed
+            # this row, which is exactly why it had to be added deliberately:
+            # a module missing from this tuple is not scanned at all, and an
+            # unscanned module is where a `provision_organisation` call would
+            # go unnoticed.
+            "clinical.workflow_endpoints",
         ):
             try:
                 module = __import__(module_name, fromlist=["*"])

@@ -73,6 +73,7 @@ from clinical.admin_endpoints import router as admin_router
 from clinical.auth_endpoints import router as auth_router
 from clinical.endpoints import router, session_router
 from clinical.portal_endpoints import router as portal_router
+from clinical.workflow_endpoints import router as workflow_router
 
 _DSN_ENV = "CLINICAL_DSN"
 
@@ -156,6 +157,32 @@ app.include_router(session_router)
 # only human-role writer. That deadlock is Wave 3's. Until it lands these
 # routes are IMPLEMENTED + UNREACHABLE and are classified that way.
 app.include_router(admin_router)
+
+# w157 (WAVE 7). THE LABORATORY BENCH SURFACE -- the Sample and QC stages of
+# the `Order -> ... -> Report` chain, and the first routes this service has
+# ever served for any operational stage of it.
+#
+# Measured at 764d646 by an ALIAS-RESOLVING ast.Call census over every non-test
+# module: `receive_sample` and `record_qc` each had ZERO production call sites,
+# while both were gated, state-checking, audited and tested at the domain
+# layer. The missing link was the outermost one, as it was in thirteen of the
+# fourteen capabilities w150 counted.
+#
+# Mounted ALONGSIDE, never through, exactly as the portal, auth and
+# administrative routers are. It adds no dependency to any router above and
+# none of them imports it. What it DOES import is `clinical.endpoints`'s
+# `_get_session`/`_get_data_access` and `clinical.admin_endpoints`'s three
+# refusal helpers -- the SAME staff dependency and the SAME three refusals, so
+# there is no second security policy and no second refusal vocabulary.
+#
+# NEITHER ROUTE IS REACHABLE BY A REAL DEPLOYMENT YET, and the reason is
+# upstream of them: the first-administrator deadlock is unchanged, and the
+# ORDER stage they act on has no production entry point at all -- `create_order`
+# requires a `test_id` foreign key into `tests`, a table with no DataAccess
+# writer of any kind. Both are IMPLEMENTED + UNREACHABLE and are classified
+# that way. See clinical/workflow_endpoints.py for the full measurement and for
+# what this wave STOPPED, release included.
+app.include_router(workflow_router)
 
 
 @app.get("/healthz", tags=["health"], summary="Liveness probe")

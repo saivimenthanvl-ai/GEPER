@@ -365,13 +365,28 @@ class TestTheSurfaceIsMounted:
         NOT under /admin is checked to be one of the four already-known
         non-administrative families. A fifth family appearing here means the
         surface grew somewhere this wave did not look.
+
+        w157 (WAVE 7) ADDED THE FIFTH FAMILY AND THIS GUARD IS WHAT MADE IT
+        SAY SO. `/lab/` is the laboratory bench surface — `POST
+        /lab/orders/{order_id}/samples` and `POST /lab/samples/{sample_id}/qc`,
+        the Sample and QC stages of the operational chain, `Lab technician`-
+        gated inside the domain method. It is listed here DELIBERATELY rather
+        than by widening the predicate, because the whole value of this row is
+        that an undeclared family fails it: the guard fired on the wave that
+        added one, which is the guard working, and the fix is a declaration
+        rather than a relaxation.
+
+        The historical claim the row exists to protect is UNCHANGED and is
+        still true: at w150 zero of the seventeen served routes were
+        administrative. `/lab/` is not administrative either.
         """
         from clinical.app import app
         from clinical.tests.test_w132_structural_guards import served_routes
 
         non_admin = {path for path, _ in served_routes(app) if not path.startswith("/admin/")}
         assert non_admin and all(
-            path.startswith(("/auth/", "/portal/", "/exceptions/", "/healthz", "/readyz")) for path in non_admin
+            path.startswith(("/auth/", "/portal/", "/exceptions/", "/lab/", "/healthz", "/readyz"))
+            for path in non_admin
         ), sorted(non_admin)
 
     def test_every_administrative_route_requires_the_staff_session_dependency(self):

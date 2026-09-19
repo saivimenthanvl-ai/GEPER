@@ -2609,7 +2609,22 @@ class DataAccess:
         requires_session=True,
         details_builder=lambda params, result: {
             "order_id": str(params.get("order_id")),
-            "type": params.get("type"),
+            # w157. WAS `params.get("type")`, WHICH IS NOT A PARAMETER OF THIS
+            # METHOD. `auditable` builds `params` by binding the ORIGINAL
+            # function's signature (`sig.bind(self, *args, **kwargs)`), so its
+            # keys are the real parameter names -- and this one is
+            # `sample_type`. Every `sample_received` audit row this repository
+            # has ever written therefore recorded `"type": null`, for every
+            # specimen, silently: the row landed, the count was right, and the
+            # one clinical fact it carried was absent.
+            #
+            # Nothing observed it. No test asserted on this action's details at
+            # all, and no production caller existed to write a row in the first
+            # place (zero call sites at 764d646) -- which is why wiring the
+            # route is what surfaced it. The OUTPUT key stays `"type"`, because
+            # that is the column it describes (`samples.type`); only the lookup
+            # is corrected.
+            "type": params.get("sample_type"),
         },
     )
     @transactional
@@ -7663,8 +7678,7 @@ class DataAccess:
         auditable=True,
         resource_id_param="report_id",
         reason=(
-            "retraction is a deliberate safety act on a report that was validly approved; "
-            "the record must name which"
+            "retraction is a deliberate safety act on a report that was validly approved; the record must name which"
         ),
         details_builder=lambda params, result: {
             "report_id": str(params.get("report_id")),

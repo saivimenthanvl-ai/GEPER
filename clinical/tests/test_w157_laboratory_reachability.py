@@ -1661,8 +1661,10 @@ class TestTheRouteCensusGrewByExactlyTwo:
         }
         # The route census keeps that list honest: every served route is
         # defined in one of those seven. 23 at 44d624b; 26 from w162, which
-        # added registration, consent and withdrawal.
-        assert len(served_routes(app)) == 26, served_routes(app)
+        # added registration, consent and withdrawal; 27 from w164, which
+        # added TOTP enrolment -- on `clinical/admin_endpoints.py`, a module
+        # already in the set above, so the needle's search is not narrowed.
+        assert len(served_routes(app)) == 27, served_routes(app)
         sites = {path for path, _ in _call_sites("_release_report")}
         assert sites & modules == set(), sites
         # The needle's single origin, proved rather than asserted.

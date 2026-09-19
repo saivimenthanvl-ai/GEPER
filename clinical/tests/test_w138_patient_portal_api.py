@@ -1019,11 +1019,15 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
         # credential ISSUANCE, which w152 had stopped on spec 16 and which the
         # human's Wave 5 dispatch then instructed in terms (see
         # hive/agents/god/w155-decision-cards.md, Card 3 -- the tension with
-        # 16 is recorded, not dissolved). TOTP enrolment is still stopped, on
-        # who supplies the secret and where the cipher key lives, and
-        # `terminate_session` still has no route. At least one must be present
-        # or the scan above is an absence over a vocabulary that no longer
-        # exists.
+        # 16 is recorded, not dissolved). w164 wired TOTP ENROLMENT: the two
+        # things it was stopped on -- who supplies the secret, and where the
+        # cipher key lives -- were both answered FROM THE REPOSITORY (the
+        # method generates the secret; the key comes from the environment,
+        # exactly as `clinical/bootstrap.py` already rules for the database
+        # passwords), so the stop was lifted by evidence rather than by a
+        # guess. `terminate_session` still has no route. At least one must be
+        # present or the scan above is an absence over a vocabulary that no
+        # longer exists.
         admin_body = _body(clinical.admin_endpoints)
         wired = [name for name in administrative if f"dao.{name}" in admin_body]
         assert wired == [
@@ -1031,6 +1035,7 @@ class TestThePatientSurfaceIsSixRoutesAndAcceptsNoPatientIdentifier:
             "set_patient_login_disabled",
             "set_user_disabled",
             "assign_role",
+            "enrol_totp",
         ], wired
 
     def test_patient_credential_ISSUANCE_is_wired_ONLY_on_the_administrative_router(self):

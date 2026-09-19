@@ -94,6 +94,26 @@ CREATE TABLE users (
     totp_secret             TEXT,
     totp_enrolled_at        TIMESTAMPTZ,
 
+    -- w164 (migration 0006): THE REPLAY GUARD, and it is the only place
+    -- one-time use of a TOTP code can live. A code is valid for its whole
+    -- 30-second step -- three steps, with the one-step skew allowance
+    -- data_access.py::TOTP_WINDOW_STEPS carries -- so refusing a code that has
+    -- already been accepted means REMEMBERING which step was spent. RFC 6238
+    -- 5.2: "the verifier MUST NOT accept the second attempt of the OTP
+    -- generated for the same time-step".
+    --
+    -- THE STEP NUMBER, NOT THE CODE. Storing the last accepted code would
+    -- store a credential and would be weaker besides: it refuses only the code
+    -- it saw, so the PREVIOUS step's code -- still inside the window and still
+    -- arithmetically valid -- would be admitted after it. A step counter is
+    -- monotonic, so everything at or before the last accepted step is refused
+    -- at once. BIGINT because a step is unix_seconds/30, which leaves INTEGER
+    -- in 2038.
+    --
+    -- NULL means "no code has been accepted yet". enrol_totp sets it back to
+    -- NULL, so a new authenticator does not inherit the old one's spent steps.
+    totp_last_used_step     BIGINT,
+
     -- Reset to 0 only by a successful login BY THIS USER (data_access.py::
     -- login). Per-user by construction, so one account's successful login
     -- cannot clear another account's counter -- an attacker holding one valid
@@ -2328,4 +2348,5 @@ INSERT INTO schema_migrations (version, name, checksum) VALUES
     (2, 'baseline',          'cc842c3943b7aa1e5786d638eff742f63fd47ce5a5048d7321036234a5290af8'),
     (3, 'report_retraction', 'd0e0ae8d149aa20aea64e18e47424f48efb63d0a7ccdd5cbfd9b3f8016202204'),
     (4, 'exception_amendment', 'a379abc3cf0a81da3af438f4bc092648ab196d1c53e5039cef106a02200743a0'),
-    (5, 'exception_amendment_vocabulary', 'b2569f6f9927c82e8dd3c66142b053cd25efa8100abeeec607fc625fcc626de0');
+    (5, 'exception_amendment_vocabulary', 'b2569f6f9927c82e8dd3c66142b053cd25efa8100abeeec607fc625fcc626de0'),
+    (6, 'totp_replay_guard', '3db752c93973912b85076708d08f120b7062dcb6e8d949720fee43ff03fead94');

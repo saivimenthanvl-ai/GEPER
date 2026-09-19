@@ -154,6 +154,28 @@ def _migrations_below_five() -> tuple:
     return tuple(m for m in migrate.discover() if m.version < VOCABULARY_VERSION)
 
 
+def _migrations_through_five() -> tuple:
+    """
+    The real set, stopped AT 0005 -- the missing other half of the helper
+    above, and its absence was a latent defect in this file rather than a new
+    requirement.
+
+    MEASURED at w164, the first wave to add a migration after this one. Two
+    rows below built their "generation 5" side with `migrate.discover()` or a
+    bare `migrate.migrate(connection)`, which applies EVERYTHING ON DISK. While
+    0005 was the last migration those were the same set, so the rows passed and
+    said what they meant. The moment 0006 landed they compared generation 4
+    with generation SIX, and reported 0006's column, its type and its four
+    INHERITED column privileges as 0005's blast radius -- a scope claim about
+    0005 that any later, unrelated migration could falsify.
+
+    The comment on `_migrations_below_five` had already seen the hazard from
+    one side ("so a later migration 0006 does not silently join it"); this is
+    the other side of the same sentence.
+    """
+    return tuple(m for m in migrate.discover() if m.version <= VOCABULARY_VERSION)
+
+
 def _the_migration() -> migrate.Migration:
     by_version = {m.version: m for m in migrate.discover()}
     assert VOCABULARY_VERSION in by_version, "migration 0005 is not on disk"
@@ -827,14 +849,21 @@ class TestFreshAndUpgradedConverge:
             plant_sentinel(connection)
             assert _constraint_def(connection) == OLD_DEF
 
-            applied = migrate.migrate(connection, migrate.discover())
+            # THROUGH five, not everything on disk. `assert applied ==
+            # (VOCABULARY_VERSION,)` is the tell: this row is about the step
+            # from 4 to 5, and `migrate.discover()` would carry it to whatever
+            # the newest migration is. See `_migrations_through_five`.
+            applied = migrate.migrate(connection, _migrations_through_five())
             assert applied == (VOCABULARY_VERSION,), applied
 
             notes, organisations = read_sentinel(connection)
             assert SENTINEL_NOTE in notes
             assert SENTINEL_ORG in organisations
             assert _constraint_def(connection) == WIDENED_DEF
-            assert migrate.inspect_state(connection).ok is True
+            # Against the SAME set that was applied. A bare `inspect_state`
+            # reads every migration on disk and would correctly report 0006 as
+            # pending on a database this row deliberately stopped at 0005.
+            assert migrate.inspect_state(connection, _migrations_through_five()).ok is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -915,7 +944,12 @@ class TestTheScopeBoundaryHolds:
         with scratch_database("w161_before") as dsn_before, scratch_database("w161_after") as dsn_after:
             with connect(dsn_before) as before, connect(dsn_after) as after:
                 migrate.migrate(before, _migrations_below_five())
-                migrate.migrate(after)
+                # THROUGH five, not everything on disk -- see
+                # `_migrations_through_five`. A bare `migrate(after)` makes
+                # this row's "generation 5" whatever the newest migration
+                # happens to be, so any later wave's objects would be reported
+                # here as 0005's blast radius.
+                migrate.migrate(after, _migrations_through_five())
                 left, right = catalog_of(before), catalog_of(after)
 
         difference = describe_difference("generation 4", left, "generation 5", right)

@@ -573,6 +573,25 @@ class TestTheRouteCensus:
             ("/clinic/patients", ("POST",)),
             ("/clinic/patients/{patient_id}/consents", ("POST",)),
             ("/clinic/consents/{consent_id}/withdrawal", ("POST",)),
+            # w164. THE SECOND FACTOR. `enrol_totp` has been
+            # Administrator-gated, audited and tenant-bound since Phase 1 and
+            # had ZERO production call sites and no route -- AND it could not
+            # have worked if called, because every production `DataAccess` was
+            # built without a cipher and the method raises `ConfigurationError`
+            # without one. Both halves landed in the same commit: a route over
+            # a method that can only raise is not a surface, and a working
+            # method nothing can reach is not a capability.
+            #
+            # ADMINISTRATOR, on the `/admin` prefix, and it takes NO REQUEST
+            # BODY. The domain method used to accept the SECRET as a parameter;
+            # it generates one now, so there is no field through which a weaker
+            # secret could arrive.
+            #
+            # THE PATIENT SECOND FACTOR IS DELIBERATELY NOT HERE.
+            # `patient_logins` has no TOTP column of any kind, and enrolling a
+            # remote patient is a product ruling nobody has made -- see
+            # `test_w155_patient_administration.py::TestPatientMfaIsBlocked`.
+            ("/admin/users/{user_id}/totp", ("POST",)),
         }
     )
 
@@ -597,10 +616,11 @@ class TestTheRouteCensus:
         # patient credential issuance; 21 from w156, which added report
         # retraction; 23 from w157, which added the two laboratory bench
         # routes; 26 from w162, which added the three clinic routes —
-        # registration, consent and withdrawal. The number is checked against
-        # the EXPECTED set above, which is what actually names them — this row
-        # exists only to refuse the empty and wrapper-shaped answers.
-        assert len(census) == 26, census
+        # registration, consent and withdrawal; 27 from w164, which added TOTP
+        # enrolment. The number is checked against the EXPECTED set above,
+        # which is what actually names them — this row exists only to refuse
+        # the empty and wrapper-shaped answers.
+        assert len(census) == 27, census
         assert all(path and path.startswith("/") for path, _ in census), census
         assert all(methods for _, methods in census), census
 

@@ -38,11 +38,13 @@ through.
 
 from __future__ import annotations
 
+import base64
 import datetime as _datetime
 import functools
 import hashlib
 import inspect
 import json
+import os
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -506,22 +508,261 @@ class BcryptHasher:
             return False
 
 
+# ─── the second factor (w164) ────────────────────────────────────────────────
+
+# RFC 6238's default, and pyotp's. Named here rather than written as a literal
+# in two places, because `matching_step` below and the replay guard in
+# `_verify_second_factor` MUST agree about what a step is -- a disagreement
+# would either refuse valid codes or forget spent ones.
+TOTP_STEP_SECONDS = 30
+
+# One step of tolerance either side, the usual allowance for clock skew
+# between an authenticator and this server. It is deliberately small and it is
+# NOT free: a wider window is a larger set of simultaneously valid codes for an
+# attacker to guess at, and every extra step is one more that the replay guard
+# has to burn on a single login. One step each way means a code lives for at
+# most 90 seconds and exactly once.
+TOTP_WINDOW_STEPS = 1
+
+# 20 bytes = 160 bits, which is what RFC 4226 section 4 R6 requires as a
+# minimum for the shared secret, encoded base32 because that is what every
+# authenticator and every otpauth:// URI speaks.
+TOTP_SECRET_BYTES = 20
+
+
 class TotpVerifier(Protocol):
-    def verify(self, secret: str, code: str, at: _datetime.datetime) -> bool: ...
+    """
+    IT RETURNS THE STEP, NOT A BOOLEAN, AND THAT IS THE WHOLE POINT (w164).
+
+    A `-> bool` verifier can say "this code is currently acceptable" and
+    nothing more, which is not enough to refuse a REPLAY: the same code stays
+    acceptable for the rest of its step and, with the skew allowance, into the
+    next. One-time use needs to know WHICH step was accepted so that step can
+    be recorded as spent. RFC 6238 section 5.2 says the same thing -- the
+    verifier "MUST NOT accept the second attempt of the OTP generated for the
+    same time-step".
+
+    So the primitive is "which step does this code belong to, if any", and the
+    boolean is derivable from it. Returning None means no step in the window
+    matched.
+    """
+
+    def matching_step(self, secret: str, code: str, at: _datetime.datetime) -> Optional[int]: ...
 
 
 class PyOtpVerifier:
-    def verify(self, secret: str, code: str, at: _datetime.datetime) -> bool:
+    """
+    The production verifier. `pyotp` is imported lazily, exactly as `bcrypt` is
+    in `BcryptHasher`, so this class can be constructed anywhere.
+
+    CONSTANT-TIME COMPARISON IS pyotp's, NOT REIMPLEMENTED HERE:
+    `pyotp.TOTP.verify` compares through `pyotp.utils.strings_equal`, which is
+    `hmac.compare_digest` over the encoded strings. A `==` on a six-digit code
+    short-circuits on the first wrong digit and leaks the prefix by timing.
+    """
+
+    def matching_step(self, secret: str, code: str, at: _datetime.datetime) -> Optional[int]:
+        if not code:
+            return None
+
         import pyotp
 
-        # valid_window=1 tolerates one step of clock skew either side, the
-        # usual allowance; `at` keeps even this on the injected clock.
-        return bool(pyotp.TOTP(secret).verify(code, for_time=at, valid_window=1))
+        totp = pyotp.TOTP(secret)
+        centre = int(at.timestamp()) // TOTP_STEP_SECONDS
+        # THE WINDOW IS WALKED HERE RATHER THAN HANDED TO `valid_window`,
+        # because `valid_window=1` answers yes without saying WHICH of the
+        # three steps matched -- and the step is the thing the replay guard
+        # records. Each candidate is checked with valid_window=0 against the
+        # instant that step begins, so the arithmetic is identical and the
+        # answer is more specific. Ascending, so the EARLIEST matching step is
+        # the one returned: that is the conservative choice, since a later one
+        # would mark more steps spent than the code actually used.
+        for step in range(centre - TOTP_WINDOW_STEPS, centre + TOTP_WINDOW_STEPS + 1):
+            moment = _datetime.datetime.fromtimestamp(step * TOTP_STEP_SECONDS, tz=_datetime.timezone.utc)
+            if totp.verify(code, for_time=moment, valid_window=0):
+                return step
+        return None
+
+
+def generate_totp_secret() -> str:
+    """
+    A NEW SHARED SECRET, FROM `secrets`, AND THERE IS NO PARAMETER (w164).
+
+    Until this wave `enrol_totp` took the secret as an argument, which meant
+    the CALLER chose it -- and a secret the caller chose can be weak, reused
+    across accounts, or a constant. This is the house's defence-by-absent-
+    parameter applied to the one value in this system that must never be
+    attacker-influenced: there is no argument through which a worse secret
+    could arrive.
+
+    `secrets.token_bytes` is the CSPRNG, not `random`. base32 without padding,
+    which is what `pyotp.TOTP` and every authenticator expect.
+    """
+    return base64.b32encode(secrets.token_bytes(TOTP_SECRET_BYTES)).decode("ascii").rstrip("=")
 
 
 class SecretCipher(Protocol):
     def encrypt(self, plaintext: str) -> str: ...
     def decrypt(self, ciphertext: str) -> str: ...
+
+
+# THE KEY THAT PROTECTS A STORED TOTP SECRET, AND WHERE IT COMES FROM (w164).
+#
+# THIS IS NOT A NEW DECISION. It is the decision `clinical/bootstrap.py`
+# already made for this service, in its own words:
+#
+#     "PASSWORDS COME FROM THE OPERATOR, NOT FROM THIS REPOSITORY. There is no
+#      secret store here and this file does not invent one: the two passwords
+#      are read from the environment and have NO DEFAULTS. A missing one is a
+#      hard refusal, never a fallback ... How the operator supplies them (a
+#      secrets manager, a CI secret, an interactive shell) is a deployment
+#      decision this file deliberately does not make."
+#
+# Four further things in the tree say the same:
+#
+#   * `CLINICAL_DSN` (clinical/endpoints.py, clinical/app.py) already arrives
+#     this way and CARRIES THE DATABASE PASSWORD -- app.py's own comment says
+#     so. The environment is already the channel by which this service is given
+#     the credential that grants full read and write on the very table
+#     `totp_secret` lives in. A key delivered the same way is not weaker than
+#     what is already there; a key delivered any other way would be a second
+#     secret channel for a system that has one.
+#   * `GEPER_API_KEYS` (geper/api/main.py::_load_api_keys) is this repository's
+#     production-credential pattern -- read from the environment, refuse on a
+#     malformed value -- and spec section 23.3 records it as IMPLEMENTED. It is
+#     the spec's ONLY statement about how a service credential is supplied.
+#   * `.env.example` is committed, `.env` is gitignored, and docker-compose
+#     passes these through. The deployment channel exists and is documented.
+#   * `clinical/schema.sql`'s comment on `users.totp_secret` already ruled the
+#     shape: "encrypted at rest by the application before it ever reaches this
+#     column ... Encrypted rather than hashed". Application-side symmetric
+#     encryption was decided by the schema, not by this wave. The `SecretCipher`
+#     Protocol above agrees: it is handed no user, no record and no
+#     organisation, which admits exactly one architecture -- a single
+#     process-wide symmetric key from configuration.
+#
+# GEPER_CLINICAL_PLATFORM_SPEC.md IS SILENT on key management, encryption at
+# rest and rotation (23.1-23.4 and 30.1-30.3; 23.4 covers transport only), and
+# none of the fourteen held branches carries a cipher, a key loader or a
+# ruling. Recorded here so that nobody later reads either as agreement.
+#
+# A LIST, NOT A VALUE, and that is the rotation mechanism rather than a
+# convenience. `MultiFernet` encrypts under the FIRST key and decrypts under
+# ANY, so putting a new key first and keeping the old one second re-protects
+# every new enrolment while every existing row still reads. What is NOT decided
+# here, and is deliberately not invented: who rotates, how often, and what
+# re-encrypts the rows already stored. That is an operator policy and it is
+# carded.
+TOTP_SECRET_KEYS_ENV = "CLINICAL_TOTP_SECRET_KEYS"
+
+
+class FernetSecretCipher:
+    """
+    Authenticated symmetric encryption for the TOTP shared secret.
+
+    FERNET, NOT A CONSTRUCTION OF OUR OWN. It is AES-128-CBC with an
+    HMAC-SHA256 over the ciphertext (encrypt-then-MAC), a random IV per token
+    and a versioned format, from `cryptography` -- the standard library offers
+    no AEAD at all, and the alternative to a maintained implementation here
+    would be writing a cipher for a clinical product, which is not defensible
+    however carefully it is done.
+
+    WHY AUTHENTICATED AND NOT MERELY ENCRYPTED. Without the MAC, anybody who
+    can write to `users.totp_secret` -- which `clinical_app` can, it holds
+    UPDATE -- could replace the token with one whose plaintext they control and
+    then log in with codes they generate. The MAC makes that a decryption
+    FAILURE, and `_verify_second_factor` turns a decryption failure into a
+    refusal.
+
+    THE IMPORT IS LAZY, exactly as `BcryptHasher`'s bcrypt and
+    `PyOtpVerifier`'s pyotp are, so constructing this class costs nothing and
+    a deployment that has not configured a key never touches `cryptography`.
+    The KEY IS VALIDATED EAGERLY, in `__init__`, using only base64 from the
+    standard library -- so a typo in the variable is a refusal at construction
+    rather than a traceback at the first enrolment, without that check itself
+    depending on the optional package.
+    """
+
+    def __init__(self, keys: Sequence[str]) -> None:
+        cleaned: List[str] = [key.strip() for key in keys if key and key.strip()]
+        if not cleaned:
+            raise ConfigurationError(
+                f"{TOTP_SECRET_KEYS_ENV} holds no usable key. It has no default on purpose: a "
+                "layer that invented its own key would encrypt every secret under a value nobody "
+                "knows and could not decrypt them after a restart."
+            )
+        for position, key in enumerate(cleaned, start=1):
+            try:
+                raw = base64.urlsafe_b64decode(key.encode("ascii"))
+            except Exception as exc:  # noqa: BLE001 -- every decode failure is the same refusal
+                raise ConfigurationError(
+                    f"{TOTP_SECRET_KEYS_ENV} entry {position} is not url-safe base64. Generate one "
+                    'with: python -c "from cryptography.fernet import Fernet; '
+                    'print(Fernet.generate_key().decode())"'
+                ) from exc
+            if len(raw) != 32:
+                # The VALUE is never quoted back, here or anywhere else: this
+                # message reaches a log.
+                raise ConfigurationError(
+                    f"{TOTP_SECRET_KEYS_ENV} entry {position} decodes to {len(raw)} bytes; a Fernet key is exactly 32."
+                )
+        self._keys: tuple = tuple(cleaned)
+        self._cipher: Any = None
+
+    def _fernet(self) -> Any:
+        if self._cipher is None:
+            from cryptography.fernet import Fernet, MultiFernet
+
+            self._cipher = MultiFernet([Fernet(key) for key in self._keys])
+        return self._cipher
+
+    def encrypt(self, plaintext: str) -> str:
+        return self._fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+    def decrypt(self, ciphertext: str) -> str:
+        return self._fernet().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+
+
+def default_secret_cipher(raw: Optional[str] = None) -> Optional[SecretCipher]:
+    """
+    The cipher a `DataAccess` gets when nobody injects one.
+
+    READ AT CALL TIME, NOT AT IMPORT. `clinical/app.py` reads its docs flag
+    once at import so the served surface cannot change under a running process;
+    the opposite argument applies here. `_get_data_access` builds a
+    `DataAccess` per request, and a key read once into a module constant would
+    be untestable without reloading the module and would make a restart the
+    only way to observe a corrected variable. Neither costs anything: this is
+    a dictionary lookup and a base64 decode beside a bcrypt verification.
+
+    ABSENT MEANS None, AND MALFORMED MEANS REFUSE. Those are different states
+    and collapsing them is the defect worth naming: treating an unreadable key
+    as "no key" would turn one typo into a deployment that silently cannot
+    enrol and silently cannot verify, reported to the caller as an ordinary
+    authentication failure. Absent is a deployment that has not turned MFA on;
+    malformed is a deployment that thinks it has.
+    """
+    value = os.environ.get(TOTP_SECRET_KEYS_ENV, "") if raw is None else raw
+    value = value.strip()
+    if not value:
+        return None
+    return FernetSecretCipher(value.split(","))
+
+
+@dataclass(frozen=True)
+class TotpEnrolment:
+    """
+    What `enrol_totp` returns: the one moment either value exists in readable
+    form.
+
+    The secret is stored encrypted and is selected by no read method; the
+    backup codes are stored only as bcrypt hashes. Neither can be recovered,
+    which is why re-enrolling is the recovery path and why re-enrolment voids
+    the previous codes.
+    """
+
+    secret: str
+    backup_codes: List[str]
 
 
 # ─── Session ─────────────────────────────────────────────────────────────────
@@ -1094,8 +1335,30 @@ class DataAccess:
         self.__connection = connection
         self._clock: Clock = clock or SystemClock()
         self._hasher: PasswordHasher = password_hasher or BcryptHasher()
-        self._totp: Optional[TotpVerifier] = totp_verifier
-        self._cipher: Optional[SecretCipher] = secret_cipher
+        # w164. THE DEFAULTS ARE WHERE MFA BECAME REACHABLE, and they are here
+        # rather than at the four call sites for a structural reason.
+        #
+        # Measured at 4ab1fbf by an alias-resolving ast.Call census: EXACTLY
+        # FOUR non-test constructions of DataAccess exist --
+        # clinical/endpoints.py:262, geper/api/exception_retry_worker.py:132,
+        # geper/api/submission_worker.py:850 and geper/review/signoff.py:936 --
+        # and all four pass the connection ALONE. Both collaborators were
+        # therefore None in every production process, which is why
+        # `_verify_second_factor` and `enrol_totp` could only ever raise there.
+        #
+        # Editing the four sites would have worked and would have been WORSE:
+        # a fifth site -- a worker, a CLI path, a future router -- would then
+        # be one forgotten keyword away from a DataAccess that cannot verify a
+        # second factor, and nothing would say so until an enrolled user tried
+        # to log in. Defaulting here means there is nothing to remember. The
+        # keyword arguments stay, for tests that inject a stand-in.
+        #
+        # The verifier needs no configuration, so it is unconditional. The
+        # cipher needs a key and has none unless the deployment supplies one,
+        # so `default_secret_cipher` returns None when the variable is unset --
+        # which leaves the fail-closed behaviour below exactly as it was.
+        self._totp: Optional[TotpVerifier] = totp_verifier or PyOtpVerifier()
+        self._cipher: Optional[SecretCipher] = secret_cipher if secret_cipher is not None else default_secret_cipher()
         self._in_transaction = False
 
     # ── internals ────────────────────────────────────────────────────────────
@@ -1259,7 +1522,7 @@ class DataAccess:
 
         row = self._query_one(
             "SELECT user_id, password_hash, failed_login_attempts, locked_until, "
-            "       disabled, totp_secret, is_system_account "
+            "       disabled, totp_secret, is_system_account, totp_last_used_step "
             "FROM users WHERE org_id = %s AND email = %s",
             (org_id, email),
         )
@@ -1271,7 +1534,16 @@ class DataAccess:
             self.log_failed_login(email, org_id, ip_address, reason="unknown_user")
             raise AuthenticationError()
 
-        user_id, password_hash, failed_attempts, locked_until, disabled, totp_secret, is_system = row
+        (
+            user_id,
+            password_hash,
+            failed_attempts,
+            locked_until,
+            disabled,
+            totp_secret,
+            is_system,
+            totp_last_used_step,
+        ) = row
 
         if locked_until is not None and locked_until > now:
             # EQUALISE HERE TOO -- w139. This branch used to be the ONE failure
@@ -1309,8 +1581,12 @@ class DataAccess:
             self.log_failed_login(email, org_id, ip_address, reason="system_account")
             raise AuthenticationError()
 
+        # THE SECOND FACTOR IS CHECKED LAST, AND THE ORDER IS THE POLICY.
+        # `disabled`, `is_system_account` and the lockout all refuse ABOVE
+        # this line, so a principal who has been taken out of service cannot
+        # be let back in by holding a valid code -- the code is never reached.
         if totp_secret is not None:
-            if not self._verify_second_factor(user_id, org_id, totp_secret, totp_code, now):
+            if not self._verify_second_factor(user_id, org_id, totp_secret, totp_code, now, totp_last_used_step):
                 self._register_failed_attempt(user_id, org_id, failed_attempts, now)
                 self.log_failed_login(email, org_id, ip_address, reason="invalid_totp")
                 raise AuthenticationError()
@@ -1373,7 +1649,43 @@ class DataAccess:
         stored_secret: str,
         code: Optional[str],
         now: _datetime.datetime,
+        last_used_step: Optional[int] = None,
     ) -> bool:
+        """
+        THE ONLY PLACE A SECOND FACTOR IS ACCEPTED, AND IT NEVER RETURNS True
+        BY ACCIDENT.
+
+        Read the exits rather than the flow: there are exactly two `return
+        True` statements reachable from here -- one after a step that has not
+        been spent, one inside `_consume_backup_code` after a row was marked
+        used in the same statement that matched it. Every other path returns
+        False or raises, INCLUDING every exception the crypto can produce.
+
+        ONE-TIME USE (RFC 6238 section 5.2). `matching_step` names the step the
+        code belongs to; `users.totp_last_used_step` remembers the last one
+        accepted; a step at or before it is refused. Storing the STEP and not
+        the CODE is what makes the guard monotonic -- remembering only the last
+        code would still admit the PREVIOUS step's code, which the one-step
+        skew window keeps arithmetically valid for another half minute.
+
+        FAIL CLOSED, IN TWO DIFFERENT SHAPES, DELIBERATELY:
+
+          * A MISSING COLLABORATOR RAISES. `ConfigurationError` is an operator
+            fault -- the account has a secret and this process was given no key
+            -- and it must be loud. It is not a login refusal dressed up as one,
+            and it never admits: the caller (`clinical/auth_endpoints.py::
+            _refuse_uniformly`) flattens it into the same 401 every other
+            failure produces, so the loudness reaches the audit trail and the
+            operator without reaching the caller.
+          * A FAILING COLLABORATOR REFUSES. A secret that will not decrypt (a
+            lost key, a rotated-away key, a tampered column) or a verifier that
+            raises is a fault about ONE ROW, not about the process. The broad
+            `except` below is the point rather than a lapse: whatever it
+            catches, `step` stays None and the only paths left are the backup
+            code -- which is exactly the recovery route a lost key needs -- and
+            refusal. There is no arrangement of an exception here that can
+            produce a session.
+        """
         if not code:
             return False
         if self._cipher is None:
@@ -1384,8 +1696,26 @@ class DataAccess:
         if self._totp is None:
             raise ConfigurationError("TOTP is enrolled for this user but no totp_verifier was provided.")
 
-        if self._totp.verify(self._cipher.decrypt(stored_secret), code, now):
+        step: Optional[int]
+        try:
+            step = self._totp.matching_step(self._cipher.decrypt(stored_secret), code, now)
+        except Exception:  # noqa: BLE001 -- see the docstring; a failure here is a refusal, never an admission
+            # AUDITED, because it is otherwise indistinguishable from a wrong
+            # code and it is not the same event: it means this organisation's
+            # stored secrets cannot be read by this process.
+            self._audit("totp_secret_unreadable", org_id, user_id, {})
+            step = None
+
+        if step is not None:
+            if last_used_step is not None and step <= last_used_step:
+                self._audit("totp_code_replayed", org_id, user_id, {"step": str(step)})
+                return False
+            self._execute(
+                "UPDATE users SET totp_last_used_step = %s WHERE user_id = %s AND org_id = %s",
+                (step, user_id, org_id),
+            )
             return True
+
         return self._consume_backup_code(user_id, org_id, code, now)
 
     def _consume_backup_code(
@@ -2255,29 +2585,74 @@ class DataAccess:
         action="totp_enrolled",
         resource_type="totp",
         requires_session=True,
+        # w164. WITHOUT THIS THE AUDIT ROW WOULD HAVE HELD THE CREDENTIALS.
+        # `@auditable` writes `resource_id=str(result)` for any method that
+        # does not declare where its identifier comes from, and this method's
+        # result is the secret and the eight backup codes. At 4ab1fbf that was
+        # latent only because nobody could reach `enrol_totp` at all; making it
+        # reachable makes it reachable too. The identifier of a TOTP enrolment
+        # is the USER it was issued to, which is a parameter, so it is declared
+        # as one -- exactly the defect w120 added this parameter for.
+        resource_id_param="target_user_id",
         details_builder=lambda params, result: {
             "target_user_id": str(params.get("target_user_id")),
-            "backup_codes_issued": len(result) if result else 0,
+            "backup_codes_issued": len(result.backup_codes) if result else 0,
         },
     )
     @transactional
-    def enrol_totp(self, session: Session, target_user_id: uuid.UUID, secret: str) -> List[str]:
+    def enrol_totp(self, session: Session, target_user_id: uuid.UUID) -> TotpEnrolment:
         """
-        Administrator-initiated TOTP enrolment. Returns the backup codes in
-        plaintext ONCE -- this return value is the only moment they exist in
-        readable form. Only bcrypt hashes are stored, so they cannot be
-        recovered, displayed again, or read out of the database by anyone.
+        Administrator-initiated TOTP enrolment.
+
+        THE SECRET IS GENERATED HERE AND THERE IS NO PARAMETER FOR IT (w164).
+        This method used to accept the secret, which meant the caller chose it,
+        and a secret the caller chose can be weak, shared between accounts or a
+        constant. `generate_totp_secret()` takes 160 bits from `secrets`; there
+        is no argument through which a worse one could arrive.
+
+        THE RETURN VALUE IS THE ONLY MOMENT either the secret or the backup
+        codes exist in readable form. The secret is stored encrypted under the
+        deployment's key and is selected by no read method on this class; the
+        codes are stored only as bcrypt hashes. Neither can be recovered,
+        displayed again, or read out of the database by anyone -- an
+        administrator who loses this response re-enrols.
+
+        RE-ENROLMENT VOIDS WHAT CAME BEFORE, and that is a security property
+        rather than tidiness. Before this wave a second enrolment added eight
+        MORE codes beside the old ones, so replacing a compromised
+        authenticator left the compromised account's backup codes working.
+        `totp_last_used_step` is cleared for the mirror-image reason: the new
+        secret's steps have not been spent, and inheriting the old
+        authenticator's counter would refuse valid codes until the clock caught
+        up.
+
+        ATOMIC. `@transactional` wraps the whole body, so the secret, the
+        voiding of the old codes and all eight new rows land together or not at
+        all -- there is no state in which the column has been replaced and the
+        codes have not.
         """
         self._require_role(session, "Administrator")
         self.get_user(session, target_user_id)
         if self._cipher is None:
-            raise ConfigurationError("Enrolling TOTP requires a secret_cipher.")
+            raise ConfigurationError(
+                f"Enrolling TOTP requires a secret cipher; {TOTP_SECRET_KEYS_ENV} is not configured."
+            )
 
         now = self._clock.now()
+        secret = generate_totp_secret()
         self._execute(
-            "UPDATE users SET totp_secret = %s, totp_enrolled_at = %s, updated_at = %s "
+            "UPDATE users SET totp_secret = %s, totp_enrolled_at = %s, totp_last_used_step = NULL, "
+            "                 updated_at = %s "
             "WHERE user_id = %s AND org_id = %s",
             (self._cipher.encrypt(secret), now, now, target_user_id, session.org_id),
+        )
+        # MARKED USED RATHER THAN DELETED, because nothing in this schema
+        # deletes (the D0b ruling; `clinical_app` holds no DELETE on this table
+        # and the REVOKE is explicit). A used row is also the honest record:
+        # the code existed and stopped being valid at a known moment.
+        self._execute(
+            "UPDATE totp_backup_codes SET used_at = %s WHERE user_id = %s AND org_id = %s AND used_at IS NULL",
+            (now, target_user_id, session.org_id),
         )
 
         codes: List[str] = []
@@ -2289,7 +2664,7 @@ class DataAccess:
                 "VALUES (%s, %s, %s, %s, %s)",
                 (uuid.uuid4(), target_user_id, session.org_id, self._hasher.hash(code), now),
             )
-        return codes
+        return TotpEnrolment(secret=secret, backup_codes=codes)
 
     # ── audit reads ──────────────────────────────────────────────────────────
 

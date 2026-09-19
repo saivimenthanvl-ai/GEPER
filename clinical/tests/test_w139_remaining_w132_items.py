@@ -173,6 +173,19 @@ AUTHENTICATED_STAFF_ROUTES = (
     ("POST", "/clinic/patients", {"name": "x", "dob": "1990-01-01", "sex": "F"}),
     ("POST", f"/clinic/patients/{_UNKNOWN_UUID}/consents", {"scope": "testing"}),
     ("POST", f"/clinic/consents/{_UNKNOWN_UUID}/withdrawal", None),
+    # w164. TOTP ENROLMENT. It is here for the reason every row above is, and
+    # the derived comparison below is once again what said so -- it reported
+    # this route as unprobed the moment it was served, which is this class's
+    # whole job.
+    #
+    # IT IS THE SHARPEST ROW IN THE SET, because the thing behind it is a
+    # CREDENTIAL. A refusal that varied by session-lifecycle state here would
+    # tell an anonymous or stale caller whether a named staff account exists,
+    # on the one route whose success hands back a second-factor secret. It
+    # takes NO BODY at all, so `_call` sends none -- which also makes it the
+    # cleanest demonstration that the session dependency is solved before any
+    # body is looked at.
+    ("POST", f"/admin/users/{_UNKNOWN_UUID}/totp", None),
 )
 
 # The administrative paths whose role gate is NOT Administrator. The fixture
@@ -1616,8 +1629,9 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
         # serves, which the assertion below checks against the route census.
         # 10 at w155; 11 from w156, which added the report-retraction route;
         # 13 from w158, which added the two laboratory-bench routes; 16 from
-        # w162, which added the three clinic routes.
-        assert len(AUTHENTICATED_STAFF_ROUTES) == 16, "a staff route left the list without being probed"
+        # w162, which added the three clinic routes; 17 from w164, which added
+        # TOTP enrolment.
+        assert len(AUTHENTICATED_STAFF_ROUTES) == 17, "a staff route left the list without being probed"
         assert any(path.startswith("/auth/logout") for _, path, _ in AUTHENTICATED_STAFF_ROUTES), (
             "the logout route left the list -- it is the entire reason this class exists"
         )
@@ -1642,8 +1656,9 @@ class TestEveryStaffRefusalIsOnePairOnEveryRouteIncludingLogout:
 
         # eight cases across every staff route: 80 at w155, 88 from w156's
         # report-retraction route, 104 from w158's two bench routes, 128 from
-        # w162's three clinic routes. The product, not a hand-kept number.
-        assert len(observed) == 8 * len(AUTHENTICATED_STAFF_ROUTES) == 128, observed
+        # w162's three clinic routes, 136 from w164's TOTP enrolment route.
+        # The product, not a hand-kept number.
+        assert len(observed) == 8 * len(AUTHENTICATED_STAFF_ROUTES) == 136, observed
         assert len(set(observed.values())) == 1, {k: (s, b[:120]) for k, (s, b) in observed.items()}
         assert set(observed.values()) == {THE_REFUSAL}, observed
 

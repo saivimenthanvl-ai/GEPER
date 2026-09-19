@@ -762,6 +762,106 @@ async def set_user_disabled(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+class TotpEnrolled(BaseModel):
+    """
+    THE ONE MOMENT THE SECRET AND THE BACKUP CODES EXIST IN READABLE FORM.
+
+    Neither can be read back: the secret is stored encrypted under the
+    deployment's key and is selected by no read method, and the backup codes
+    are stored only as bcrypt hashes. An administrator who loses this response
+    re-enrols, which is why re-enrolment voids the previous codes.
+
+    `otpauth_uri` IS DELIBERATELY NOT HERE. It would be the convenient thing to
+    return -- it is what an authenticator app scans -- but building one means
+    choosing an issuer label and an account label, which is what a person sees
+    beside a code in their authenticator, and neither has been ruled. The
+    secret is what the protocol needs; the label is presentation, and
+    presentation is out of scope.
+
+    NO `extra="forbid"`, AND THAT IS NOT AN OMISSION. On this surface that
+    setting is the MARKER FOR A REQUEST MODEL -- it is what
+    `test_w152_admin_surface.py::test_structurally_no_route_signature_or_
+    request_model_names_an_organisation` scans for to decide which models a
+    caller can send, and therefore which must never grow an inbound `org_id`.
+    Every response model here (`PatientLoginEnrolled`, `RetractionCreated`,
+    `RoleAssignmentCreated`, `RoleRevoked`, `AuditEntry`, `ErrorResponse`)
+    omits it for the same reason. The first draft of this class carried it,
+    and that guard correctly went red: declaring it would have put an OUTBOUND
+    model inside an INBOUND scan, where the setting governs nothing and the
+    census it feeds would have been wrong about what this surface accepts.
+    """
+
+    secret: str
+    backup_codes: List[str]
+
+
+@router.post(
+    "/users/{user_id}/totp",
+    status_code=status.HTTP_201_CREATED,
+    response_model=TotpEnrolled,
+    summary="Enrol a second factor for a staff user in the CALLER'S OWN organisation",
+    responses={
+        201: {"description": "Enrolled; the secret and the backup codes are returned once and never again"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        403: {"model": ErrorResponse, "description": "Not permitted"},
+        404: {"model": ErrorResponse, "description": "Not found"},
+    },
+)
+async def enrol_totp(
+    user_id: str,
+    session: Session = Depends(_get_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> TotpEnrolled:
+    """
+    `DataAccess.enrol_totp`, and nothing else.
+
+    w164. THE OUTERMOST LINK THAT WAS MISSING. `enrol_totp` has been
+    Administrator-gated, audited and tenant-bound since Phase 1 and had ZERO
+    production callers and no route -- the same shape as thirteen of the
+    fourteen capabilities w150 counted. It also could not have worked if it had
+    been called: every production `DataAccess` was built without a cipher, so
+    the method could only raise. Both halves are fixed in the same commit,
+    because either one alone would be a surface over a method that raises, or a
+    working method nothing can reach.
+
+    THERE IS NO REQUEST BODY, AND THAT IS THE POINT. The domain method used to
+    take the SECRET as a parameter, so the caller chose it. It generates one
+    now, and there is no field through which a weaker one could arrive --
+    defence by absent parameter, applied to the one value in this system that
+    must never be attacker-influenced.
+
+    THE GATE IS NOT HERE. `_require_role(session, "Administrator")` is the
+    first executable statement of the domain method, not a dependency on this
+    route. Measured at w162: a router-side gate is invisible to the entire HTTP
+    surface, and the method is reachable from workers, CLI paths and future
+    routers that never pass through this router.
+    `clinical/tests/test_w164_mfa.py` carries the row that calls the method
+    DIRECTLY with an Orderer session.
+
+    THE ORGANISATION IS NOT HERE EITHER. `user_id` is in the path; the
+    organisation comes from `session.org_id`. `get_user` inside the method
+    binds `WHERE org_id = %s AND user_id = %s`, so a real user in another
+    tenant raises `NotFoundError` and arrives here as the SAME 404 an invented
+    identifier gets.
+
+    IT CAN 500, AND THAT IS CORRECT. `ConfigurationError` -- no key configured
+    -- is deliberately not converted. The caller here is an authenticated
+    Administrator acting inside their own organisation, so there is nobody to
+    leak to, and an operator who has not set `CLINICAL_TOTP_SECRET_KEYS` needs
+    to learn that rather than be told "not found". The LOGIN route is where
+    that exception must be indistinguishable from every other failure, and
+    `clinical/auth_endpoints.py::_refuse_uniformly` already flattens it there.
+    """
+    target = _target(user_id)
+    try:
+        enrolment = dao.enrol_totp(session, target)
+    except AuthorizationError:
+        raise _forbidden()
+    except NotFoundError:
+        raise _not_found()
+    return TotpEnrolled(secret=enrolment.secret, backup_codes=enrolment.backup_codes)
+
+
 @router.post(
     "/patients/{patient_id}/logins",
     status_code=status.HTTP_201_CREATED,

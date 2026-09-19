@@ -1419,18 +1419,35 @@ class TestTheUngatedThreeAreStoppedAndNotWired:
 
 class TestPatientMfaIsBlocked:
     """
-    MFA IS THE EXPECTED STOP, and the prior finding is RE-VERIFIED at 60c48d9
-    rather than inherited. No cryptography was invented.
+    UPDATED AT w164, AND TWO OF ITS FOUR ROWS HAVE INVERTED. Rule 3 applied:
+    fix the claim, not the code.
 
-    PATIENT MFA IS ABSENT: `patient_logins` has no TOTP column of any kind.
-    STAFF MFA IS FAIL-CLOSED-BROKEN: `_verify_second_factor` and `enrol_totp`
-    both raise `ConfigurationError` when the cipher or verifier is `None`, and
-    every production construction of `DataAccess` passes neither — so both are
-    always `None` outside tests. `enrol_totp` additionally takes the SECRET AS
-    A PARAMETER, so the caller generates it.
+    WHAT WAS TRUE AT 60c48d9 AND IS NOW FALSE. Staff MFA was
+    FAIL-CLOSED-BROKEN -- `_verify_second_factor` and `enrol_totp` raised
+    `ConfigurationError` because every production `DataAccess(...)` passed the
+    connection alone -- and `enrol_totp` took the SECRET AS A PARAMETER. Both
+    findings were correct and both are now fixed. `DataAccess.__init__`
+    derives the cipher from `CLINICAL_TOTP_SECRET_KEYS`, which reaches all
+    four construction sites without any of them being edited, and the method
+    generates its own secret. The census that asserted the broken state has
+    moved to `clinical/tests/test_w164_mfa.py`, where it asserts WHERE the
+    cipher comes from instead -- with a row for the key present AND a row for
+    the key absent, so it cannot be satisfied by an empty subject.
 
-    Completing this needs a key-management ruling, a secret-generation ruling,
-    and for patients a schema change. BLOCKED — DECISION REQUIRED.
+    WHAT IS STILL TRUE, AND IS STILL A STOP. PATIENT MFA IS ABSENT:
+    `patient_logins` has no TOTP column of any kind and `patient_login`
+    mentions no second factor. It was not built at w164 and the reason is a
+    PRODUCT ruling rather than a technical gap. `enrol_totp` is
+    Administrator-gated and presumes an administrator sitting with the account
+    holder and a device the organisation controls -- `data_access.py`'s own
+    comment above `patient_login` says so. That assumption does not hold for a
+    patient at home, and nothing in the repository says how a remote patient
+    enrols, what happens when they lose the device, or whether a portal
+    account may be locked out of its own results by a second factor. The spec
+    is silent: section 23.1 names MFA for "Approver and Administrator" and
+    decision 7 reads "MFA for all roles or privileged only -- All roles",
+    which is a statement about STAFF ROLES; a patient holds no role. BLOCKED
+    -- DECISION REQUIRED, and nothing was guessed.
     """
 
     def test_the_patient_credential_table_has_no_second_factor_column(self):
@@ -1443,12 +1460,20 @@ class TestPatientMfaIsBlocked:
         users_start = schema.index("CREATE TABLE users")
         assert "totp" in schema[users_start : schema.index(");", users_start)].lower()
 
-    def test_no_production_construction_of_the_data_layer_supplies_a_cipher_or_verifier(self):
+    def test_every_production_construction_of_the_data_layer_still_passes_the_connection_alone(self):
         """
-        THE CENSUS, by syntax tree. If one ever does, staff MFA stops being
-        unreachable-and-fail-closed and becomes live — at which point this
-        row fails and somebody has to look, which is exactly what should
-        happen.
+        THE CENSUS, INVERTED RATHER THAN DELETED. It used to prove that no
+        production site supplies a cipher, and read that as MFA being
+        unreachable. Both halves are still measured; only the conclusion
+        changed, because the cipher now arrives through the CONSTRUCTOR
+        DEFAULT rather than through a keyword.
+
+        THIS IS THE STRONGER PROPERTY, not a weakening. Four sites passing the
+        connection alone means there is no fifth site that can forget: a
+        worker, a CLI path or a future router that builds a `DataAccess`
+        inherits the configured cipher without knowing it exists.
+        `test_w164_mfa.py::TestTheKeyComesFromTheEnvironment` is where the
+        default itself is proved, in both directions.
         """
         supplied = []
         constructions = 0
@@ -1469,20 +1494,22 @@ class TestPatientMfaIsBlocked:
         assert constructions >= 4, f"only {constructions} production constructions found; the census is blind"
         assert supplied == [], supplied
 
-    def test_enrol_totp_takes_the_secret_as_a_parameter(self):
-        """The reason this cannot be finished by wiring: the method does not
-        GENERATE a secret, it accepts one. Who generates it, and where the
-        cipher key lives, are the rulings that are missing."""
+    def test_enrol_totp_generates_the_secret_rather_than_accepting_one(self):
+        """
+        THE INVERSION OF THE w155 FINDING, kept here beside the census that
+        found it. A secret the caller supplies is a secret the caller chose;
+        the method now takes no such parameter, so there is no route by which
+        a weaker one could arrive.
+        """
         tree = ast.parse(DATA_ACCESS_MODULE.read_text(encoding="utf-8"))
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "enrol_totp")
-        assert "secret" in [a.arg for a in node.args.args], [a.arg for a in node.args.args]
-        assert "secrets.token" not in ast.unparse(node).replace("token_hex(5)", ""), (
-            "a secret is generated inside the method after all -- re-read the finding"
-        )
+        names = [a.arg for a in node.args.args]
+        assert "secret" not in names, names
+        assert "generate_totp_secret" in ast.unparse(node)
 
     def test_there_is_no_patient_second_factor_code_path_at_all(self):
         """
-        Not "the tests do not cover it" — there is no code. The patient
+        Not "the tests do not cover it" -- there is no code. The patient
         authentication method never mentions a second factor.
         """
         tree = ast.parse(DATA_ACCESS_MODULE.read_text(encoding="utf-8"))

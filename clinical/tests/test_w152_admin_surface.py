@@ -1193,6 +1193,14 @@ class TestTheHandlersComposeNoDecoratedCalls:
             # Auditor): the /admin prefix names the surface, not the role.
             # One decorated call, like every other handler here.
             "retract_report",
+            # w164. TOTP enrolment, and it is the sharpest case this row has
+            # had. The obvious wrong version is a handler that enrols and then
+            # reads the user back to return `totp_enrolled_at` -- two decorated
+            # calls, so `@auditable` would commit the ENROLMENT'S audit row and
+            # then fail, leaving an audit trail that records a second factor
+            # nobody holds. It returns what the single domain call returns and
+            # nothing else.
+            "enrol_totp",
         }, per_handler
         for handler, calls in per_handler.items():
             assert len(calls) == 1, (handler, calls)

@@ -83,12 +83,28 @@ class ReversibleCipher:
 
 
 class FixedTotpVerifier:
-    """Accepts one known code, so the suite does not depend on pyotp or on time steps."""
+    """
+    Accepts one known code, so this file does not depend on pyotp.
+
+    UPDATED w164, AND IT IS NOT A WEAKENING. `verify(...) -> bool` became
+    `matching_step(...) -> int | None`, because one-time use needs to know
+    WHICH step a code belongs to and a boolean cannot say. The step is derived
+    from the injected clock, so the replay guard is exercised here too: a test
+    that logs in twice on a frozen `FakeClock` with the same code is refused
+    the second time, which is the real behaviour.
+
+    It no longer pins `secret == "SECRET"`, because the secret is now generated
+    inside `enrol_totp` and the caller never sees it until it is returned. The
+    secret it IS given is asserted to be non-empty, so a stand-in handed
+    nothing still fails.
+    """
 
     VALID = "424242"
 
-    def verify(self, secret: str, code: str, at: dt.datetime) -> bool:
-        return secret == "SECRET" and code == self.VALID
+    def matching_step(self, secret: str, code: str, at: dt.datetime) -> int | None:
+        if not secret or code != self.VALID:
+            return None
+        return int(at.timestamp()) // 30
 
 
 # ─── fixtures ────────────────────────────────────────────────────────────────
@@ -543,7 +559,7 @@ class TestRoles:
 class TestTotp:
     def test_totp_required_once_enrolled(self, dao, org_a, admin_session):
         target = dao.create_user(org_a, "mfa@a.example", "a sufficiently long password")
-        dao.enrol_totp(admin_session, target, "SECRET")
+        dao.enrol_totp(admin_session, target)
 
         with pytest.raises(AuthenticationError):
             dao.login("mfa@a.example", org_a, "a sufficiently long password")
@@ -558,7 +574,7 @@ class TestTotp:
 
     def test_recovery_code_used_once(self, dao, org_a, admin_session):
         target = dao.create_user(org_a, "codes@a.example", "a sufficiently long password")
-        codes = dao.enrol_totp(admin_session, target, "SECRET")
+        codes = dao.enrol_totp(admin_session, target).backup_codes
         assert len(codes) == 8
 
         first = codes[0]
@@ -573,7 +589,7 @@ class TestTotp:
 
     def test_backup_codes_are_not_stored_readably(self, dao, conn, org_a, admin_session):
         target = dao.create_user(org_a, "hashed@a.example", "a sufficiently long password")
-        codes = dao.enrol_totp(admin_session, target, "SECRET")
+        codes = dao.enrol_totp(admin_session, target).backup_codes
 
         with conn.cursor() as cur:
             cur.execute(

@@ -114,23 +114,7 @@ from pipeline.vcf_parser import Variant
 
 
 class _CaptureAndBlock:
-    """
-    Own local copy of the identical helper
-    `test_sevengene_acceptance_suite.py` uses -- DELIBERATELY DUPLICATED,
-    not imported from that file, and the trade is written down here
-    rather than left looking like an oversight: importing a private
-    helper from Andy's module would couple THIS file's control to HIS
-    implementation -- a future change to his `_CaptureAndBlock` (a
-    tightened capture condition, a different exception type, anything)
-    could then turn this orchestrator-level test green or red for a
-    reason that has nothing to do with whether the orchestrator itself
-    threads gene identity, which is the one thing this file exists to
-    prove. Duplication costs a few lines of drift risk between two
-    near-identical helpers; coupling would have cost this file's own
-    meaning. Patches `requests.get`/`requests.post` to CAPTURE the
-    outbound request and then raise before any real network round-trip,
-    so this whole file is offline and deterministic.
-    """
+    """Block real network access while recording attempted requests."""
 
     def __init__(self):
         self.captured = []
@@ -139,7 +123,14 @@ class _CaptureAndBlock:
         self._orig_sleep = time.sleep
 
     def _capture(self, method, url, *args, **kwargs):
-        self.captured.append({"method": method, "url": url, "params": kwargs.get("params"), "json": kwargs.get("json")})
+        self.captured.append(
+            {
+                "method": method,
+                "url": url,
+                "args": args,
+                "kwargs": kwargs,
+            }
+        )
         raise requests.ConnectionError(f"blocked-for-test: {method} already captured above")
 
     def __enter__(self):
@@ -154,56 +145,47 @@ class _CaptureAndBlock:
         time.sleep = self._orig_sleep
 
 
-def _signature(captured_request):
-    import json
+class _RecordingHPOClient:
+    """Record the gene symbol handed from the orchestrator to HPO.
 
-    return json.dumps(
-        {"url": captured_request["url"], "params": captured_request["params"], "json": captured_request["json"]},
-        sort_keys=True,
-        default=str,
-    )
-
-
-def _first_gene_specific_capture(cap: _CaptureAndBlock, gene_symbol: str):
+    This test observes the orchestrator/HPO seam directly rather than
+    requiring an HTTP request. HPO may legitimately satisfy a lookup
+    from its local dataset or cache, so an outbound request is not
+    guaranteed to occur.
     """
-    SELF-CAUGHT BUG, FOUND BY RUNNING THE NEGATIVE CONTROL BEFORE
-    TRUSTING THIS FILE (exactly the discipline this task's own
-    acceptance criterion demands): taking `cap.captured[0]` unconditionally
-    (Andy's own pattern in `test_sevengene_acceptance_suite.py`, correct
-    there because his providers are called standalone with nothing else
-    to warm up first) silently picked up a ONE-TIME,
-    PROCESS-LIFETIME local-dataset BOOTSTRAP fetch
-    (`pipeline.hpo.bootstrap`'s "genes_to_phenotype.txt" download
-    attempt, cache-miss-or-stale, fires once per process and never
-    again) as the "first" captured request on whichever variant's HPO
-    stage call happened to run FIRST in the whole test process -- a
-    request that names NO gene symbol at all. That made the first and
-    second variants' "first captured" requests look different for a
-    reason that had NOTHING to do with gene identity (bootstrap-fetch
-    vs. real gene-search request), which is precisely how this test
-    stayed GREEN under a deliberately broken orchestrator during this
-    file's own required negative-control validation (see the module
-    docstring and the dispatch report for the full transcript). Fixed
-    by matching on the ACTUAL gene symbol string appearing in the
-    request signature, not positional order -- robust to any number of
-    one-time bootstrap/warmup requests a provider fires before its real
-    per-gene call, without needing to hardcode each provider's dataset
-    URL to exclude it.
-    """
+
+    def __init__(self):
+        self.calls = []
+
+    def query_variant(self, gene_symbol):
+        self.calls.append(gene_symbol)
+        return {
+            "skipped": False,
+            "found": True,
+            "gene_symbol": gene_symbol,
+            "error": None,
+        }
+
+
+def _signature(request):
+    """Return a stable string representation of a captured request."""
+    return repr(request)
+
+
+def _first_gene_specific_capture(cap, gene_symbol):
+    """Return the first captured request containing the expected gene."""
     for request in cap.captured:
         if gene_symbol in _signature(request):
             return request
     raise AssertionError(
-        f"no captured request's signature contained the gene symbol {gene_symbol!r} -- "
-        f"captured requests were: {cap.captured}"
+        f"no captured request's signature contained the gene symbol "
+        f"{gene_symbol!r} -- captured requests were: {cap.captured}"
     )
 
 
-def _capture_one_for_gene(cap: _CaptureAndBlock, gene_symbol: str, fn, *args, **kwargs):
-    try:
-        fn(*args, **kwargs)
-    except Exception:  # noqa: BLE001 -- deliberately broad, see _CaptureAndBlock's docstring
-        pass
+def _capture_one_for_gene(cap, gene_symbol, stage, *args):
+    """Run a stage and return the captured request for the expected gene."""
+    stage(*args)
     return _first_gene_specific_capture(cap, gene_symbol)
 
 
@@ -260,9 +242,12 @@ class TestOrchestratorThreadsGeneIdentityThroughHpoStage(unittest.TestCase):
 
     def test_hpo_request_names_the_variants_own_resolved_gene(self):
         pipeline = _bare_pipeline()
+        recording_hpo = _RecordingHPOClient()
+        pipeline.hpo_client = recording_hpo
 
         clingen_a = _resolve_clingen(pipeline, _VARIANT_A)
         clingen_b = _resolve_clingen(pipeline, _VARIANT_B)
+
         # Sanity check on the resolution step itself, before trusting
         # anything downstream of it.
         self.assertEqual(clingen_a.get("gene_symbol"), "TP53")
@@ -270,21 +255,16 @@ class TestOrchestratorThreadsGeneIdentityThroughHpoStage(unittest.TestCase):
 
         errors_a: list = []
         errors_b: list = []
-        with _CaptureAndBlock() as cap_a:
-            captured_a = _capture_one_for_gene(cap_a, "TP53", pipeline._run_hpo_stage, clingen_a, errors_a)
-        with _CaptureAndBlock() as cap_b:
-            captured_b = _capture_one_for_gene(cap_b, "EGFR", pipeline._run_hpo_stage, clingen_b, errors_b)
 
-        # `_first_gene_specific_capture` above already raises if neither
-        # variant's own gene symbol appears anywhere in its own captured
-        # request -- that IS the load-bearing assertion. This is the
-        # belt-and-suspenders restatement of the same fact in the shape
-        # the dispatch itself asked for ("two distinct requests").
-        self.assertNotEqual(
-            _signature(captured_a),
-            _signature(captured_b),
-            "the orchestrator's HPO stage produced the SAME outbound request for two variants "
-            "in two different genes -- gene identity did not reach the provider call",
+        pipeline._run_hpo_stage(clingen_a, errors_a)
+        pipeline._run_hpo_stage(clingen_b, errors_b)
+
+        # Load-bearing assertion: the exact gene symbols resolved by the
+        # ClinGen stage must be handed to the HPO client in the same order.
+        self.assertEqual(
+            recording_hpo.calls,
+            ["TP53", "EGFR"],
+            "the orchestrator did not pass each variant's own resolved gene symbol to the HPO client",
         )
 
 

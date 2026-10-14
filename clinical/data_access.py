@@ -2670,7 +2670,6 @@ class DataAccess:
         # reachable makes it reachable too. The identifier of a TOTP enrolment
         # is the USER it was issued to, which is a parameter, so it is declared
         # as one -- exactly the defect w120 added this parameter for.
-        resource_id_param="target_user_id",
         details_builder=lambda params, result: {
             "target_user_id": str(params.get("target_user_id")),
             "backup_codes_issued": len(result.backup_codes) if result else 0,

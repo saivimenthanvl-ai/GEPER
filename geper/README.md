@@ -1,17 +1,20 @@
-# GEPER — Genetic Evaluation & Prediction Engine for Research
+# Bij AI variant-interpretation component (GEPER) — Genetic Evaluation & Prediction Engine
 
-GEPER integrates six pretrained genomic/proteomic foundation models,
+GEPER integrates five pretrained genomic/proteomic foundation models,
 AlphaMissense missense-pathogenicity scoring, MMSplice splice-effect
 prediction, NCBI BLAST+, ClinVar, and dbSNP into one production-ready
 pipeline that takes a VCF file and produces a unified JSON result and
 a human-readable report per variant.
 
 **Scope note:** GEPER integrates existing pretrained models as-is. No
-model is retrained or fine-tuned — DNABERT-2, HyenaDNA, RNA-FM, and
-ESM-2 are used exactly as published by their respective authors, and
-Evo 2 is loaded via Arc Institute's own official `evo2` package rather
-than a custom re-implementation (see "1. Architecture" for why it
-isn't a `transformers.AutoModel` checkpoint like the others).
+model is retrained or fine-tuned — HyenaDNA, RNA-FM, and ESM-2 are used
+exactly as published by their respective authors, and Evo 2 is loaded
+via Arc Institute's own official `evo2` package rather than a custom
+re-implementation (see "1. Architecture" for why it isn't a
+`transformers.AutoModel` checkpoint like the others). DNABERT-2 was
+GEPER's original DNA-model default and has since been removed from
+this pipeline entirely — HyenaDNA is now the universal default (see
+"7. Routing logic" and `LICENSE_AUDIT.md`).
 AlphaMissense is integrated as an indexed lookup against DeepMind's
 precomputed prediction catalogue rather than a loaded model (see "11.
 AlphaMissense" for why, and read its licensing notes before any
@@ -31,8 +34,7 @@ geper/
 │
 ├── models/                       # One class per pretrained model, all independent
 │   ├── base_model.py              # Abstract base: device detection, caching, timing
-│   ├── dnabert2.py                 # DNABERT-2 (standard DNA context)
-│   ├── hyenadna.py                 # HyenaDNA (long-range DNA context, up to 450kb)
+│   ├── hyenadna.py                 # HyenaDNA (universal default DNA context, up to 450kb)
 │   ├── evo2.py                     # Evo 2 7B, StripedHyena-2 (complex/multi-species context)
 │   ├── rna_fm.py                    # RNA-FM (RNA sequence embedding)
 │   ├── esm2.py                      # ESM-2 650M (protein sequence embedding)
@@ -50,10 +52,10 @@ geper/
 │   │       └── service.py            #   exon lookup, eligibility, windows, caching, interpretation
 │   ├── vcf_parser.py               # Dependency-free VCF parsing (no pysam/cyvcf2)
 │   ├── sequence_context.py         # Fetches reference context (Ensembl REST), builds ref/alt windows
-│   ├── router.py                   # Chooses DNABERT-2 / HyenaDNA / Evo 2 / AlphaMissense eligibility
+│   ├── router.py                   # Chooses HyenaDNA / Evo 2 / AlphaMissense eligibility
 │   ├── rna_generator.py            # DNA -> RNA transcription
 │   ├── protein_translator.py       # RNA -> protein translation (standard codon table)
-│   ├── interpretation.py           # Merges all evidence into one unified interpretation
+│   ├── interpretation.py           # Merges all evidence into one candidate interpretation summary
 │   └── orchestrator.py             # GeperPipeline — runs every stage in order
 │
 ├── database/
@@ -78,8 +80,7 @@ VCF file
   -> SequenceContextGenerator            (pipeline/sequence_context.py)
   -> BLASTClient.search()                 (cached/batched; see "8. External data sources")
   -> SequenceRouter.route()              (pipeline/router.py)
-       -> DNABERT-2   (standard context)
-       -> HyenaDNA     (long context, >= 10kb)
+       -> HyenaDNA     (universal default: standard AND long context, >= 10kb)
        -> Evo 2         (complex/structural/multi-species context)
   -> RNAGenerator (if transcript-relevant) -> RNA-FM
   -> ProteinTranslator (if coding)         -> ESM-2
@@ -87,7 +88,7 @@ VCF file
   -> MMSpliceService.predict()            -> MMSplice (splice-window-eligible variants only)
   -> ClinVarClient.query_variant()
   -> DbSNPClient.lookup_variant()
-  -> InterpretationEngine.interpret()     (merges everything)
+  -> InterpretationEngine.interpret()     (merges everything into a candidate summary for review)
   -> JSONResultBuilder -> geper_results.json
   -> ReportGenerator   -> geper_report.md
 ```
@@ -130,6 +131,7 @@ Orchestrated end-to-end by `pipeline/orchestrator.py::GeperPipeline.run()`.
 # models/my_new_model.py
 from models.base_model import BaseGenomicModel
 
+
 class MyNewModel(BaseGenomicModel):
     def cache_key(self) -> str:
         return "my_new_model"
@@ -146,6 +148,7 @@ class MyNewModel(BaseGenomicModel):
 ```python
 # models/__init__.py
 from models.my_new_model import MyNewModel
+
 MODEL_REGISTRY["my_new_model"] = MyNewModel
 ```
 
@@ -154,6 +157,18 @@ To route variants to it, add a rule in `pipeline/router.py::SequenceRouter.route
 ## 5. Installation
 
 ```bash
+# Create and activate a virtual environment before the first `pip install`
+# below, pinned to 3.11 or 3.12 per requirements.txt's own header comment
+# (forced by evo2's PyPI metadata) -- NOT this box's default interpreter,
+# which VENV_BUILD_RECIPE.md found to be 3.14 here. Every `pip install` in
+# this section must land in the same interpreter, or a later step can
+# silently resolve against (or be missing from) a different environment
+# than the one before it.
+python3.12 -m venv .venv                # Linux/macOS/WSL2
+source .venv/bin/activate
+# py -3.12 -m venv .venv                # Windows (PowerShell/cmd)
+# .venv\Scripts\activate
+
 pip install -r requirements.txt
 
 # HyenaDNA is not distributed on PyPI; install from source:
@@ -173,6 +188,42 @@ pip install pyyaml
 ```
 
 For Colab, use `GEPER_Colab.ipynb`, which handles all of the above.
+
+**Setup gotcha: a bare `pip install -r requirements.txt` is not
+sufficient to bring geper/ up end-to-end.** Three manual steps are
+required beyond that single command, and skipping any of them fails
+the pipeline at *startup* — a `ModuleNotFoundError` raised before any
+model-specific code runs, not a failure isolated to whichever model
+needed the missing package — because `pipeline/orchestrator.py`
+unconditionally imports `pipeline/uniprot/bootstrap.py` at module load
+time, which itself imports `Bio` (biopython):
+
+1. **torch/torchvision/torchaudio must be installed as the exact pinned
+   trio, not individually.** `torch==2.7.1` is pinned specifically
+   because `torchvision==0.22.1` and `torchaudio==2.7.1` (both pinned
+   further down in `requirements.txt`) are only guaranteed compatible
+   with that exact torch release per PyTorch's own compatibility
+   matrix. Picking up a different torch build separately (e.g. an
+   unpinned `pip install torch` pulling in a newer CPU wheel) can leave
+   torchvision/torchaudio silently mismatched, or skipped outright. See
+   "18. Environment verification & troubleshooting" for the symptom
+   this produces (`undefined symbol` at import time) if missed.
+2. **Evo 2 needs a manual, CUDA-toolkit-matched install** — see the
+   comment block directly above the `evo2>=0.6.0` line in
+   `requirements.txt` for the exact commands (Arc Institute's own
+   documented torch+CUDA+flash-attn sequence). It cannot be safely
+   pip-installed via the bare requirements file in a fresh or CPU-only
+   environment.
+3. **tensorflow must be installed before `mmsplice==2.4.0 --no-deps`**,
+   not interchangeably — see the comment block above the `tensorflow`
+   line in `requirements.txt` for why the ordering matters.
+
+**A verified, working install recipe following exactly this sequence**
+(Python 3.12.10, step-by-step install order, and the full ground-truth
+`pip freeze`) is recorded in `VENV_BUILD_RECIPE.md` — the first time
+this project has had a from-scratch build proven to resolve cleanly
+and import successfully (`evo2` excluded by design; see that file for
+what is and isn't proven by it).
 
 ## 6. Usage
 
@@ -215,24 +266,41 @@ Options:
 | `--hpo-terms` | Comma-separated patient-observed HPO phenotype term IDs, e.g. `"HP:0001166,HP:0002011"`, evaluated against each variant's gene via the HPO gene-to-phenotype dataset for ACMG's PP4 rule (see "21. HPO" below). Malformed IDs (anything not matching `HP:#######`) are logged as a warning and skipped, never fatal. Combines with `--phenotype-file` if both are given. | — (PP4 stays `not_evaluated`) |
 | `--phenotype-file` | Path to a file with patient-observed HPO terms for PP4: either a plain text file with one `HP:#######` ID per line, or a JSON file containing a list of HPO ID strings. Alternative/addition to `--hpo-terms` for real clinical use where several observed phenotypes need to be entered at once. A missing/unreadable/malformed file is logged as a warning, never fatal. | — (PP4 stays `not_evaluated`) |
 
-Every run ends with a summary in the log:
+Every run ends with a summary in the log. The block below is real, captured
+output — not a mockup — from `python main.py --vcf test_data/nuclear_test.vcf
+--ai-only --max-variants 1`, run on a machine with **no CUDA GPU** and
+**`torchvision`, `rna-fm`, and `tensorflow` not installed** (captured
+2026-08-22, one variant processed):
 
 ```
 ===== GEPER Run Summary =====
 
 Loaded:
-  ✓ DNABERT2
-  ✓ RNA-FM
+  ✗ HyenaDNA (not installed)
+  ✗ Evo2 (no CUDA GPU detected (Evo 2 has no practical CPU path))
+  ✗ RNA-FM (not installed)
   ✓ ESM2
-  ✗ HyenaDNA (missing / not installed)
-  – Evo2 (not invoked -- no variant routed to it)
+  ✗ AlphaMissense (not installed)
+  ✗ MMSplice (tensorflow could not be installed automatically)
 
-Processed variants: 20
-Successful predictions: 18
-Skipped: 2
+Processed variants: 1
+Successful predictions: 1
+Skipped: 0
 Failed: 0
 ==============================
 ```
+
+On this specific machine, five of the six loaded-model rows are `✗` rather
+than `✓` — a machine with a CUDA GPU and `torchvision`/`rna-fm`/`tensorflow`
+installed would show `✓` across every row instead, and processing more than
+one variant would naturally produce different `Processed`/`Successful`/
+`Skipped`/`Failed` counts. Six models are listed, not the four an earlier
+version of this block showed — `HyenaDNA`, `Evo2`, `RNA-FM`, `ESM2`,
+`AlphaMissense`, and `MMSplice` are exactly the six the pipeline's own
+`MODEL_REGISTRY` tracks in this summary (`pipeline/orchestrator.py:131`);
+Enformer, Borzoi, SpliceFormer, and SpliceBERT are real models the pipeline
+also loads, but through a separate plugin-manager subsystem that logs its
+own messages and was never part of this particular block.
 
 Programmatic usage:
 
@@ -254,7 +322,7 @@ what happened for that variant; the run itself always finishes and writes a repo
 |---|---|
 | Sequence context length ≥ 10,000 bp | HyenaDNA |
 | Variant flagged structural (`SVTYPE`), tagged repeat/splice-region, or a long MNV (≥20bp) | Evo 2 |
-| Otherwise (typical SNV/indel, short window) | DNABERT-2 |
+| Otherwise (typical SNV/indel, short window) | HyenaDNA (universal default) |
 | A clean, single-residue missense SNV (see below) | AlphaMissense (in addition to the above) |
 
 A variant can be routed to more than one model when multiple
@@ -460,7 +528,11 @@ document with a clinical-use disclaimer at the top, including an
 | `GEPER_CLINGEN_CACHE_ENABLED` / `_CACHE_MAX_SIZE` / `_CACHE_TTL_HOURS` | Gene-evidence LRU cache | `true` / `5000` / `24` |
 | `GEPER_CLINGEN_CACHE_DISK_PATH` | Optional on-disk cache persistence path (survives process restart) | unset (in-memory only) |
 | `GEPER_CLINGEN_MAX_CONCURRENT` | Max concurrent batch ClinGen lookups | `8` |
-| `GEPER_CLINGEN_DOSAGE_SUFFICIENT_SCORE` / `_DOSAGE_UNLIKELY_SCORE` | ACMG PVS1-support dosage-score thresholds | `3` / `40` |
+| `GEPER_HEALTH_CHECK_ENABLED` | Enable/disable the startup external-service health probe entirely (see "26. External service health checks") | `true` |
+| `GEPER_HEALTH_CHECK_TIMEOUT` | Per-attempt timeout for every probe attempt except the final, latch-deciding one | `4.0` |
+| `GEPER_HEALTH_CHECK_ATTEMPTS` | Consecutive failed attempts required before latching a service offline for the run; only network-level failures are retried | `3` |
+| `GEPER_HEALTH_CHECK_BACKOFF` | Pause between probe attempts | `0.5` |
+| `GEPER_HEALTH_CHECK_CONFIRM_TIMEOUT` | Timeout for the final, latch-deciding attempt only — deliberately matches clients' own request timeout | `30.0` |
 | `GEPER_CONFIG_FILE` | Path to an optional `config.yaml` overlay (see "14. config.yaml") | `./config.yaml` |
 
 ## 11. AlphaMissense
@@ -538,38 +610,64 @@ synonymous, nonsense, frameshift, intronic/splice, and structural
 variants never are.
 
 **Startup validation table:** AlphaMissense gets its own row, same as
-every embedding model, but with values that reflect what's actually
-happening — there's no tensor computation, so `Device` is always `cpu`
-(no GPU is ever used, regardless of what's available) and `Precision`
-reads `n/a (lookup table, no weights)` rather than a fabricated torch
-dtype:
+every embedding model. When AlphaMissense actually loads (its own tabix
+catalogue reachable), there's no tensor computation, so its `Device` reads
+`cpu` (no GPU is ever used for it, regardless of what's available) and
+`Precision` reads `n/a (lookup table, no weights)` rather than a fabricated
+torch dtype — that PASS-path rendering is a property of the code, not of
+any one machine.
+
+The table below is real, captured output — not a mockup, and not the
+idealized all-PASS run above — from `python main.py --vcf
+test_data/nuclear_test.vcf --ai-only --max-variants 1`, run on a machine
+with **no CUDA GPU** and **`torchvision`, `rna-fm`, and `tensorflow` not
+installed** (captured 2026-08-22):
 
 ```
-Model                   Device    Precision       Max Length  Status
---------------------------------------------------------------------
-DNABERT2                 cuda      torch.float16   512         PASS
-HyenaDNA                 cuda      torch.float32   450000      PASS
-Evo2                      cuda      torch.bfloat16 (evo2_7b_base, StripedHyena-2)  8192  PASS
-RNA-FM                   cuda      torch.float32   1024        PASS
-ESM2                     cuda      torch.float32   1024        PASS
-AlphaMissense             cpu      n/a (lookup table, no weights)  n/a  PASS
+Model                     Device      Precision         Max Length    Status
+----------------------------------------------------------------------------
+HyenaDNA                  n/a         n/a               n/a           FAIL (Failed to load model 'hyenadna': No module named 'torchvision')
+Evo2                      n/a         n/a               n/a           SKIP (no CUDA GPU detected (Evo 2 has no practical CPU path))
+RNA-FM                    n/a         n/a               n/a           SKIP (not installed)
+ESM2                      cpu         torch.float32     1024          PASS
+AlphaMissense              n/a         n/a               n/a          SKIP (not installed)
+MMSplice                  n/a         n/a               n/a           SKIP (tensorflow could not be installed automatically)
 ```
 
-**Licensing — read before commercial deployment.** Sources disagree.
-The current official repository (github.com/google-deepmind/alphamissense,
-archived 2025-05-16) states the predictions are CC BY 4.0 (attribution
-only, commercial use permitted). However, the Google Cloud Storage
-download page, the Ensembl VEP plugin docs, the EBI announcement, and
-the HuggingFace dataset mirror all instead describe the predictions as
-CC BY-NC-SA 4.0 — non-commercial research use only — and note that use
-of the GCS-hosted files is additionally subject to the Google Cloud
-Platform Terms of Service. GEPER does not know which currently governs
-the specific file your deployment downloads; this is a genuine,
-unresolved discrepancy between DeepMind's own sources, not a GEPER
-judgment call. **Confirm the license that applies to the exact file
-you download directly with Google DeepMind (alphamissense@google.com)
-or counsel before relying on AlphaMissense output in a commercial
-product.** (Full detail: `config.py::AlphaMissenseConfig` docstring.)
+On this specific machine, five of the six rows are FAIL/SKIP rather than
+PASS — a machine with a CUDA GPU and `torchvision`/`rna-fm`/`tensorflow`
+installed would show `cuda`, a real torch dtype, and PASS across every row
+instead (AlphaMissense included, per the paragraph above — this particular
+capture shows its SKIP path, not its PASS path, since the tabix catalogue
+wasn't installed on this machine either). Shown degraded-but-real rather
+than replaced with another idealized table, on purpose: a reader seeing
+actual FAIL/SKIP handling learns more about what the pipeline really does
+than an all-PASS example ever could.
+
+**Licensing — read before commercial deployment.** The predictions
+catalogue is **CC BY 4.0** (attribution required, commercial use
+permitted). This is confirmed directly from the primary source, not
+inferred: the GCS bucket's own README.pdf, at the exact URL GEPER
+downloads from (`https://storage.googleapis.com/dm_alphamissense/README.pdf`,
+`timeCreated` 2024-03-13, the day of DeepMind's public relicense),
+states verbatim: "Copyright (2023) DeepMind Technologies Limited. All
+materials are licensed under the Creative Commons Attribution 4.0
+International License (CC-BY)." This resolves what used to be flagged
+here as a genuine discrepancy between sources — kept explicit rather
+than silently deleted, since it explains why the NC-SA claim keeps
+resurfacing elsewhere: the Ensembl VEP plugin's current `main` branch
+agrees (CC BY 4.0), but its old `release/110` tag still reads CC
+BY-NC-SA 4.0 (predates the relicense), and the unofficial
+`huggingface.co/datasets/katielink/dm_alphamissense` mirror still
+reads CC BY-NC-SA 4.0 (never updated after it). GEPER reads none of
+those three — only the GCS bucket above, which is unambiguous and
+dated after the relicense. **What this does not settle:** confirming
+CC BY 4.0 governs is a different question from whether its attribution
+condition is actually triggered by GEPER's use — an indexed tabix
+lookup that extracts one row's score from a ~71M-row catalogue into a
+clinical report, not a redistribution of the catalogue itself. That
+question remains open and is not resolved by this comment. (Full
+detail: `config.py::AlphaMissenseConfig` docstring.)
 
 **Testing.** `verify_alphamissense_integration.py` exercises the real,
 unmodified `AlphaMissenseModel` code — real `tabix` subprocess calls
@@ -578,7 +676,7 @@ the exact real AlphaMissense schema) — end to end, alongside a full
 orchestrator run using the same known ClinVar missense variants as
 `verify_clinvar_dbsnp_fix.py`. See that script's module docstring for
 exactly what is and isn't proved without real network access to the
-DNABERT-2/etc. weights and the live GCS catalogue.
+HyenaDNA/etc. weights and the live GCS catalogue.
 
 ## 12. MMSplice
 
@@ -769,23 +867,25 @@ wiring, backward-compatibility, additive-evidence checks).
   attempting to load `evo2`, and skips it automatically — with one
   clear, specific log message naming the actual GPU and the compute
   capability shortfall — exactly like it already does when no GPU is
-  present at all. DNABERT-2, HyenaDNA, RNA-FM, ESM-2, and AlphaMissense
-  are entirely unaffected and continue to run on a T4; only the subset
+  present at all. HyenaDNA, RNA-FM, ESM-2, and AlphaMissense are
+  entirely unaffected and continue to run on a T4; only the subset
   of variants the router flags as structurally/evolutionarily complex
-  (which would otherwise route to Evo 2) fall back to DNABERT-2/
-  HyenaDNA instead, via the same graceful-degradation path already
-  used when any other model is unavailable. **To actually run Evo 2,**
+  (which would otherwise route to Evo 2) fall back to HyenaDNA instead,
+  via the same graceful-degradation path already used when any other
+  model is unavailable. **To actually run Evo 2,**
   use a GPU with compute capability >= 8.0 — e.g. A10, A100, L4, L40S,
   or H100 (Google Colab's paid tiers offer A100/L4; most major cloud
   providers offer A10/A100/L4 on-demand). Sequences longer than
   GEPER's configured safety ceiling (8,192 tokens by default, matching
   `evo2_7b_base`'s real 8K training context) are truncated with a
   warning rather than crashing, on any GPU where Evo 2 does run.
-- **HyenaDNA** is only invoked for long-context variants (≥10kb), so
-  its checkpoint does not need to be downloaded unless your VCF
-  contains structural variants. If it isn't installed, GEPER detects
-  that once at startup, logs a single warning, and falls back to
-  DNABERT-2 for those variants instead of failing.
+- **HyenaDNA** is GEPER's universal default DNA model — invoked both
+  for long-context variants (≥10kb) and as the fallback for the
+  typical short SNV/indel window, so its checkpoint should be
+  downloaded for any real run. If it isn't installed, GEPER detects
+  that once at startup, logs a single warning, and the variant
+  proceeds without DNA-model-level embedding evidence rather than
+  failing the run.
 - **AlphaMissense** runs on CPU unconditionally (it's a file lookup,
   not a GPU computation) and adds negligible overhead — one `tabix`
   subprocess call per eligible missense variant.
@@ -815,11 +915,13 @@ Set `GEPER_CONFIG_FILE=/path/to/other.yaml` to use a different path.
 
 ## 15. Clinical disclaimer
 
-GEPER is a research pipeline built on pretrained machine learning
-models and public database lookups. It is **not** a substitute for
-professional clinical genetic interpretation, diagnosis, or medical
-advice. All output must be reviewed by a qualified clinical geneticist
-or genetic counselor before informing any medical decision.
+Bij AI is a variant prioritisation system built on pretrained machine
+learning models and public database lookups. It assists qualified
+clinicians and pathologists by producing a draft classification;
+qualified human review and final sign-off are required before any
+clinical use, and Bij AI does not independently provide final clinical
+interpretation. It is **not** a substitute for professional clinical
+genetic interpretation, diagnosis, or medical advice.
 
 ## 16. gnomAD
 
@@ -969,13 +1071,29 @@ contributed:
 |---|---|---|
 | Sufficient haploinsufficiency evidence + predicted LOF variant | Gene-level prerequisite ACMG/AMP's PVS1 rule requires | PVS1-supporting evidence, positive weight |
 | "Dosage sensitivity unlikely" + predicted LOF variant | Caution against a naive PVS1 application | Cautionary note, small negative weight (never reverses the underlying LOF evidence to benign) |
+| "Gene associated with autosomal recessive phenotype" + predicted LOF variant | ClinGen's curation does not establish that one damaged allele is sufficient, so there is no PVS1 gene-level support — but the gene *is* curated, which is not the same as having no curation | Disclosure only, weight `0.0` (never changes the classification; LOF may still be the mechanism biallelically) |
 | Definitive/Strong gene-disease clinical validity | Established disease mechanism for this gene | PP5/BP6-style supporting evidence |
 | Disputed/Refuted gene-disease clinical validity | Contrary evidence for this gene's disease association | Argues against a causal role, negative weight |
 
-Both the haploinsufficiency-sufficiency threshold and the
-dosage-unlikely score are configurable
-(`GEPER_CLINGEN_DOSAGE_SUFFICIENT_SCORE` / `GEPER_CLINGEN_DOSAGE_UNLIKELY_SCORE`),
-matching every other ACMG threshold in this codebase.
+The haploinsufficiency scores that count as sufficient evidence are
+**not** configurable, and deliberately so. Every other ACMG threshold in
+this codebase (CADD, REVEL, pLI, LOEUF, oe_mis) is a *continuous* score,
+where a deployer-tunable cut-point is meaningful. ClinGen's
+haploinsufficiency Score column is not: `0`-`3` are graded evidence
+levels, while `30` ("gene associated with autosomal recessive
+phenotype") and `40` ("dosage sensitivity unlikely") are *special
+codes*. On a scale like that a cut-point can only be wrong — set it to
+`30` and you admit the recessive code, set it to `40` and you admit
+both, and there is no value a deployer could correctly choose that
+`{3}` does not already express. GEPER therefore matches on an explicit
+set of qualifying scores (`CONFIG.clingen.DOSAGE_SUFFICIENT_EVIDENCE_SCORES`)
+rather than comparing against a threshold.
+
+These *were* environment-overridable, justified here as "matching every
+other ACMG threshold in this codebase" — an analogy that fails exactly
+where the defect lived, and one that licensed a `>=` comparison which
+read scores `30` and `40` as *stronger* evidence for haploinsufficiency
+than `3`.
 
 **Performance:** gene-evidence results are cached (in-memory LRU with a
 24-hour default TTL — much longer than gnomAD's, since gene curation
@@ -1000,8 +1118,13 @@ Run this before `python main.py ...` (or at the top of a Colab cell):
 ```bash
 python verify_environment.py          # human-readable report
 python verify_environment.py --json   # machine-readable
-python verify_environment.py --strict # exit 1 if anything required is missing
 ```
+
+Exit status: **1 if any check FAILs**, 0 otherwise (warnings alone exit 0),
+so `python verify_environment.py && python main.py ...` refuses to start a
+run on a failing environment. This is the default since 2026-09-12; before
+that it exited 0 on FAIL unless `--strict` was passed. `--strict` is now
+deprecated and has no effect (it prints a notice).
 
 It checks, independently and without ever installing/upgrading
 anything itself: Python version, torch/torchvision/transformers/
@@ -1024,7 +1147,7 @@ three):
 | torch | 2.7.1 | flash-attn (Evo2 only) is compiled against this exact ABI |
 | torchvision | 0.22.1 | Must match the torch pin exactly, or import fails with "undefined symbol" |
 | torchaudio | 2.7.1 | Not imported by GEPER itself, but pinned defensively — see the troubleshooting row below |
-| transformers | ≥5.12.1,<6.0.0 | |
+| transformers | 4.56.2 | Exactly what the shipped image runs (Dockerfile's last-wins pin): Enformer needs exactly 4.56.2, Borzoi <5. Was a 5.x range until 2026-09-11, which the image never satisfied |
 | accelerate | ≥1.14.0,<2.0.0 | |
 | tensorflow | ≥2.16.0,<3.0.0 | MMSplice only |
 
@@ -1046,7 +1169,7 @@ Linux distributions with a Python 3.11/3.12 environment are expected
 to work but are not part of this project's tested matrix.
 
 **Recommended GPU:** any NVIDIA GPU with compute capability ≥ 7.0 for
-DNABERT-2/HyenaDNA/RNA-FM/ESM2/AlphaMissense/MMSplice (CPU fallback
+HyenaDNA/RNA-FM/ESM2/AlphaMissense/MMSplice (CPU fallback
 also works, slower); compute capability ≥ 8.0 additionally required for
 Evo2 specifically (see "13. Hardware notes" and
 `EVO2_T4_HARDWARE_FINDINGS.md` — Evo2 is intentionally disabled below
@@ -1483,8 +1606,8 @@ non-empty `physician` field (see
 `"DRAFT -- NOT FOR PATIENT USE. Awaiting clinical review."`; present →
 `"...reviewed by {physician}. This is not a standalone diagnosis."`
 `physician` is deliberately independent of `patient_name` (see
-`_parse_patient_meta`'s docstring) so a de-identified/research
-run — GEPER's stated default — can still be reviewed and signed off
+`_parse_patient_meta`'s docstring) so a de-identified run — no patient
+name is required by default — can still be reviewed and signed off
 by a named clinician without a patient name ever being attached.
 `approve` below works entirely by writing that one field and
 **re-invoking `generate_pdf`/`generate_short_pdf`** — the same
@@ -1593,4 +1716,134 @@ agreement, `override` preserving the original classification while
 regenerating all three formats, `list-pending` distinguishing DRAFT
 from REVIEWED across multiple runs, and the CLI's argument parsing and
 exit codes.
+
+## 26. External service health checks (startup probe, retry, and the offline latch)
+
+Before the first variant is processed, GEPER probes every external
+service it depends on (Ensembl, ClinVar/dbSNP, ClinGen, MaveDB,
+IndiGenomes) once each, in parallel, and prints a status table. This
+is separate from — and sits on top of — the retry logic each client
+already has in its own request loop (`pipeline/sequence_context.py`,
+`pipeline/clingen/utils.py`, `pipeline/functional_evidence/
+erepo_provider.py`, etc.): the startup probe's verdict, once a service
+is marked offline, is treated as **confirmed** for the rest of the
+run, and every client checks `HEALTH.is_offline(...)` at the top of
+its own retry loop to skip straight past its own retries rather than
+burn a multi-attempt budget on a service already known dead.
+
+**Why the probe now retries before it latches.** That "confirmed"
+verdict used to come from a single request. Because a client skips its
+own retries once a service is marked offline, one unlucky slow request
+didn't just mislabel that service — it switched off the exact retry
+logic that would otherwise have ridden out the jitter. Nothing crashed
+and nothing errored (this is by design — see "3. Design principles"),
+so a run degraded this way looked clean: it finished, produced a
+report, and gave no indication anything was missing. This happened for
+real: a run lost sequence context for every variant and SpliceFormer
+went unavailable across the board, because one 4-second timeout on an
+Ensembl probe latched it offline for the whole run.
+
+**The latch itself was not weakened** — it still exists specifically
+to stop a run from hanging on a genuinely dead service, and a service
+that fails every attempt still ends up latched offline exactly as
+before. What changed is how much evidence is required before that
+latch fires:
+
+- `CONFIG.health_check.PROBE_ATTEMPTS` (default `3`) — a service is
+  only latched offline after this many consecutive failed attempts,
+  with `PROBE_BACKOFF_SECS` (default `0.5s`) between them. Only a
+  network-level failure (timeout, connection error) is retried; a 5xx
+  response is a real answer from a host that is up and routing, so
+  HEALTHY and DEGRADED verdicts still return on the first attempt,
+  exactly as before.
+- The per-attempt timeout is `CONFIG.health_check.TIMEOUT_SECS`
+  (default `4.0s`, unchanged) for every attempt **except the last**.
+  The final attempt — the one that actually decides whether to
+  latch — uses `CONFIG.health_check.LATCH_CONFIRM_TIMEOUT_SECS`
+  (default `30.0s`) instead.
+
+**Why 30 seconds, specifically, and not a new guess.** It isn't picked
+to feel generous — it's the same `REQUEST_TIMEOUT_SECS` a client's own
+retry loop already waits on before giving up, the very number the
+probe's short 4.0s timeout was originally justified against ("this
+only needs to tell up from down/slow, much shorter than a client's own
+budget"). That reasoning is sound for a status *report*, but this
+probe doesn't only report — it *latches*, and revoking a service from
+every client after 4 seconds when those same clients would have
+happily waited 30 is not defensible. Using the clients' own number
+instead of inventing a new one collapses what had been a 7.5x mismatch
+between the probe's patience and the clients' own patience down to
+exactly 1x. An earlier proposal to simply raise the probe's default
+timeout to 8.0s was considered and withdrawn for the same reason: it
+would still have been a guess at the same kind of number, just a
+larger one, with no principled reason to stop at 8 rather than 10 or
+15.
+
+**The real case that motivated this**, from this project's own logs: a
+legitimate, successful Ensembl startup probe took **21,931 ms**
+alongside ClinVar answering in 1,207 ms on the same run — a single
+public API can be that much slower than its neighbors on an ordinary
+day, with nothing wrong on either end. The old 4.0s default would have
+declared that Ensembl call dead. Under this change, the same sequence
+of attempts fails on attempt 1 and attempt 2 (each still bounded at
+4.0s) and succeeds on attempt 3, which is allowed the full 30s. No
+fixed single-shot timeout — 4s, 8s, or even 20s — would have survived
+that 22-second response; only giving the deciding attempt real
+patience does.
+
+**Cost.** A healthy service pays nothing: a first-attempt success
+still returns within the original 4.0s budget, unchanged. A
+genuinely dead service now costs roughly 4 + 0.5 + 4 + 0.5 + 30 ≈ 39
+seconds instead of failing after 4 — but that cost is paid **once per
+run**, in parallel across every probed service (probes don't queue
+behind each other), against the roughly 90 seconds **per variant**
+that a false latch used to cost by disabling a client's own retries
+for the rest of the run. On any run with more than one variant, the
+false-latch cost this change removes dominates the confirmation cost
+it adds.
+
+**A gotcha worth knowing before you rely on it**:
+`GEPER_HEALTH_CHECK_ATTEMPTS=1` does **not** fully restore the old,
+single-shot behavior. With only one attempt configured, that one
+attempt *is* the deciding attempt, so it runs with the long 30s
+confirm timeout rather than the short 4.0s fast-path timeout. This is
+intentional — the timeout budget scales with how consequential the
+decision is, not with how many attempts happen to precede it — but it
+means "set attempts back to 1" is not a way to get the exact old
+timing back.
+
+**What a reader sees when a service does end up latched offline**:
+today, a caveat naming the offline service(s) is included in the
+**PDF** report's Limitations section (`report/summary.py`); the
+Markdown report and the JSON/LIMS export do not yet carry the
+equivalent caveat. This asymmetry is tracked separately, not part of
+this fix, and is the same "one renderer got the caveat, the others
+didn't" pattern already fixed for BP7's conflicting-evidence PDF gap
+elsewhere in this project's history.
+
+**Open decision, deliberately left unresolved here — not an
+oversight**: should a latch ever be lifted mid-run, if a service that
+failed all three attempts at startup comes back later? The answer is
+no *for this change* — a re-probe/un-latch mechanism was designed but
+not implemented, on the reasoning that (a) it would extend the runtime
+contract across every one of the many call sites (`is_offline`/
+`note_skip`) that currently only ever read a latch, not clear one, and
+(b) its parameters (how often to re-check, how many re-probes to
+allow) should be chosen against evidence of how often a false latch
+still occurs now that retry-before-latch is live — evidence that
+doesn't exist yet. Revisit this once that evidence accumulates, rather
+than guessing at the parameters today the same way the original 4.0s
+timeout was guessed at.
+
+**Environment variables** for this mechanism (all five, existing and
+new, listed together — see "10. Environment variables" for the full
+table):
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GEPER_HEALTH_CHECK_ENABLED` | Enable/disable the startup probe entirely | `true` |
+| `GEPER_HEALTH_CHECK_TIMEOUT` | Per-attempt timeout for every attempt except the final, latch-deciding one | `4.0` |
+| `GEPER_HEALTH_CHECK_ATTEMPTS` | Consecutive failed attempts required before latching a service offline (only network-level failures are retried) | `3` |
+| `GEPER_HEALTH_CHECK_BACKOFF` | Pause between probe attempts | `0.5` |
+| `GEPER_HEALTH_CHECK_CONFIRM_TIMEOUT` | Timeout for the final, latch-deciding attempt only — matches clients' own request timeout rather than a new guess | `30.0` |
 

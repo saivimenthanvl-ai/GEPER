@@ -81,13 +81,18 @@ uses, so callers do not need to special-case it.
 
 Ensemble/evidence-aggregation note: like SpliceFormer, this plugin is
 deliberately NOT added to `pipeline/models/ensemble.py`'s
-Enformer+Borzoi consensus, not passed to
-`InterpretationEngine`/ACMG PP3-PP4 evaluation, not added to
-`pipeline/models/status.py`'s "AI Models" display table, and not
-wired into `pipeline/orchestrator.py`'s per-variant stages -- see
-`spliceformer_plugin.py`'s own module docstring for the identical
-reasoning (an unvalidated zero-shot score should not silently become
-clinical evidence). It is reachable via `ModelManager` (through
+Enformer+Borzoi consensus (that ensemble feeds PP3/BP4 specifically),
+and not passed to ACMG PP3/BP4 evaluation. It IS otherwise wired into
+a live per-variant run, the same way SpliceFormer is: invoked from
+`pipeline/orchestrator.py::_run_standalone_splice_plugin_stage`
+(called at `pipeline/orchestrator.py:1465-1466`), listed in the "AI
+Models" status table (`pipeline/models/status.py:306-310`), and
+consumed directly by BP7 (`pipeline/acmg_rules.py::
+ACMGRuleEngine._bp7`) -- whose rationale text (caveated here as
+"uncalibrated; not clinically validated") reaches `report/*` through
+the same `supporting_evidence`/`conflicting_evidence` mechanism every
+other criterion's evidence uses. It is also reachable via
+`ModelManager` (through
 `pipeline.models.pending_plugins.build_default_registry()`) for
 direct/programmatic use and tests, exactly like SpliceFormer.
 --------------------------------------------------------------------
@@ -95,8 +100,10 @@ direct/programmatic use and tests, exactly like SpliceFormer.
 
 from typing import Any, Dict, List
 
+import requests
 import torch
 
+import config
 from config import CONFIG
 from pipeline.models.base import ModelMetadata, PluginModel
 from pipeline.models.cache import WeightCache
@@ -108,13 +115,24 @@ from utils.auto_install import is_pip_package_installed
 # pipeline/models/splicebert/loader.py for the config.json sourcing.
 SPLICEBERT_MAX_CONTENT_LENGTH = splicebert_loader.MAX_CONTENT_LENGTH
 
+
 # Same classification thresholds pipeline/models/spliceformer_plugin.py,
 # enformer_plugin.py, and borzoi_plugin.py already use for their own
 # single-model delta-score summaries -- reused here so a SpliceBERT
 # score sits on the same documented 0..~1 scale as the other
 # splicing/regulatory plugins' `score`/`classification` fields.
-_NO_EFFECT_THRESHOLD = 0.1
-_MODERATE_EFFECT_THRESHOLD = 0.5
+# READ AT CALL TIME, NOT BOUND AT IMPORT: `config.SPLICE_DELTA_*` is looked up
+# inside `_classify` rather than copied into a module-level name here. A
+# module-level copy would be a private literal again by another route -- it
+# would stop tracking config the moment anything changed the value.
+def _classify(score: float) -> str:
+    """Three-way bucketing shared with ensemble/enformer/borzoi/spliceformer."""
+    if score < config.SPLICE_DELTA_NO_EFFECT_THRESHOLD:
+        return "no_significant_effect"
+    if score < config.SPLICE_DELTA_MODERATE_EFFECT_THRESHOLD:
+        return "moderate_effect"
+    return "large_effect"
+
 
 # Upper bound on how many differing ref/alt positions get their own
 # masked forward pass. A SNV differs at exactly one position (the
@@ -128,16 +146,40 @@ _MODERATE_EFFECT_THRESHOLD = 0.5
 # which is where the biologically meaningful signal is.
 _MAX_SCORED_POSITIONS = 32
 
-_NETWORK_ERROR_TYPES = (OSError, ConnectionError, TimeoutError)
+# Network-shaped failures only -- NOT bare OSError. `splicebert_loader.
+# download_and_extract_checkpoint` fetches the archive via
+# `requests.get(...)` (see pipeline/models/splicebert/loader.py); a
+# real connectivity/HTTP failure surfaces as `requests.exceptions.
+# RequestException` (covers ConnectionError/Timeout/HTTPError from
+# `raise_for_status()`), not a bare OSError. Bare OSError was removed
+# 2026-08-21: the same function also does purely LOCAL work
+# (tarfile extraction, shutil.move/rmtree) with no network involved,
+# and OSError is the same class Windows raises for local resource
+# exhaustion -- confirmed reproducible on this project's own dev box,
+# loading ESM2: `OSError: The paging file is too small for this
+# operation to complete. (os error 1455)`. Catching that here and
+# relabeling it "SpliceBERT model unavailable" would report a wrong
+# diagnosis. A genuine local OSError now simply isn't caught in this
+# block -- it propagates through PluginModel.load()/ModelManager.get()
+# (pipeline/models/base.py, manager.py), both of which already fold
+# `str(exc)` into their own raised message and log it at `error`, so
+# the real cause stays visible rather than being relabeled a second
+# time. (The `except` block below already logs at `warning`, not
+# `debug` -- Round 20 got that half of this fix right already; only
+# the exception-type narrowing was missing.)
+_NETWORK_ERROR_TYPES = (requests.exceptions.RequestException, ConnectionError, TimeoutError)
 
 _COMPLEMENT = str.maketrans("ACGTN", "TGCAN")
 
 
 class SpliceBERTPlugin(PluginModel):
-    """Real SpliceBERT integration. Disabled by default
-    (`CONFIG.splicing.ENABLE_SPLICEBERT`); once enabled, this loads
-    the official pretrained `SpliceBERT.1024nt` checkpoint (BSD-3-
-    Clause code / CC-BY-4.0 weights) from the upstream Zenodo archive
+    """Real SpliceBERT integration, gated by
+    `CONFIG.splicing.ENABLE_SPLICEBERT`. Currently disabled by default
+    (as of 2026-08-20) due to a known load-timeout failure against
+    `transformers` 5.13.1 (see DATA_PROVENANCE.md); will be re-enabled
+    once that issue is resolved. When enabled, loads the official
+    pretrained `SpliceBERT.1024nt` checkpoint (BSD-3-Clause code /
+    CC-BY-4.0 weights) from the upstream Zenodo archive
     (`pipeline/models/splicebert/loader.py`) via `transformers`'
     standard `BertForMaskedLM`/`BertTokenizer`."""
 
@@ -211,21 +253,33 @@ class SpliceBERTPlugin(PluginModel):
             try:
                 splicebert_loader.download_and_extract_checkpoint(cache_dir, checkpoint=checkpoint, record=record)
             except _NETWORK_ERROR_TYPES as exc:
-                message = (
-                    f"SpliceBERT model unavailable: archive fetch for checkpoint '{checkpoint}' "
-                    f"failed ({exc.__class__.__name__}): {exc}"
+                # Round 20 correction: the diagnostic detail below
+                # (exception class + str(exc)) stays in the LOG line
+                # only. It used to also be folded into the *raised*
+                # RuntimeError -- which reaches `ModelManager._failed`
+                # and, from there, `model_checkpoints[...]["reason"]`
+                # in geper_results.json and the clinical report's own
+                # "Data Source Provenance" section (round 17's
+                # renderer work). A network exception's `str(exc)`
+                # routinely embeds the full request URL (confirmed:
+                # `test_network_failure_is_sanitized` caught exactly
+                # this -- a mocked `ConnectionError("could not reach
+                # zenodo.org")` produced a raised message containing
+                # "zenodo.org", which a real `requests`-level
+                # ConnectionError would render as the complete Zenodo
+                # archive URL) -- not appropriate for a clinical
+                # document a reader outside this codebase may see.
+                # `d48a829` (an early round) promoted this detail from
+                # `logger.debug` to the raised message specifically
+                # because real runs never captured it at debug level;
+                # promoting the LOG level to `warning` (kept below)
+                # already solves that -- it does not also require
+                # leaking the detail into the report-facing message.
+                log_message = (
+                    f"SpliceBERT archive fetch for checkpoint '{checkpoint}' failed ({exc.__class__.__name__}): {exc}"
                 )
-                # Promoted from `logger.debug` to `logger.warning` (F1b,
-                # report review round 4): the underlying reason was
-                # previously only visible with debug logging enabled,
-                # so every real run only ever recorded the generic
-                # wrapper text below -- never the actual detail needed
-                # to diagnose it later. Also folded into the raised
-                # message itself so it reaches `ModelManager._failed`
-                # (and therefore the provenance/status reporting F1a
-                # wires up) without needing the log line at all.
-                self.logger.warning(message, exc_info=True)
-                raise RuntimeError(message) from exc
+                self.logger.warning(log_message, exc_info=True)
+                raise RuntimeError("SpliceBERT model unavailable") from exc
 
         checkpoint_dir = splicebert_loader.checkpoint_dir_for(cache_dir, checkpoint)
         try:
@@ -238,33 +292,64 @@ class SpliceBERTPlugin(PluginModel):
             # for the rest of the run instead of propagating a raw
             # timeout message.
             #
-            # Root cause of *why* it times out at all is unconfirmed as
-            # of this pass (F1b, report review round 4): the checkpoint
-            # is a standard, unmodified `BertForMaskedLM` (see
-            # `build_model_and_tokenizer`'s docstring), so this is not
-            # a config/architecture mismatch in the checkpoint itself.
-            # The two most recent verified runs preceded this failure
-            # with transformers' "You are using a model of type 'bert'
-            # to instantiate a model of type ''" warning under
-            # transformers 5.13.1 (this repo's fix for the ORIGINAL
-            # hang, `_force_transformers_to_prefer_torch_over_tf`, was
-            # verified only against the previously-pinned 4.56.2) --
-            # plausibly a second, distinct transformers-v5 auto-mapping
-            # resolution issue triggered by the same import-order
-            # precondition as the original bug (`pipeline/models/esm2.py`
-            # importing `transformers` first), but this was not
-            # reproduced or fixed in this pass since doing so needs a
-            # real load attempt, which this pass's environment cannot
-            # provide (no GPU, no fresh download). Message and
-            # exc_info promoted to `warning` so the next live run
-            # captures the detail needed to actually diagnose it,
-            # instead of only "SpliceBERT model unavailable".
-            message = (
-                f"SpliceBERT model unavailable: checkpoint load for '{checkpoint}' timed out "
-                f"after {CONFIG.splicing.SPLICEBERT_LOAD_TIMEOUT_SECS:.0f}s ({exc})"
+            # Root cause of *why* it times out at all is still unconfirmed
+            # (round 18 update): the checkpoint is a standard, unmodified
+            # `BertForMaskedLM` (see `build_model_and_tokenizer`'s
+            # docstring), so this is not a config/architecture mismatch in
+            # the checkpoint itself. The originally-suspected cause --
+            # `transformers` TensorFlow-backend auto-detection, which this
+            # repo previously "fixed" with `USE_TF=0` and then a direct
+            # override of an internal `transformers` flag
+            # (`_force_transformers_to_prefer_torch_over_tf`, since removed)
+            # -- was confirmed FALSE live under this repo's own
+            # `transformers` v5 pin: neither the internal flag that fix
+            # touched nor any TensorFlow-backend entry point exists under
+            # v5 at all, so that fix was a no-op the whole time. What's
+            # actually confirmed instead: the load succeeds quickly in
+            # isolation (13s cold, 0.2s warm), but has repeatedly stalled
+            # inside the full orchestrator process specifically, where
+            # MMSplice has already loaded real TensorFlow onto the GPU and
+            # ESM2 has already used `transformers`' `AutoModel` machinery --
+            # correlated with, but not yet isolated to, transformers'
+            # "You are using a model of type 'bert' to instantiate a model
+            # of type ''" warning immediately preceding the stall (see
+            # `build_model_and_tokenizer`'s docstring for the full,
+            # up-to-date account).
+            #
+            # Round 21: `str(exc)` (the TimeoutError `_load_with_timeout`
+            # raises) includes `checkpoint_dir` -- a full local filesystem
+            # path -- interpolated directly into its own message. That
+            # raw text used to be folded into the *raised* RuntimeError
+            # too, and a real 2026-08-14 run's clinical PDF printed the
+            # resulting path in its Data Source Provenance section (same
+            # leak class round 20 fixed on the network-error branch just
+            # above, via the identical `ModelManager._failed` ->
+            # `model_checkpoints[...]["reason"]` -> report route). Full
+            # detail (including the path) stays in this log line only,
+            # at `warning` so a real run still captures it without
+            # needing debug logging. What survives into the raised,
+            # report-facing message is deliberately NOT nothing, unlike
+            # the network branch: the "succeeds in isolation / stalls
+            # only inside the full orchestrator" correction is round 18's
+            # actual fix for a story (TensorFlow-backend detection) that
+            # misled this project for months, and dropping it back to a
+            # bare "SpliceBERT model unavailable" would silently undo
+            # that correction for every future reader of a real report.
+            # That sentence names no path, URL, or internal identifier --
+            # it's a behavioral fact about GEPER's own process, safe to
+            # show a report reader the same way any other "this model
+            # could not be run" caveat already is.
+            log_message = (
+                f"SpliceBERT checkpoint load for '{checkpoint}' timed out after "
+                f"{CONFIG.splicing.SPLICEBERT_LOAD_TIMEOUT_SECS:.0f}s ({exc})"
             )
-            self.logger.warning(message, exc_info=True)
-            raise RuntimeError(message) from exc
+            self.logger.warning(log_message, exc_info=True)
+            raise RuntimeError(
+                f"SpliceBERT model unavailable: checkpoint load timed out after "
+                f"{CONFIG.splicing.SPLICEBERT_LOAD_TIMEOUT_SECS:.0f}s. This load succeeds quickly in "
+                "isolation but has repeatedly stalled specifically inside the full pipeline process; "
+                "see server logs for the full diagnostic detail."
+            ) from exc
 
         model.to(self.device)
         model.eval()
@@ -383,12 +468,7 @@ class SpliceBERTPlugin(PluginModel):
 
         max_abs_change = max(abs(v) for v in prob_changes)
 
-        if max_abs_change < _NO_EFFECT_THRESHOLD:
-            classification = "no_significant_effect"
-        elif max_abs_change < _MODERATE_EFFECT_THRESHOLD:
-            classification = "moderate_effect"
-        else:
-            classification = "large_effect"
+        classification = _classify(max_abs_change)
 
         # Not a calibrated probability -- see the caveat above. Already
         # bounded to [0, 1] since it's a difference of two softmax

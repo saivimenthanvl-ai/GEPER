@@ -11,16 +11,14 @@ GAP 5 — gnomad_constraint and hotspot config sections
 GAP 6 — api package discoverable via setuptools
 GAP 7 — anyio / pytest-anyio available
 """
+
 from __future__ import annotations
 
 import os
-import signal
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Dict
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,7 +33,7 @@ if str(_ROOT) not in sys.path:
 # GAP 1 — VEP Annotation Stage
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from pipeline.vep.stage import VEPAnnotationStage, VEPVariantAnnotation
+from pipeline.vep.stage import VEPAnnotationStage
 from pipeline.fastq.errors import FastqPipelineError
 
 
@@ -43,9 +41,14 @@ def test_gap1_vep_raises_when_binary_absent(tmp_path):
     """VEPAnnotationStage.run() raises FastqPipelineError when vep is absent."""
     stage = VEPAnnotationStage(cfg={"vep": {"enabled": True}})
     # Patch _require to simulate vep not on PATH
-    with patch("pipeline.vep.stage._require", side_effect=FastqPipelineError(
-        "Required tool 'vep' is not installed or not on PATH.", stage="vep_annotation", tool="vep"
-    )):
+    with patch(
+        "pipeline.vep.stage._require",
+        side_effect=FastqPipelineError(
+            "Required tool 'vep' is not installed or not on PATH.",
+            stage="vep_annotation",
+            tool="vep",
+        ),
+    ):
         with pytest.raises(FastqPipelineError) as exc_info:
             stage.run(
                 filtered_vcf_path=str(tmp_path / "test.vcf"),
@@ -112,23 +115,29 @@ chr1\t200\t.\tG\tA\t80\tPASS\tCSQ=A|missense_variant|TP53|ENST00000269305|NM_000
 
 def test_gap1_vep_checkpoint_written(tmp_path):
     """vep_annotation checkpoint key is written after successful VEP stage."""
-    import json
-    from unittest.mock import MagicMock
 
     vcf_path = tmp_path / "test.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
     stage = VEPAnnotationStage(cfg={"vep": {"enabled": True}})
 
-    # Mock the subprocess to return success with empty VCF output
-    with patch("pipeline.vep.stage._require", return_value="/usr/bin/vep"), \
-         patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    # Mock the subprocess to return success with empty VCF output. vep/
+    # stage.py now routes through the shared _run() helper (not a direct
+    # subprocess.run) so DELETE can find and kill it mid-run -- see
+    # pipeline/utils/process_control.py -- so that's what's mocked here;
+    # vep/stage.py doesn't use _run()'s return value (output comes from
+    # parsing the annotated VCF file on disk), so a bare success is enough.
+    with (
+        patch("pipeline.vep.stage._require", return_value="/usr/bin/vep"),
+        patch("pipeline.vep.stage._run", return_value=None),
+    ):
         # Create empty output VCF
         out_dir = tmp_path / "vep_out"
         out_dir.mkdir()
         annotated = out_dir / "vep_annotated.vcf"
-        annotated.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+        annotated.write_text(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        )
 
         result = stage.run(
             filtered_vcf_path=str(vcf_path),
@@ -142,14 +151,26 @@ def test_gap1_vep_checkpoint_written(tmp_path):
 # GAP 2 — API Authentication
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from fastapi.testclient import TestClient
+# `fastapi` is not always installed (see e.g. test_api.py's own guarded
+# import) -- deliberately NOT imported at module level here. A
+# module-level `from fastapi.testclient import TestClient` aborts
+# collection of this WHOLE FILE (and, with no
+# `--continue-on-collection-errors` in pyproject.toml, the rest of the
+# suite invoked alongside it) with a single opaque error the moment
+# fastapi is missing, instead of letting the ~1000 tests that don't
+# need it run and reporting real results. Every function below that
+# needs `TestClient` imports it locally, matching the pattern
+# test_fixes_6_to_11.py already uses for the same reason.
 
 
 def _make_api_client(api_keys_env: str = ""):
     """Create a TestClient with GEPER_API_KEYS set to api_keys_env."""
+    from fastapi.testclient import TestClient
+
     # Patch the env var and reload the module-level _API_KEYS
     with patch.dict(os.environ, {"GEPER_API_KEYS": api_keys_env}, clear=False):
         from api import main as api_main
+
         # Re-compute the API keys for this test
         api_main._API_KEYS = api_main._load_api_keys()
         client = TestClient(api_main.app, raise_server_exceptions=False)
@@ -166,11 +187,14 @@ def test_gap2_health_always_200_no_key():
 def test_gap2_start_401_no_key():
     """pipeline/start returns 401 when GEPER_API_KEYS is set and no key provided."""
     client, _ = _make_api_client("secretkey123")
-    resp = client.post("/api/v1/pipeline/start", json={
-        "fastq_r1_path": "/tmp/r1.fastq.gz",
-        "reference_fasta_path": "/tmp/ref.fasta",
-        "sample_id": "TEST01",
-    })
+    resp = client.post(
+        "/api/v1/pipeline/start",
+        json={
+            "fastq_r1_path": "/tmp/r1.fastq.gz",
+            "reference_fasta_path": "/tmp/ref.fasta",
+            "sample_id": "TEST01",
+        },
+    )
     assert resp.status_code == 401
 
 
@@ -196,15 +220,19 @@ def test_gap2_start_accepts_correct_key(tmp_path):
     ref = tmp_path / "ref.fasta"
     ref.touch()
 
+    from fastapi.testclient import TestClient
     from api import main as api_main
+
     api_main._API_KEYS = {"goodkey"}
 
     client = TestClient(api_main.app, raise_server_exceptions=False)
 
     # Patch heavy parts so the test is about auth only
-    with patch("api.main._validate_path_in_roots", return_value=tmp_path), \
-         patch.object(Path, "exists", return_value=True), \
-         patch("api.main._run_pipeline_sync"):
+    with (
+        patch("api.main._validate_path_in_roots", return_value=tmp_path),
+        patch.object(Path, "exists", return_value=True),
+        patch("api.main._run_pipeline_sync"),
+    ):
         resp = client.post(
             "/api/v1/pipeline/start",
             json={
@@ -223,7 +251,9 @@ def test_gap2_dev_mode_no_key_needed():
     # _API_KEYS = None means dev mode
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("GEPER_API_KEYS", None)
+        from fastapi.testclient import TestClient
         from api import main as api_main
+
         api_main._API_KEYS = None  # explicit dev mode
         client = TestClient(api_main.app, raise_server_exceptions=False)
         # /health should definitely return 200
@@ -334,8 +364,11 @@ def test_issue3_list_runs_does_not_leak_without_auth():
     protection on the report/log download endpoints."""
     client, api_main = _make_api_client("secretkey123")
     api_main._RUNS["leak-test-run"] = {
-        "run_id": "leak-test-run", "sample_id": "PATIENT-PHI-001",
-        "status": "completed", "progress_pct": 100.0, "started_at": None,
+        "run_id": "leak-test-run",
+        "sample_id": "PATIENT-PHI-001",
+        "status": "completed",
+        "progress_pct": 100.0,
+        "started_at": None,
     }
     try:
         resp = client.get("/api/v1/pipeline")
@@ -423,9 +456,10 @@ def test_gap3_delete_removes_run(tmp_path):
 # GAP 4 — Real process cancellation
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def test_gap4_delete_sets_status_cancelled(tmp_path):
     """After delete_run() on a running run, status becomes 'cancelled'."""
-    from api.run_store import RunStore
+    from fastapi.testclient import TestClient
     from api import main as api_main
 
     # Inject a fake running run
@@ -454,7 +488,7 @@ def test_gap4_delete_sets_status_cancelled(tmp_path):
     client = TestClient(api_main.app, raise_server_exceptions=False)
     api_main._API_KEYS = None  # dev mode
 
-    with patch("os.killpg"), patch("shutil.rmtree"):
+    with patch("shutil.rmtree"):
         resp = client.delete(f"/api/v1/pipeline/{run_id}")
 
     assert resp.status_code == 200
@@ -462,8 +496,14 @@ def test_gap4_delete_sets_status_cancelled(tmp_path):
     assert run_id not in api_main._RUNS
 
 
-def test_gap4_killpg_called_with_sigterm():
-    """os.killpg is called with SIGTERM when a running run is deleted."""
+def test_gap4_termination_requested_for_active_process():
+    """The currently-active subprocess for a running run is handed to
+    request_termination_async() when that run is deleted -- the
+    cross-platform replacement for the old POSIX-only os.killpg/SIGTERM
+    call (see pipeline/utils/process_control.py; os.killpg doesn't exist
+    on Windows at all, so a test asserting on it directly can never pass
+    there)."""
+    from fastapi.testclient import TestClient
     from api import main as api_main
 
     run_id = "killtest"
@@ -487,21 +527,26 @@ def test_gap4_killpg_called_with_sigterm():
         "reference_fasta": "/tmp/ref.fasta",
     }
     api_main._RUN_STORE.create(run_id, api_main._RUNS[run_id])
-    api_main._PROCESS_GROUPS[run_id] = 99999  # fake pgid
+    fake_proc = MagicMock()
+    api_main._ACTIVE_PROCESSES[run_id] = fake_proc
     api_main._API_KEYS = None
 
     client = TestClient(api_main.app, raise_server_exceptions=False)
-    with patch("os.killpg") as mock_kill, patch("shutil.rmtree"):
+    with (
+        patch("api.main.request_termination_async") as mock_terminate,
+        patch("shutil.rmtree"),
+    ):
         resp = client.delete(f"/api/v1/pipeline/{run_id}")
 
     assert resp.status_code == 200
-    mock_kill.assert_called()
-    first_call_args = mock_kill.call_args_list[0]
-    assert first_call_args[0][1] == signal.SIGTERM
+    mock_terminate.assert_called_once_with(fake_proc)
+    # The registry entry is cleared once termination has been requested.
+    assert run_id not in api_main._ACTIVE_PROCESSES
 
 
 def test_gap4_delete_completed_no_kill():
     """delete_run() on a completed run does not attempt to kill anything."""
+    from fastapi.testclient import TestClient
     from api import main as api_main
 
     run_id = "completedrun"
@@ -528,16 +573,21 @@ def test_gap4_delete_completed_no_kill():
     api_main._API_KEYS = None
 
     client = TestClient(api_main.app, raise_server_exceptions=False)
-    with patch("os.killpg") as mock_kill, patch("shutil.rmtree"):
+    with (
+        patch("api.main.request_termination_async") as mock_terminate,
+        patch("shutil.rmtree"),
+    ):
         resp = client.delete(f"/api/v1/pipeline/{run_id}")
 
     assert resp.status_code == 200
-    mock_kill.assert_not_called()
+    mock_terminate.assert_not_called()
 
 
 def test_gap4_delete_unknown_run_returns_404():
     """delete_run() on an unknown run_id returns 404."""
+    from fastapi.testclient import TestClient
     from api import main as api_main
+
     api_main._API_KEYS = None
 
     # Ensure not in store
@@ -552,7 +602,7 @@ def test_gap4_delete_unknown_run_returns_404():
 # GAP 5 — gnomad_constraint and hotspot config sections
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from pipeline.config_validator import validate_config, ConfigValidationError
+from pipeline.config_validator import validate_config
 
 
 def test_gap5_no_raise_empty_gnomad_constraint_tsv_path():
@@ -571,6 +621,7 @@ def test_gap5_no_raise_hotspot_section_absent():
 def test_gap5_gnomad_constraint_lookup_missing_cfg():
     """GnomadConstraintLookup initialises without error when cfg['gnomad_constraint'] is missing."""
     from pipeline.constraint.lookup import GnomadConstraintLookup
+
     # Pass empty config — should not raise
     lookup = GnomadConstraintLookup(cfg={})
     assert lookup is not None
@@ -580,9 +631,11 @@ def test_gap5_gnomad_constraint_lookup_missing_cfg():
 # GAP 6 — api package discoverable via setuptools
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def test_gap6_api_in_find_packages():
     """'api' is in the list returned by setuptools.find_packages() for the project root."""
     import setuptools
+
     packages = setuptools.find_packages(where=str(_ROOT), include=["pipeline*", "geper*", "api*"])
     assert "api" in packages, f"'api' not found in packages: {packages}"
 
@@ -590,6 +643,7 @@ def test_gap6_api_in_find_packages():
 def test_gap6_api_main_importable():
     """from api.main import app succeeds."""
     from api.main import app
+
     assert app is not None
 
 
@@ -597,16 +651,55 @@ def test_gap6_api_main_importable():
 # GAP 7 — anyio and pytest-anyio available
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def test_gap7_anyio_importable():
     """anyio is importable."""
     import anyio
+
     assert anyio is not None
 
 
-def test_gap7_pytest_anyio_mark_recognised():
-    """pytest.mark.anyio is a recognised mark (not unknown)."""
-    import pytest
-    # If pytest-anyio is installed, the mark is registered.
-    # We check it doesn't throw MarkDecorator errors when accessed.
-    mark = pytest.mark.anyio
-    assert mark is not None
+@pytest.mark.anyio
+async def test_gap7_pytest_anyio_mark_recognised():
+    """
+    `@pytest.mark.anyio`-marked async tests actually run under anyio's
+    pytest plugin -- not merely that `pytest.mark.anyio` can be spelled.
+
+    `pytest.mark.<anything>` returns a non-None `MarkDecorator` for
+    literally any attribute name, whether or not a plugin backs it --
+    `_pytest.mark.MarkGenerator.__getattr__` synthesizes one
+    unconditionally (confirmed directly:
+    `pytest.mark.this_plugin_definitely_does_not_exist_zzz` is also
+    non-None). The previous version of this test asserted exactly that
+    ("mark is not None") and so could never fail regardless of whether
+    anyio's pytest plugin was installed, registered, or even existed --
+    a cannot-fail assertion, not a check.
+
+    This checks the real, discriminating fact instead: an `async def`
+    test genuinely gets collected and its body genuinely gets awaited.
+    Without a working async-capable pytest plugin, pytest cannot run an
+    `async def` test at all -- it fails the test outright with "async
+    def functions are not natively supported" rather than silently
+    skipping the body -- so reaching the final assertion here is itself
+    proof the mark does real work, the same real-world path
+    `tests/test_fixes_6_to_11.py`'s async API tests (auth, cancellation)
+    already depend on.
+
+    Verified both directions by hand before landing this test: passes
+    under a normal run; fails with exactly that "async def functions
+    are not natively supported" diagnostic under `pytest -p no:anyio`.
+    (An earlier draft of this fix instead checked
+    `pytestconfig.pluginmanager.list_name_plugin()` for "anyio" -- that
+    turned out to *also* report "anyio" as registered even under
+    `-p no:anyio` in this pytest/anyio version, i.e. it would not have
+    discriminated either. Caught by running it against both conditions
+    before trusting it, not assumed correct because it looked
+    plausible.)
+    """
+    ran = []
+
+    async def _mark_ran():
+        ran.append(True)
+
+    await _mark_ran()
+    assert ran == [True]

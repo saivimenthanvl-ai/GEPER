@@ -82,10 +82,25 @@ from pipeline.variant_normalization import bare_spdi
 from pipeline.vcf_parser import Variant
 from utils.exceptions import ExternalAPIError
 from utils.logger import get_logger
-from utils.ncbi_eutils import lenient_json_loads, parse_retry_after, warn_if_placeholder_contact
+from utils.ncbi_eutils import lenient_json_loads, parse_retry_after, parse_vcv_submitters, warn_if_placeholder_contact
 from utils.service_health import HEALTH, is_transient_http_error
 
 logger = get_logger(__name__)
+
+
+def _entrez_chrom(chrom: str) -> str:
+    """
+    Strip an optional 'chr' prefix for NCBI Entrez's ClinVar `[chr]`
+    field -- which, for the mitochondrial contig specifically, wants
+    'MT', never 'M'. Confirmed live (round 15): `MT[chr]` returns
+    hits, `M[chr]` returns zero with an NCBI "phrase not found"
+    warning. A bare strip-and-pass-through silently drops every MT
+    variant whose VCF spelled the contig 'M'/'chrM' (same M-family
+    special case already handled in pipeline.hgvs_utils._strip_chr and
+    models.alphamissense._normalize_chrom_for_catalogue).
+    """
+    bare = chrom[3:] if chrom.lower().startswith("chr") else chrom
+    return "MT" if bare.upper() in ("M", "MT") else bare
 
 
 class ClinVarMatchStatus(str, enum.Enum):
@@ -103,6 +118,14 @@ class ClinVarMatchStatus(str, enum.Enum):
     NOT_FOUND = "not_found"  # esearch returned nothing at this position at all
     POSITION_ONLY = "position_only"  # record(s) exist at this position, but none match this allele
     MATCHED = "matched"  # at least one record's allele (and position) matches the query variant
+
+    def __bool__(self):
+        raise TypeError(
+            "ClinVarMatchStatus has no truth value -- every member of a `str` enum is truthy, "
+            "so `if x:`/`if not x:` silently collapses NOT_FOUND, POSITION_ONLY and MATCHED "
+            "into one answer, which is exactly the distinction this type exists to "
+            "keep. Compare explicitly, e.g. `x is ClinVarMatchStatus.MATCHED`."
+        )
 
 
 class ClinVarClient:
@@ -177,6 +200,17 @@ class ClinVarClient:
         if matched_records:
             match_status = ClinVarMatchStatus.MATCHED
             primary_record = self._select_primary(matched_records)
+            # Round 30: submitting organisation(s) for every record that
+            # can actually contribute to a criterion (PS1/PM5/BP6 all
+            # read `matched_records`/`primary_record`, never `records`'
+            # position-only noise) -- see `_fetch_submitters` for why
+            # this needs a second request. Best-effort: a failure here
+            # (logged inside `_fetch_submitters`) leaves `submitters`
+            # unset rather than blocking the classification-relevant
+            # result already computed above.
+            submitters_by_uid = self._fetch_submitters([r["uid"] for r in matched_records])
+            for r in matched_records:
+                r["submitters"] = submitters_by_uid.get(r["uid"])
         else:
             match_status = ClinVarMatchStatus.POSITION_ONLY
             primary_record = None
@@ -228,7 +262,7 @@ class ClinVarClient:
         return max(matched_records, key=sort_key)
 
     def _positional_search_term(self, variant: Variant, assembly: Optional[str]) -> str:
-        chrom = variant.chrom.replace("chr", "")
+        chrom = _entrez_chrom(variant.chrom)
         position_field = self._position_field(assembly)
         # NOTE: earlier versions appended a bare `AND {ref}>{alt}` clause
         # here with no Entrez field tag. An untagged term is matched as
@@ -326,6 +360,48 @@ class ClinVarClient:
                 }
             )
         return records
+
+    def _fetch_submitters(self, uids: List[str]) -> Dict[str, List[Dict[str, Optional[str]]]]:
+        """
+        Submitting organisation(s) for each ClinVar `uid`, via a single
+        batched `efetch&rettype=vcv` request (VCV XML) -- NOT available
+        from the `esummary` JSON `_esummary` already parses (confirmed
+        live: `supporting_submissions.scv` there is bare SCV
+        accessions with no org name; `parse_vcv_submitters`'s docstring
+        has the full comparison). Batched the same way `_esummary`
+        batches its own `id` parameter, so this is one extra request
+        per `query_variant` call, not one per record.
+
+        Best-effort and never raises: a submitter lookup is
+        supplementary provenance, not something PS1/PM5/BP6's own
+        pathogenic/benign classification depends on, so a network or
+        parse failure here is logged and yields `{}` (leaving
+        `submitters` unset on every affected record) rather than
+        surfacing as an `ExternalAPIError` that would block the
+        classification-relevant result `query_variant` already
+        computed before calling this.
+        """
+        if not uids:
+            return {}
+        params = {
+            "db": self.db,
+            "id": ",".join(uids),
+            "rettype": "vcv",
+            "is_variationid": "true",
+            "tool": CONFIG.api.NCBI_TOOL_NAME,
+            "email": CONFIG.api.NCBI_EMAIL,
+        }
+        if CONFIG.api.NCBI_API_KEY:
+            params["api_key"] = CONFIG.api.NCBI_API_KEY
+        try:
+            response = requests.get(
+                f"{self.base_url}/efetch.fcgi", params=params, timeout=CONFIG.api.REQUEST_TIMEOUT_SECS
+            )
+            response.raise_for_status()
+            return parse_vcv_submitters(response.text)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad; see docstring above.
+            logger.warning(f"ClinVar submitter lookup failed for {len(uids)} record(s); submitters left unset: {exc}")
+            return {}
 
     @staticmethod
     def _variant_match(entry: Dict[str, Any], variant: Optional[Variant], assembly: Optional[str]) -> Optional[bool]:
@@ -468,7 +544,17 @@ class ClinVarClient:
         """
         if HEALTH.is_offline("ClinVar"):
             HEALTH.note_skip("ClinVar")
-            raise ExternalAPIError(f"ClinVar request to '{url}' skipped: ClinVar was confirmed offline at startup.")
+            logger.warning(f"ClinVar request to '{url}' skipped: ClinVar was confirmed offline at startup.")
+            # Round 26: the message actually raised (folded verbatim into
+            # `clinvar_error` -- see `report/clinical_report_builder.py::
+            # _clinical_evidence` -- and rendered into every report
+            # unconditionally by `report/report_generator.py`, plus
+            # embedded verbatim in geper_results.json's `clinvar` key by
+            # `report/json_builder.py`) must not embed `url`; full detail
+            # goes to the log line above only. Same pattern rounds 20-24
+            # applied to SpliceBERT/MMSplice/UniProt/InterPro/ClinGen/
+            # AlphaFold DB.
+            raise ExternalAPIError("ClinVar request skipped: ClinVar was confirmed offline at startup.")
 
         last_error: Optional[Exception] = None
         for attempt in range(1, CONFIG.api.MAX_RETRIES + 1):
@@ -497,6 +583,10 @@ class ClinVarClient:
                 if attempt < CONFIG.api.MAX_RETRIES:
                     time.sleep(CONFIG.api.RETRY_BACKOFF_SECS * attempt)
         HEALTH.note_failure("ClinVar")
-        raise ExternalAPIError(
-            f"ClinVar request to '{url}' failed after {CONFIG.api.MAX_RETRIES} attempts: {last_error}"
+        logger.warning(
+            f"ClinVar request to '{url}' failed after {CONFIG.api.MAX_RETRIES} attempts: {last_error}",
+            exc_info=last_error,
         )
+        # Round 26: see the sanitization note on the offline-skip raise
+        # above -- the raised message must not embed `url`/`last_error`.
+        raise ExternalAPIError(f"ClinVar request failed after {CONFIG.api.MAX_RETRIES} attempts")

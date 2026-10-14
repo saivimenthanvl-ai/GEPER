@@ -1,3 +1,25 @@
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: Performance benchmark for the SpliceFormer plugin's own code path
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 Performance benchmark for the SpliceFormer plugin's own code path
 (sequence preparation, one-hot encoding, and the post-inference
@@ -76,9 +98,7 @@ class _FastFakeSpliceFormerModel:
         import torch
 
         n = features.shape[0]
-        out = torch.stack(
-            [torch.full((3, 8), 0.1 * (i % 3)) for i in range(n)], dim=0
-        )
+        out = torch.stack([torch.full((3, 8), 0.1 * (i % 3)) for i in range(n)], dim=0)
         return out, None, None, None, None
 
 
@@ -97,17 +117,15 @@ def main() -> None:
     registry.register("spliceformer", SpliceFormerPlugin)
     manager = ModelManager(registry=registry)
 
-    with mock.patch(
-        "pipeline.models.spliceformer_plugin.CONFIG"
-    ) as mock_config, mock.patch(
-        "pipeline.models.spliceformer_plugin.ensure_pip_package_available", return_value=True
-    ), mock.patch(
-        "pipeline.models.spliceformer_plugin.spliceformer_loader.build_model",
-        return_value=_FastFakeSpliceFormerModel(),
-    ), mock.patch(
-        "pipeline.models.spliceformer_plugin.spliceformer_loader.download_checkpoint"
-    ), mock.patch(
-        "pipeline.models.spliceformer_plugin.spliceformer_loader.load_checkpoint_into"
+    with (
+        mock.patch("pipeline.models.spliceformer_plugin.CONFIG") as mock_config,
+        mock.patch("pipeline.models.spliceformer_plugin.ensure_pip_package_available", return_value=True),
+        mock.patch(
+            "pipeline.models.spliceformer_plugin.spliceformer_loader.build_model",
+            return_value=_FastFakeSpliceFormerModel(),
+        ),
+        mock.patch("pipeline.models.spliceformer_plugin.spliceformer_loader.download_checkpoint"),
+        mock.patch("pipeline.models.spliceformer_plugin.spliceformer_loader.load_checkpoint_into"),
     ):
         mock_config.splicing.ENABLE_SPLICEFORMER = True
         mock_config.splicing.SPLICEFORMER_SOURCE_REF = "v1.0.0"

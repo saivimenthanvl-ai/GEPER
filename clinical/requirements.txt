@@ -1,0 +1,68 @@
+# clinical/requirements.txt
+# ─────────────────────────
+# WHAT THE CLINICAL SERVICE NEEDS TO RUN, DECLARED IN ONE PLACE BECAUSE A
+# DEPENDENCY THAT IS NOT DECLARED WILL BE ABSENT SOMEWHERE.
+#
+# This file did not exist until the service did, and its absence had already
+# cost twice in one evening:
+#   - the clinical CI job lists its packages inline and had no `fastapi`, so
+#     nine HTTP tests skipped and CLINICAL_REQUIRE_DB turned each skip into a
+#     failure;
+#   - `.github/workflows/pytest.yml` sets `cache-dependency-path:
+#     clinical/requirements.txt`, a path that did not resolve to anything.
+# `bcrypt` in particular was declared NOWHERE in the repository -- only in
+# that inline CI line -- while `clinical/data_access.py` imports it inside
+# BcryptHasher. A lazy import means the gap does not show at startup; it shows
+# the first time someone tries to authenticate.
+#
+# Unpinned, matching geper/requirements.txt's stated convention for the same
+# packages. See that file's own note on why psycopg is not pinned.
+
+# ── The service ──────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# ── The database ─────────────────────────────────────────────────────────────
+# The [binary] extra, not bare psycopg: it ships its own libpq, so no system
+# package is required in the image. Matches geper/requirements.txt.
+psycopg[binary]
+
+# ── Passwords ────────────────────────────────────────────────────────────────
+# Imported lazily by clinical/data_access.py::BcryptHasher. Absent here, the
+# service starts happily and fails at the first login.
+bcrypt
+
+# ── MFA ──────────────────────────────────────────────────────────────────────
+# Imported lazily by clinical/data_access.py::PyOtpVerifier.matching_step(),
+# same shape as bcrypt above.
+#
+# UPDATED w164: THIS IS NO LONGER PREEMPTIVE. The line above used to say
+# PyOtpVerifier was "dormant today (never instantiated in production)" and
+# warned that deleting it would surface as a ModuleNotFoundError the moment
+# somebody wired MFA in. Somebody did. `DataAccess.__init__` now defaults
+# `totp_verifier` to `PyOtpVerifier()`, so every production construction
+# carries one, and the lazy import means an absent pyotp still would not show
+# at startup -- it would show at the first second factor.
+pyotp
+
+# ── MFA: the key that protects the stored secret ──────────────────────────────
+# Imported lazily by clinical/data_access.py::FernetSecretCipher, and ONLY when
+# CLINICAL_TOTP_SECRET_KEYS is set -- a deployment that has not turned MFA on
+# never touches it. Fernet is AES-128-CBC with an HMAC-SHA256 over the
+# ciphertext; the standard library has no AEAD, and the alternative to a
+# maintained implementation is writing a cipher for a clinical product.
+#
+# UNPINNED, matching every other line in this file. THE CI JOB THAT NEEDS IT
+# ALREADY INSTALLS THIS FILE (.github/workflows/pytest.yml, clinical-tests:
+# `pip install -r requirements.txt`). The geper-tests job installs bcrypt only
+# and does NOT need this one: it builds DataAccess without a key configured, so
+# `default_secret_cipher()` returns None and the import is never reached -- the
+# same measurement that job's own comment already records.
+cryptography
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+# httpx is required by starlette's TestClient, which raises RuntimeError --
+# not ImportError -- when it is missing, so pytest.importorskip does not catch
+# it and it surfaces as an unexplained error at setup.
+pytest
+httpx>=0.27.0

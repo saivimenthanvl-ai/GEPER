@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geper-platform"
+version = "1.0.0"
+description = "GEPER Clinical Platform — unified workspace for shared utilities, clinical layer, and interpretation engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Minimal package: only shared/ is a pure Python package
+# Install with: pip install -e . (from repo root)
+# Makes import shared work everywhere, including in subprocesses
+# Other trees (kim_pipeline, clinical, geper) have their own requirements.txt
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shared*"]

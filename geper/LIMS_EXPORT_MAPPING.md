@@ -43,6 +43,32 @@ timestamps, real HGVS nomenclature, verbatim ACMG/AMP 2015 classification
 terms, real external accessions) so a future FHIR crosswalk is a mapping
 exercise against this table, not a rewrite.
 
+## Governance gate: review/sign-off required before export
+
+Round 30 part 2: `export_lims_json`/`export_lims_csv` (and the pure
+`build_lims_export` they both call) refuse to run at all unless the
+source `geper_results.json`'s `review_status` field is exactly
+`"reviewed"` -- raising `utils.exceptions.LIMSExportBlockedError` and
+writing an `action: "export_blocked"` entry to a `geper_signoff_audit.log`
+alongside the requested export path (see `report/export_lims.py
+::_require_reviewed`). A LIMS is an automated downstream consumer that
+never opens the PDF a human clinician would see the DRAFT/OVERRIDDEN
+status on, so this gate exists precisely so an unreviewed -- or
+subsequently clinician-overridden -- run's classification can never
+reach a hospital's LIMS silently.
+
+`review_status` starts `"draft"` (set by `report/json_builder.py` at
+generation time) and only ever changes via `review/signoff.py`:
+`approve()` sets it to `"reviewed"` (plus `reviewed_by`/`reviewed_at`);
+`override()` sets it to `"overridden"` -- deliberately re-blocking
+export even on a previously-approved run, since the prior sign-off no
+longer covers content a clinician has since changed. A fresh
+`approve()` call after an `override()` is what makes a run
+export-eligible again. `review_status`/`reviewed_by`/`reviewed_at` are
+NOT themselves part of the `LIMSExport` schema below -- they gate
+whether an export happens at all, rather than being data a LIMS needs
+mapped.
+
 ## Format
 
 - **JSON** (`export_lims_json`): one file per run, nested, matches the
@@ -71,12 +97,32 @@ result is worse than an honest `null`.
 | `run.sample_id` | `sample_id` | `document["vcf_samples"]` (joined), else the input VCF's filename stem | GEPER has no first-class Sample ID concept (see `report/summary.py::_derive_sample_id`, reused directly here -- not re-derived). A real deployment should supply its own authoritative sample ID. |
 | `run.run_id` | `run_id` | caller-supplied override, else derived from `document["generated_at"]` | Reuses `report/summary.py::_derive_run_id` directly, so a JSON export and a PDF generated from the same `geper_results.json` (and no explicit `run_id`) get the *same* run ID. |
 | `run.input_vcf` | -- | `document["input_vcf"]` | Verbatim. |
-| `run.reference_assembly` | -- | `document["assembly"]` | e.g. `"GRCh38"`; `null` if the assembly preflight never resolved one. |
+| `run.reference_assembly` | `reference_assembly` (CSV repeats the same value in every row of a given export; empty cell when `null`) | `document["assembly"]` | e.g. `"GRCh38"`; `null` if the assembly preflight never resolved one. CSV column added 2026-09-11 under the ruling "put the build on every rendered surface" -- until then the CSV was the one surface that omitted it. Appended as the last CSV column, after the `variant_allele_fraction` pair, so existing column positions are unchanged. |
 | `run.variant_count` | -- | `document["variant_count"]` | |
 | `run.geper_code_version` | -- | `document["code_version"]` | GEPER's own code version (`pipeline/provenance.py::get_geper_code_version`) -- for reproducibility, not a clinical field. |
 | `run.generated_at` | -- | `document["generated_at"]` | ISO 8601 UTC, verbatim -- GEPER already stores it that way. |
+| `run.caveats[]` | `run_caveats` (semicolon-joined; CSV repeats the same value in every row of a given export) | `document["caveats"]` | Statements qualifying the whole run rather than any one finding -- currently just `RESEARCH_USE_DISCLAIMER`, with more queued (see `report/json_builder.py`). `[]` for a pre-`428a77d` document with no such field, never a fabricated placeholder. Appended as the last CSV column so existing column positions are unchanged for anything already parsing this file. |
 
 ## Per-finding fields
+
+> **Key rename, 2026-08-22 — action required before 2026-11-22.**
+> The per-variant object formerly published as `variants[i]["clinical_report"]`
+> is now `variants[i]["candidate_interpretation"]`. The old key is still
+> emitted, pointing at the **same object**, as a deprecated alias, and is
+> scheduled for removal after the next release (target 2026-11-22).
+>
+> The rename is not cosmetic: GEPER produces a draft classification for a
+> qualified human to review and sign off, and does not independently provide
+> a final clinical interpretation (EJ-01). A key named `clinical_report` tells
+> every downstream consumer the opposite.
+>
+> **Why you must act rather than wait for a failure.** Every consumer of this
+> document reads the key defensively — `.get("clinical_report") or {}` is the
+> shape used throughout GEPER's own code, and integrations tend to mirror it.
+> When the alias is removed, that pattern does not raise: it yields an empty
+> object and the integration carries on reporting nothing, silently. Migrate
+> on the date, not on the first error, because there will not be a first error.
+
 
 `findings[]` -- one entry per `document["variants"][i]`, in the same
 order. `finding_number` (1-based) is stable across export runs against
@@ -99,6 +145,10 @@ cross-reference this export against those reports directly.
 | `variant.coding_hgvs` | `coding_hgvs` | `variants[i]["normalization"]["hgvs_c"]` | HGVS.c -- only when a transcript structure resolved for this variant (`pipeline/hgvs_utils.py::to_hgvs_c`). `null` for intergenic variants or when transcript resolution failed. |
 | `variant.protein_hgvs` | `protein_hgvs` | `variants[i]["alphamissense"]["protein_variant"]`, only when `alphamissense["found"]` | **Honest gap, stated plainly:** GEPER's `pipeline/hgvs_utils.py` supports computing HGVS.p (`to_hgvs_p`/`to_hgvs_p_for_substitution`), but no orchestrator stage currently calls it for every variant -- confirmed by grepping `pipeline/orchestrator.py` for both function names (zero call sites as of this writing). The one place a real protein change already flows into `geper_results.json` is AlphaMissense's own precomputed catalogue match, available only for missense variants AlphaMissense actually scored. `null` for every other variant -- never independently computed or guessed here. |
 | `variant.protein_hgvs_source` | `protein_hgvs_source` | derived | `"alphamissense_catalogue"` when `protein_hgvs` is populated; `null` otherwise. Exists so a downstream consumer never mistakes an AlphaMissense-sourced protein change for a GEPER-computed one. |
+| `variant.variant_allele_fraction` | `variant_allele_fraction` | derived from `variants[i]["variant"]["variant_allele_fractions"]` | **Within-sample read support (NABL 112A Issue 01, s.7.8.5(b)(iii)) -- NOT the population allele frequency.** Do not confuse this with `evidence.gnomad_global_af` below: that is how common the variant is in the general population (and feeds PM2/BS1); this is what fraction of THIS patient's reads carry it (used for zygosity and somatic mosaicism). Computed as `AD[alt]/sum(AD)` from the VCF's per-sample `FORMAT/AD`, falling back to `FORMAT/AF` when AD is absent. `INFO/AF` is never read -- in a VCF that key is a cohort/population estimate, and GEPER already parses it as exactly that elsewhere. Populated **only** when exactly one sample carries a real fraction; `null` in every other case, with `variant_allele_fraction_status` saying which. Appended, together with its status column, as the two CSV columns immediately after `run_caveats` (since 2026-09-11 followed only by `reference_assembly`) so existing column positions are unchanged for anything already parsing this file -- the same reason, and the same precedent, as `run.caveats`. |
+| `variant.variant_allele_fraction_status` | `variant_allele_fraction_status` | derived | **Required; never `null`.** One of `"found"` (a real number is in the value column), `"not_run"` (nothing was ever measured -- the VCF carried no genotype columns, or FORMAT declared neither AD nor AF; this is an absence of measurement, NOT a fraction of zero), `"error"` (FORMAT was present but malformed/unusable for every sample), or `"multiple_samples"` (more than one sample carries a real fraction, so no single cell can represent them -- read the per-sample values from `geper_results.json`). This column is what makes the three empty-value cases distinguishable: `csv.DictWriter` writes `null` as an empty cell, so a consumer reading only the value column cannot tell "never measured" from "measurement failed". **A consumer must branch on this column, not on whether the value is blank.** |
+| `variant.variant_allele_fraction_sample` | -- | derived | The VCF sample column name the fraction came from. Present whenever the status is `"found"`, `null` otherwise -- a fraction never travels without the sample it was measured in, because an unlabelled number on a multi-sample run reads as though it applied to the whole record. |
+| `variant.variant_allele_fraction_reason` | -- | derived | Human-readable explanation of a non-`"found"` status, verbatim from the parser (e.g. which FORMAT field was malformed). `null` when a fraction was found. |
 
 ### Gene
 
@@ -112,7 +162,7 @@ cross-reference this export against those reports directly.
 
 | Export field | CSV column | GEPER source | Notes |
 |---|---|---|---|
-| `classification.acmg_classification` | `acmg_classification` | `variants[i]["clinical_report"]["acmg_classification"]["classification"]` | Verbatim ACMG/AMP 2015 term: `"Pathogenic"` \| `"Likely Pathogenic"` \| `"Uncertain Significance"` \| `"Likely Benign"` \| `"Benign"` \| `null`. Never remapped to a different vocabulary here. |
+| `classification.acmg_classification` | `acmg_classification` | `variants[i]["candidate_interpretation"]["acmg_classification"]["classification"]` | Verbatim ACMG/AMP 2015 term: `"Pathogenic"` \| `"Likely Pathogenic"` \| `"Uncertain Significance"` \| `"Likely Benign"` \| `"Benign"` \| `null`. Never remapped to a different vocabulary here. |
 | `classification.triggered_criteria[].code` etc. | `triggered_acmg_criteria` (semicolon-joined codes) | `...["acmg_classification"]["triggered_criteria"]` | Each entry: ACMG criterion code (e.g. `"PS3"`), strength, direction. |
 | `classification.not_evaluated_criteria_count` | `not_evaluated_criteria_count` | `...["acmg_classification"]["not_evaluated_count"]` | How many of the 28 ACMG/AMP criteria couldn't be evaluated for this variant due to missing evidence (e.g. no functional-evidence source available) -- see `pipeline/acmg_rules.py` for per-criterion reasons (not carried into this export; see `geper_results.json` itself for the full detail this summarizes). |
 
@@ -120,8 +170,8 @@ cross-reference this export against those reports directly.
 
 | Export field | CSV column | GEPER source | Notes |
 |---|---|---|---|
-| `confidence.pending` / `.score` / `.label` | `confidence_pending` / `confidence_score` / `confidence_label` | `variants[i]["clinical_report"]["confidence"]` | `pending=true` means confidence scoring did not complete for this variant -- `score`/`label` stay `null` in that case, never a fabricated default. |
-| `priority.pending` / `.score` / `.category` / `.rank` | `priority_pending` / `priority_score` / `priority_category` / `priority_rank` | `variants[i]["clinical_report"]["priority"]` | `rank` is 1-indexed, batch-relative (`pipeline/prioritization_engine.py::rank_batch`) -- `null` until every variant in the run has been scored. |
+| `confidence.pending` / `.score` / `.label` | `confidence_pending` / `confidence_score` / `confidence_label` | `variants[i]["candidate_interpretation"]["confidence"]` | `pending=true` means confidence scoring did not complete for this variant -- `score`/`label` stay `null` in that case, never a fabricated default. |
+| `priority.pending` / `.score` / `.category` / `.rank` | `priority_pending` / `priority_score` / `priority_category` / `priority_rank` | `variants[i]["candidate_interpretation"]["priority"]` | `rank` is 1-indexed, batch-relative (`pipeline/prioritization_engine.py::rank_batch`) -- `null` until every variant in the run has been scored. |
 
 ### Case-level phenotype-driven ranking (`pipeline/case_prioritization.py`)
 
@@ -156,12 +206,70 @@ cross-reference this export against those reports directly.
 
 | Export field | CSV column | GEPER source | Notes |
 |---|---|---|---|
-| `supporting_evidence[]` | -- | `variants[i]["clinical_report"]["supporting_evidence"]` | Free-text evidence statements, already deduplicated by Phase 2 (`pipeline/interpretation_result.py`). |
+| `supporting_evidence[]` | -- | `variants[i]["candidate_interpretation"]["supporting_evidence"]` | Free-text evidence statements, already deduplicated by Phase 2 (`pipeline/interpretation_result.py`). |
 | `conflicting_evidence[]` | -- | `...["conflicting_evidence"]` | |
 | `recommendations[]` | -- | `...["recommendations"]` | |
 | `evidence_sources[]` | `evidence_sources` (semicolon-joined) | `...["evidence_sources"]` | Which external sources actually contributed evidence to this variant's classification (e.g. `["ClinVar", "dbSNP", "ClinGen"]`). |
 | `stage_errors[]` | `stage_errors` (semicolon-joined) | `variants[i]["errors"]` | Non-fatal, per-stage failures recorded during this variant's processing (e.g. a single BLAST timeout) -- present even when `interpretation_available` is `true`, since GEPER's own "best-effort partial evidence is still a success" policy means a variant can be fully classified despite one stage failing. |
 | `interpretation_available` | `interpretation_available` | derived | `false` when `variants[i]["interpretation_result"]` is missing or itself an `{"error": ...}` record (the ACMG aggregation engine failed for this variant) -- when `false`, `classification`/`confidence`/`priority` all stay at their honest empty defaults (never fabricated), while `variant`/`gene` identity and `case_prioritization` (a genuinely independent signal -- see above) are still populated when available, so a reviewer knows *which* variant failed and *why*, not just that one did. |
+
+## Documented design boundaries: what this export doesn't carry, and why
+
+Three fields exist in `geper_results.json` and reach every other renderer
+-- the full PDF, the short PDF, and the Markdown report -- but are
+intentionally out of scope for this export today: run-level QC metrics,
+patient consent, and per-variant `candidate_interpretation` limitations. Verified
+field-by-field against real generated output (render-and-diff, not
+schema inspection alone): none of the three appears anywhere in either
+the LIMS JSON or the flattened CSV.
+
+This follows directly from the minimalism strategy above ("Why this
+format, not HL7 FHIR"): the mapping table is a deliberate minimum
+against an unknown target spec, not an attempt at full document
+fidelity. **Out of scope by design, pending a real target LIMS spec --
+not "considered and rejected on merit."** Nothing in this project
+enumerates these three fields individually and rules them out; the
+minimalism strategy is what excludes them, not a field-by-field review.
+If a real pilot customer's LIMS spec asks for any of them, adding it is
+a mapping extension against this table (see "Extending this mapping"
+below), not a reversal of a decision.
+
+### QC metrics
+
+`geper_results.json["qc_metrics"]` (mean coverage depth, %>20x, Q30)
+reaches the full PDF's QC table and JSON verbatim, but neither
+`LIMSRun` nor `LIMSFinding` carries it -- absent from both LIMS JSON
+and CSV.
+
+### Patient consent
+
+`geper_results.json`'s `patient_consent` object (DPDP Act 2023
+clinical-reporting/research flags + timestamp) reaches the full PDF,
+the short PDF, and Markdown, and JSON carries it verbatim -- four of
+the five outputs a completed run can produce. LIMS is the sole
+omission. **One caveat that sets this boundary apart from the other
+two:** consent has a regulatory character (DPDP Act 2023), not only a
+clinical one. If a downstream LIMS ever becomes a processing
+destination for personal data in its own right, whether it must carry
+the consent record is a compliance question, not a
+mapping-completeness one -- outside what this boundary settles.
+Documented here with that caveat attached rather than closed flat.
+
+### Per-variant limitations
+
+`candidate_interpretation["limitations"]` -- which leads with
+`RESEARCH_USE_DISCLAIMER`, the same constant `run.caveats` above
+carries -- is fully present in `geper_results.json`'s per-variant
+record, but `LIMSFinding` has no `limitations` field. **This is the
+mildest of the three, and the export is not left unqualified by its
+absence**: the draft-classification/mandatory-review qualification a
+LIMS most needs already reaches it at run level, via `run.caveats`
+above (shipped in `457dd5b`; verified present in both LIMS formats).
+What's missing is
+the per-variant *restatement* of that qualification, plus any
+variant-specific limitation text -- not the qualification itself. Read
+"limitations missing" here as "not duplicated per finding," not as
+"this export ships unqualified."
 
 ## Regenerating this export
 

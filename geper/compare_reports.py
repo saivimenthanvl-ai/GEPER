@@ -14,6 +14,10 @@ documents -- nothing here re-runs the pipeline or re-derives evidence):
   1. Variants whose ACMG/AMP classification changed between the two runs
      (matched by chrom/pos/ref/alt identity), with each side's
      classification and confidence label for context.
+  1b. Variants whose numeric confidence *score* changed, independently of
+      whether the classification or confidence label did (Finding 8: a
+      label like "Moderate" can span a wide score range, so a real shift
+      such as 55.6 -> 64.8 previously had nowhere to appear at all).
   2. Per-variant evidence-source changes: which sources newly contributed
      evidence in run B that didn't in run A, and vice versa
      (`clinical_report["evidence_sources"]`, already computed by
@@ -41,6 +45,8 @@ documents -- nothing here re-runs the pipeline or re-derives evidence):
 
 from __future__ import annotations
 
+from report.clinical_report_builder import candidate_interpretation_of
+
 import argparse
 import json
 import os
@@ -57,6 +63,7 @@ _PROVENANCE_COMPARE_KEYS = ("status", "version", "release_date", "content_hash")
 # ---------------------------------------------------------------------------
 # Loading + basic accessors
 # ---------------------------------------------------------------------------
+
 
 def load_document(output_dir: str) -> Dict[str, Any]:
     """Reads `<output_dir>/geper_results.json`. Raises `FileNotFoundError`/
@@ -91,20 +98,33 @@ def _index_variants(document: Dict[str, Any]) -> Dict[VariantKey, Dict[str, Any]
 
 
 def _classification(variant_result: Dict[str, Any]) -> Optional[str]:
-    clinical = variant_result.get("clinical_report") or {}
+    clinical = candidate_interpretation_of(variant_result) or {}
     return (clinical.get("acmg_classification") or {}).get("classification")
 
 
 def _confidence_label(variant_result: Dict[str, Any]) -> Optional[str]:
-    clinical = variant_result.get("clinical_report") or {}
+    clinical = candidate_interpretation_of(variant_result) or {}
     confidence = clinical.get("confidence") or {}
     if confidence.get("pending", True):
         return None
     return confidence.get("label")
 
 
+def _confidence_score(variant_result: Dict[str, Any]) -> Optional[float]:
+    """The numeric confidence score `_confidence_label` deliberately
+    doesn't surface (Finding 8): two runs can share a classification AND
+    a confidence *label* while the underlying score moves several points
+    (e.g. 55.6 -> 64.8, both "Moderate") -- a real clinical-confidence
+    shift with nothing in the old diff output to show it."""
+    clinical = candidate_interpretation_of(variant_result) or {}
+    confidence = clinical.get("confidence") or {}
+    if confidence.get("pending", True):
+        return None
+    return confidence.get("score")
+
+
 def _evidence_sources(variant_result: Dict[str, Any]) -> Set[str]:
-    clinical = variant_result.get("clinical_report") or {}
+    clinical = candidate_interpretation_of(variant_result) or {}
     return set(clinical.get("evidence_sources") or [])
 
 
@@ -121,6 +141,7 @@ def _provenance_records_differ(record_a: Optional[Dict[str, Any]], record_b: Opt
 # ---------------------------------------------------------------------------
 # Diff computation
 # ---------------------------------------------------------------------------
+
 
 def diff_reports(doc_a: Dict[str, Any], doc_b: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -151,6 +172,7 @@ def diff_reports(doc_a: Dict[str, Any], doc_b: Dict[str, Any]) -> Dict[str, Any]
     classification_changes: List[Dict[str, Any]] = []
     unexplained_changes: List[Dict[str, Any]] = []
     evidence_changes: List[Dict[str, Any]] = []
+    confidence_changes: List[Dict[str, Any]] = []
 
     for key in sorted(common_keys, key=lambda k: (k[0], k[1] if isinstance(k[1], int) else 0)):
         variant_a, variant_b = variants_a[key], variants_b[key]
@@ -181,20 +203,41 @@ def diff_reports(doc_a: Dict[str, Any], doc_b: Dict[str, Any]) -> Dict[str, Any]
                 d for d in provenance_diffs if any(d["source"].startswith(p) for p in prefixes)
             ]
             if not relevant_provenance_diffs and not code_version_changed:
-                unexplained_changes.append({
-                    **entry,
-                    "cited_sources": sorted(cited),
-                })
+                unexplained_changes.append(
+                    {
+                        **entry,
+                        "cited_sources": sorted(cited),
+                    }
+                )
+
+        # Independent of whether classification changed: Finding 8 is
+        # specifically the case where it DIDN'T (or the label stayed the
+        # same) and the score still moved -- that must not be invisible.
+        score_a, score_b = _confidence_score(variant_a), _confidence_score(variant_b)
+        if score_a != score_b:
+            confidence_changes.append(
+                {
+                    "locus": locus,
+                    "classification_a": cls_a,
+                    "classification_b": cls_b,
+                    "confidence_score_a": score_a,
+                    "confidence_score_b": score_b,
+                    "confidence_label_a": _confidence_label(variant_a),
+                    "confidence_label_b": _confidence_label(variant_b),
+                }
+            )
 
         sources_a, sources_b = _evidence_sources(variant_a), _evidence_sources(variant_b)
         newly_matched = sorted(sources_b - sources_a)
         newly_unmatched = sorted(sources_a - sources_b)
         if newly_matched or newly_unmatched:
-            evidence_changes.append({
-                "locus": locus,
-                "newly_matched": newly_matched,
-                "newly_unmatched": newly_unmatched,
-            })
+            evidence_changes.append(
+                {
+                    "locus": locus,
+                    "newly_matched": newly_matched,
+                    "newly_unmatched": newly_unmatched,
+                }
+            )
 
     added_variants = [
         _variant_locus(variants_b[k].get("variant") or {})
@@ -209,6 +252,7 @@ def diff_reports(doc_a: Dict[str, Any], doc_b: Dict[str, Any]) -> Dict[str, Any]
         "classification_changes": classification_changes,
         "unexplained_changes": unexplained_changes,
         "evidence_changes": evidence_changes,
+        "confidence_changes": confidence_changes,
         "provenance_diffs": provenance_diffs,
         "added_variants": added_variants,
         "removed_variants": removed_variants,
@@ -223,10 +267,15 @@ def diff_reports(doc_a: Dict[str, Any], doc_b: Dict[str, Any]) -> Dict[str, Any]
 # Markdown rendering
 # ---------------------------------------------------------------------------
 
+
 def render_markdown(diff: Dict[str, Any], doc_a: Dict[str, Any], doc_b: Dict[str, Any], dir_a: str, dir_b: str) -> str:
     lines: List[str] = ["# GEPER Report Comparison", ""]
-    lines.append(f"- **Run A:** `{dir_a}` (generated {doc_a.get('generated_at', 'unknown')}, code version `{diff['code_version_a'] or 'unknown'}`)")
-    lines.append(f"- **Run B:** `{dir_b}` (generated {doc_b.get('generated_at', 'unknown')}, code version `{diff['code_version_b'] or 'unknown'}`)")
+    lines.append(
+        f"- **Run A:** `{dir_a}` (generated {doc_a.get('generated_at', 'unknown')}, code version `{diff['code_version_a'] or 'unknown'}`)"
+    )
+    lines.append(
+        f"- **Run B:** `{dir_b}` (generated {doc_b.get('generated_at', 'unknown')}, code version `{diff['code_version_b'] or 'unknown'}`)"
+    )
     lines.append(f"- **Variants compared (present in both runs):** {diff['common_variant_count']}")
     lines.append(f"- **Code version changed between runs:** {'Yes' if diff['code_version_changed'] else 'No'}")
     lines.append("")
@@ -258,8 +307,10 @@ def render_markdown(diff: Dict[str, Any], doc_a: Dict[str, Any], doc_b: Dict[str
             )
         lines.append("")
     else:
-        lines.append("*None -- every classification change between the two runs is explained by either a "
-                      "cited data-source version difference or a code version change (see below).*")
+        lines.append(
+            "*None -- every classification change between the two runs is explained by either a "
+            "cited data-source version difference or a code version change (see below).*"
+        )
         lines.append("")
     lines.append("---")
     lines.append("")
@@ -277,6 +328,38 @@ def render_markdown(diff: Dict[str, Any], doc_a: Dict[str, Any], doc_b: Dict[str
         lines.append("")
     else:
         lines.append("*No classification changes for any variant present in both runs.*")
+        lines.append("")
+
+    lines.append("## Confidence Changes")
+    lines.append("")
+    if diff["confidence_changes"]:
+        lines.append(
+            "*Every variant present in both runs whose numeric confidence score differs -- shown "
+            "independently of whether the classification or confidence label also changed, since a "
+            'label like "Moderate" can cover a wide score range and hide a real shift (e.g. 55.6 -> '
+            "64.8, same label, same classification) that would otherwise appear nowhere in this report.*"
+        )
+        lines.append("")
+        lines.append("| Variant | Classification (A → B) | Confidence A | Confidence B | Δ Score |")
+        lines.append("|---|---|---|---|---|")
+        for c in diff["confidence_changes"]:
+            cls_shown = (
+                f"{c['classification_a'] or 'Not classified'} → {c['classification_b'] or 'Not classified'}"
+                if c["classification_a"] != c["classification_b"]
+                else (c["classification_a"] or "Not classified")
+            )
+            score_a, score_b = c["confidence_score_a"], c["confidence_score_b"]
+            delta = (
+                f"{score_b - score_a:+.1f}"
+                if isinstance(score_a, (int, float)) and isinstance(score_b, (int, float))
+                else "n/a"
+            )
+            conf_a = f"{c['confidence_label_a'] or 'n/a'} ({score_a if score_a is not None else 'n/a'})"
+            conf_b = f"{c['confidence_label_b'] or 'n/a'} ({score_b if score_b is not None else 'n/a'})"
+            lines.append(f"| {c['locus']} | {cls_shown} | {conf_a} | {conf_b} | {delta} |")
+        lines.append("")
+    else:
+        lines.append("*No confidence-score changes for any variant present in both runs.*")
         lines.append("")
 
     lines.append("## Added / Removed Variants")
@@ -315,8 +398,8 @@ def render_markdown(diff: Dict[str, Any], doc_a: Dict[str, Any], doc_b: Dict[str
     if diff["provenance_diffs"]:
         lines.append(
             "*Every known data source (`pipeline/provenance.py`) whose recorded status/version/release date/"
-            "content hash differs between the two runs -- this is what \"which ClinVar/ClinGen versions "
-            "differ\" is answered from.*"
+            'content hash differs between the two runs -- this is what "which ClinVar/ClinGen versions '
+            'differ" is answered from.*'
         )
         lines.append("")
         for d in diff["provenance_diffs"]:
@@ -342,13 +425,16 @@ def _format_provenance_record(record: Optional[Dict[str, Any]]) -> str:
     if record.get("release_date"):
         parts.append(f"release_date={record['release_date']}")
     if record.get("content_hash"):
-        parts.append(f"content_hash={record['content_hash'][:16]}... ({record.get('hash_algorithm') or 'unknown algorithm'})")
+        parts.append(
+            f"content_hash={record['content_hash'][:16]}... ({record.get('hash_algorithm') or 'unknown algorithm'})"
+        )
     return ", ".join(parts)
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -357,7 +443,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("run_a", help="Path to the first (baseline) GEPER output directory.")
     parser.add_argument("run_b", help="Path to the second (comparison) GEPER output directory.")
     parser.add_argument(
-        "--output", default=None,
+        "--output",
+        default=None,
         help="Write the Markdown diff report to this path instead of printing it to stdout.",
     )
     return parser

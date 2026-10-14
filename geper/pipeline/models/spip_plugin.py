@@ -73,14 +73,16 @@ are unused. Callers must instead pass `chrom=`, `pos=`, `ref=`,
 writes into a minimal one-variant VCF and hands to SPiP exactly the
 way its own VCF input mode works.
 
-Ensemble/evidence-aggregation note: like SpliceFormer/SpliceBERT,
-this plugin is deliberately NOT added to `pipeline/models/ensemble.py`'s
-Enformer+Borzoi consensus, not passed to `InterpretationEngine`/ACMG
-PP3-PP4 evaluation, not added to `pipeline/models/status.py`'s "AI
-Models" display table, and not wired into
-`pipeline/orchestrator.py`'s per-variant stages -- see
-`spliceformer_plugin.py`'s own module docstring for the identical
-reasoning. It is reachable via `ModelManager` (through
+Ensemble/evidence-aggregation note: like SpliceFormer/SpliceBERT, this
+plugin is deliberately NOT added to `pipeline/models/ensemble.py`'s
+Enformer+Borzoi consensus. UNLIKE SpliceFormer/SpliceBERT, SPiP is not
+otherwise wired in either: not passed to `InterpretationEngine`/ACMG
+evaluation of any criterion (not just PP3/BP4), not added to
+`pipeline/models/status.py`'s "AI Models" display table, and not
+called from any per-variant stage in `pipeline/orchestrator.py` -- see
+`pipeline/models/pending_plugins.py`'s module docstring for how
+SpliceFormer/SpliceBERT differ from SPiP on this point. It is
+reachable via `ModelManager` (through
 `pipeline.models.pending_plugins.build_default_registry()`) for
 direct/programmatic use and tests, exactly like SpliceFormer/SpliceBERT.
 --------------------------------------------------------------------
@@ -88,21 +90,61 @@ direct/programmatic use and tests, exactly like SpliceFormer/SpliceBERT.
 
 from typing import Any, Dict, List
 
+import requests
+
+import config
 from config import CONFIG
 from pipeline.models.base import ModelMetadata, PluginModel
 from pipeline.models.cache import WeightCache
 from pipeline.models.spip import loader as spip_loader
 
-# Same classification thresholds pipeline/models/spliceformer_plugin.py,
-# splicebert_plugin.py, enformer_plugin.py, and borzoi_plugin.py already
-# use for their own single-model summaries -- reused here (for the
-# moderate/large split only; see _infer_impl's own comment for why
-# "no effect" is instead read directly from SPiP's own "NTR"
-# interpretation rather than a reapplied 0.1 cutoff) so a SPiP score
-# sits on the same documented 0..~1 scale as the rest of this family.
-_MODERATE_EFFECT_THRESHOLD = 0.5
+# SPiP shares this family's MODERATE/LARGE split -- config's
+# SPLICE_DELTA_MODERATE_EFFECT_THRESHOLD, the same one spliceformer_plugin.py,
+# splicebert_plugin.py, enformer_plugin.py and borzoi_plugin.py bucket against
+# -- so a SPiP score sits on the same documented 0..~1 scale as the rest.
+#
+# *** SPiP DELIBERATELY HAS NO NO-EFFECT CONSTANT. DO NOT "COMPLETE THE PAIR". ***
+# Every sibling plugin uses config.SPLICE_DELTA_NO_EFFECT_THRESHOLD (0.1) for its
+# bottom bucket. SPiP does not, and that asymmetry is correct rather than an
+# oversight: SPiP publishes its OWN "NTR" (no-transcript-result) interpretation,
+# which is a more accurate no-effect signal for this tool than reapplying this
+# family's generic 0.1 cutoff would be. See `_classify` below.
+# Adding a no-effect threshold here would CHANGE SPiP'S BEHAVIOUR, not tidy it.
+# tests/test_splice_delta_thresholds_shared.py::test_spip_keeps_its_own_no_effect_shape
+# fails if anyone does, so this is enforced rather than merely requested.
 
-_NETWORK_ERROR_TYPES = (OSError, ConnectionError, TimeoutError)
+
+def _classify(interpretation: str, raw_score: float, score: float) -> str:
+    """
+    SPiP's bucketing: its own NTR interpretation decides "no effect", then the
+    SHARED moderate/large split. Reads config at call time, not at import.
+    """
+    if interpretation == "NTR" or raw_score < 0:
+        return "no_significant_effect"
+    if score < config.SPLICE_DELTA_MODERATE_EFFECT_THRESHOLD:
+        return "moderate_effect"
+    return "large_effect"
+
+
+# Network-shaped failures only -- NOT bare OSError. `spip_loader.
+# prepare_runtime_dir` fetches reference data via `requests.get(...)`
+# (see pipeline/models/spip/loader.py::_download_file); a real
+# connectivity/HTTP failure surfaces as `requests.exceptions.
+# RequestException` (covers ConnectionError/Timeout/HTTPError from
+# `raise_for_status()`), not a bare OSError. Bare OSError was removed
+# 2026-08-21: `prepare_runtime_dir` also does purely LOCAL work
+# (shutil.copy2/copytree/rmtree) with no network involved, and OSError
+# is the same class Windows raises for local resource exhaustion --
+# confirmed reproducible on this project's own dev box, loading ESM2:
+# `OSError: The paging file is too small for this operation to
+# complete. (os error 1455)`. Catching that here and relabeling it
+# "SPiP model unavailable" would report a wrong diagnosis. A genuine
+# local OSError now simply isn't caught in this block -- it propagates
+# through PluginModel.load()/ModelManager.get() (pipeline/models/
+# base.py, manager.py), both of which already fold `str(exc)` into
+# their own raised message and log it at `error`, so the real cause
+# stays visible rather than being relabeled a second time.
+_NETWORK_ERROR_TYPES = (requests.exceptions.RequestException, ConnectionError, TimeoutError)
 
 
 def _parse_spip_output(output_text: str) -> List[Dict[str, str]]:
@@ -131,13 +173,12 @@ def _parse_spip_output(output_text: str) -> List[Dict[str, str]]:
 
 
 class SpipPlugin(PluginModel):
-    """Real SPiP integration. Disabled by default
-    (`CONFIG.splicing.ENABLE_SPIP`); once enabled, this vendors and
-    runs the official, unmodified upstream R source
-    (`pipeline/models/spip/vendor/`) as a subprocess, with reference
-    data (trained randomForest model, RefSeq transcript annotation,
-    genome sequence) downloaded from the official repository/its
-    linked SourceForge host (`pipeline/models/spip/loader.py`)."""
+    """Real SPiP integration, gated by `CONFIG.splicing.ENABLE_SPIP`
+    (defaults to enabled); vendors and runs the official, unmodified
+    upstream R source (`pipeline/models/spip/vendor/`) as a subprocess,
+    with reference data (trained randomForest model, RefSeq transcript
+    annotation, genome sequence) downloaded from the official
+    repository/its linked SourceForge host (`pipeline/models/spip/loader.py`)."""
 
     @classmethod
     def metadata(cls) -> ModelMetadata:
@@ -175,14 +216,8 @@ class SpipPlugin(PluginModel):
     @classmethod
     def unavailability_reason(cls) -> str:
         if not CONFIG.splicing.ENABLE_SPIP:
-            return (
-                "disabled via CONFIG.splicing.ENABLE_SPIP "
-                "(set GEPER_ENABLE_SPIP=true to enable)"
-            )
-        return (
-            "no 'Rscript' executable found in this environment "
-            "(install R: https://cran.r-project.org/)"
-        )
+            return "disabled via CONFIG.splicing.ENABLE_SPIP (set GEPER_ENABLE_SPIP=true to enable)"
+        return "no 'Rscript' executable found in this environment (install R: https://cran.r-project.org/)"
 
     def __init__(self):
         super().__init__()
@@ -194,17 +229,14 @@ class SpipPlugin(PluginModel):
     def _load_impl(self) -> None:
         rscript_path = spip_loader.find_rscript()
         if not rscript_path:
-            raise RuntimeError(
-                "No 'Rscript' executable found (install R: "
-                "https://cran.r-project.org/)."
-            )
+            raise RuntimeError("No 'Rscript' executable found (install R: https://cran.r-project.org/).")
         if not spip_loader.ensure_r_packages(rscript_path):
             raise RuntimeError(
                 f"Automatic installation of required R package(s) "
                 f"({spip_loader.REQUIRED_R_PACKAGES}) did not succeed in "
                 "this environment (check network access to cloud.r-project.org, "
                 "or install them yourself from an R console with "
-                "`install.packages(c(\"foreach\",\"doParallel\",\"randomForest\"))`)."
+                '`install.packages(c("foreach","doParallel","randomForest"))`).'
             )
 
         cache_dir = self._weight_cache.ensure_dir("spip")
@@ -213,9 +245,14 @@ class SpipPlugin(PluginModel):
         try:
             runtime_dir = spip_loader.prepare_runtime_dir(cache_dir, genome=genome)
         except _NETWORK_ERROR_TYPES as exc:
-            self.logger.debug(
-                f"SPiP reference-data fetch for genome '{genome}' failed "
-                f"({exc.__class__.__name__}): {exc}",
+            # Promoted from `debug` to `warning` 2026-08-21: this line is
+            # the only place the real exception class/message survives --
+            # the raised RuntimeError below deliberately drops it so a raw
+            # request URL never reaches the clinical report (same
+            # rationale as splicebert_plugin.py's own network-error
+            # branch). At `debug` it was invisible in a normal run's logs.
+            self.logger.warning(
+                f"SPiP reference-data fetch for genome '{genome}' failed ({exc.__class__.__name__}): {exc}",
                 exc_info=True,
             )
             raise RuntimeError("SPiP model unavailable") from exc
@@ -310,12 +347,7 @@ class SpipPlugin(PluginModel):
         # split below still reuses the shared family threshold so
         # SPiP's classification bucket sits on the same scale as
         # SpliceFormer/SpliceBERT/Enformer/Borzoi's own.
-        if interpretation == "NTR" or raw_score < 0:
-            classification = "no_significant_effect"
-        elif score < _MODERATE_EFFECT_THRESHOLD:
-            classification = "moderate_effect"
-        else:
-            classification = "large_effect"
+        classification = _classify(interpretation, raw_score, score)
 
         return {
             "score": score,

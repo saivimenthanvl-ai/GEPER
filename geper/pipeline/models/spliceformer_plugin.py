@@ -52,29 +52,36 @@ wrappers, because upstream itself does not offer one.
 
 Ensemble/evidence-aggregation note: unlike Enformer/Borzoi, this
 plugin is deliberately NOT added to
-`pipeline/models/ensemble.py::_ENSEMBLE_MODEL_KEYS`, and its result is
-not passed to `InterpretationEngine`/ACMG PP3-PP4 evaluation or to
-`report/*` -- see this module's own callers (or rather, the deliberate
-absence of any) for confirmation. It is reachable via `ModelManager`
+`pipeline/models/ensemble.py::_ENSEMBLE_MODEL_KEYS` (that ensemble
+feeds PP3/BP4 specifically), and its result is not passed to ACMG
+PP3/BP4 evaluation. It IS otherwise wired into a live per-variant run:
+invoked from `pipeline/orchestrator.py::
+_run_standalone_splice_plugin_stage` (called at
+`pipeline/orchestrator.py:1465-1466`), listed in the "AI Models"
+status table (`pipeline/models/status.py:306-310`), and consumed
+directly by BP7 (`pipeline/acmg_rules.py::ACMGRuleEngine._bp7`) --
+whose rationale text (caveated here as "uncalibrated; not clinically
+validated") reaches `report/*` through the same
+`supporting_evidence`/`conflicting_evidence` mechanism every other
+criterion's evidence uses. It is also reachable via `ModelManager`
 (through `pipeline.models.pending_plugins.build_default_registry()`)
 for direct/programmatic use, tests, and the benchmark script
-(`benchmark_spliceformer.py`), exactly like every other plugin here,
-without altering any existing evidence-aggregation or report-rendering
-behavior.
+(`benchmark_spliceformer.py`).
 --------------------------------------------------------------------
 """
 
-import re
 from typing import Any, Dict
 
 import numpy as np
+import requests
 import torch
 
+import config
 from config import CONFIG
 from pipeline.models.base import ModelMetadata, PluginModel
 from pipeline.models.cache import WeightCache
 from pipeline.models.spliceformer import loader as spliceformer_loader
-from utils.auto_install import ensure_pip_package_available
+from utils.auto_install import PackageCheckStatus, check_pip_package_availability, ensure_pip_package_available
 
 # Total input window length the official checkpoints were trained
 # with: SL (5,000, the number of central positions scored per
@@ -84,14 +91,25 @@ from utils.auto_install import ensure_pip_package_available
 # "45k" in "Spliceformer-45k".
 SPLICEFORMER_TOTAL_INPUT_LENGTH = spliceformer_loader.TOTAL_INPUT_LENGTH
 
-# Same classification thresholds pipeline/models/enformer_plugin.py,
-# borzoi_plugin.py, and pipeline/models/ensemble.py already use for
-# their own single-model delta-score summaries -- reused here so a
-# SpliceFormer score sits on the same documented 0..~1 scale as the
-# other splicing/regulatory plugins' `score`/`classification` fields,
-# rather than a third, inconsistent scale.
-_NO_EFFECT_THRESHOLD = 0.1
-_MODERATE_EFFECT_THRESHOLD = 0.5
+
+# Classification thresholds come from config's SHARED splice-family pair --
+# the same one pipeline/models/enformer_plugin.py, borzoi_plugin.py and
+# pipeline/models/ensemble.py bucket against -- so a SpliceFormer score sits on
+# the same documented 0..~1 scale as the other splicing/regulatory plugins'
+# `score`/`classification` fields, rather than a third, inconsistent scale.
+#
+# READ AT CALL TIME, NOT BOUND AT IMPORT: `config.SPLICE_DELTA_*` is looked up
+# inside `_classify` rather than copied into a module-level name here. A
+# module-level copy would be a private literal again by another route -- it
+# would stop tracking config the moment anything changed the value.
+def _classify(score: float) -> str:
+    """Three-way bucketing shared with ensemble/enformer/borzoi/splicebert."""
+    if score < config.SPLICE_DELTA_NO_EFFECT_THRESHOLD:
+        return "no_significant_effect"
+    if score < config.SPLICE_DELTA_MODERATE_EFFECT_THRESHOLD:
+        return "moderate_effect"
+    return "large_effect"
+
 
 # Integer base encoding used by the official repo's own delta-scoring
 # notebook (Code/get_clinvar_delta_for_transformer.ipynb::seqToArray):
@@ -111,12 +129,29 @@ _IN_MAP = np.asarray(
 )
 _BASE_TO_CODE = {"A": 1, "C": 2, "G": 3, "T": 4}
 
-_NETWORK_ERROR_TYPES = (OSError, ConnectionError, TimeoutError)
+# Network-shaped failures only -- NOT bare OSError. `spliceformer_loader.
+# download_checkpoint` fetches the checkpoint via `requests.get(...)`
+# (see pipeline/models/spliceformer/loader.py); a real connectivity/HTTP
+# failure surfaces as `requests.exceptions.RequestException` (covers
+# ConnectionError/Timeout/HTTPError from `raise_for_status()`), not a
+# bare OSError. Bare OSError was removed 2026-08-21: it is the same
+# class Windows raises for local resource exhaustion, unrelated to the
+# network -- confirmed reproducible on this project's own dev box,
+# loading ESM2: `OSError: The paging file is too small for this
+# operation to complete. (os error 1455)`. Catching that here and
+# relabeling it "SpliceFormer model unavailable" would report a wrong
+# diagnosis. A genuine local OSError now simply isn't caught in this
+# block -- it propagates through PluginModel.load()/ModelManager.get()
+# (pipeline/models/base.py, manager.py), both of which already fold
+# `str(exc)` into their own raised message and log it at `error`, so
+# the real cause stays visible rather than being relabeled a second
+# time.
+_NETWORK_ERROR_TYPES = (requests.exceptions.RequestException, ConnectionError, TimeoutError)
 
 
 class SpliceFormerPlugin(PluginModel):
-    """Real SpliceFormer integration. Disabled by default
-    (`CONFIG.splicing.ENABLE_SPLICEFORMER`); once enabled, this vendors
+    """Real SpliceFormer integration, gated by
+    `CONFIG.splicing.ENABLE_SPLICEFORMER` (defaults to enabled); vendors
     and runs the official, unmodified model source
     (`pipeline/models/spliceformer/vendor/`) with one official
     pretrained checkpoint downloaded from the upstream MIT-licensed
@@ -168,18 +203,26 @@ class SpliceFormerPlugin(PluginModel):
     @classmethod
     def unavailability_reason(cls) -> str:
         if not CONFIG.splicing.ENABLE_SPLICEFORMER:
-            return (
-                "disabled via CONFIG.splicing.ENABLE_SPLICEFORMER "
-                "(set GEPER_ENABLE_SPLICEFORMER=true to enable)"
-            )
-        return "the 'einops' package is not installed and automatic installation has not been attempted yet"
+            return "disabled via CONFIG.splicing.ENABLE_SPLICEFORMER (set GEPER_ENABLE_SPLICEFORMER=true to enable)"
+        status = check_pip_package_availability("einops", import_name="einops")
+        if status is PackageCheckStatus.NOT_CHECKED:
+            return "'einops' availability was not checked (auto-install is disabled under pytest)"
+        return "the 'einops' package could not be installed automatically"
 
     def __init__(self):
         super().__init__()
         self._weight_cache = WeightCache()
 
     def _load_impl(self) -> None:
-        if not ensure_pip_package_available("einops", import_name="einops"):
+        einops_status = check_pip_package_availability("einops", import_name="einops")
+        if einops_status is PackageCheckStatus.NOT_CHECKED:
+            raise RuntimeError(
+                "'einops' availability was not checked in this environment "
+                "(auto-install is disabled under pytest) -- it is not confirmed "
+                "missing, it was never looked for. Install it yourself, or run "
+                "outside the test harness, to find out."
+            )
+        if einops_status is PackageCheckStatus.ABSENT:
             raise RuntimeError(
                 "Automatic installation of 'einops' did not succeed in this "
                 "environment (check network access to pypi.org, or install "
@@ -200,9 +243,15 @@ class SpliceFormerPlugin(PluginModel):
                     checkpoint=checkpoint_name,
                 )
             except _NETWORK_ERROR_TYPES as exc:
-                self.logger.debug(
-                    f"SpliceFormer checkpoint fetch for "
-                    f"'{checkpoint_name}' failed ({exc.__class__.__name__}): {exc}",
+                # Promoted from `debug` to `warning` 2026-08-21: this line
+                # is the only place the real exception class/message
+                # survives -- the raised RuntimeError below deliberately
+                # drops it so a raw request URL never reaches the clinical
+                # report (same rationale as splicebert_plugin.py's own
+                # network-error branch). At `debug` it was invisible in a
+                # normal run's logs.
+                self.logger.warning(
+                    f"SpliceFormer checkpoint fetch for '{checkpoint_name}' failed ({exc.__class__.__name__}): {exc}",
                     exc_info=True,
                 )
                 raise RuntimeError("SpliceFormer model unavailable") from exc
@@ -245,9 +294,7 @@ class SpliceFormerPlugin(PluginModel):
         encoding. Non-ACGT characters (including 'N') map to the
         all-zero row, matching upstream.
         """
-        codes = np.fromiter(
-            (_BASE_TO_CODE.get(base, 0) for base in sequence), dtype=np.int64, count=len(sequence)
-        )
+        codes = np.fromiter((_BASE_TO_CODE.get(base, 0) for base in sequence), dtype=np.int64, count=len(sequence))
         if strand == "-":
             # Reverse-complement via upstream's own trick: reverse the
             # coded array, then map code c -> (5 - c) % 5, which sends
@@ -315,16 +362,9 @@ class SpliceFormerPlugin(PluginModel):
         top_a_disruption = float(-np.min(acceptor_delta_np))
         top_d_disruption = float(-np.min(donor_delta_np))
 
-        max_abs_delta = max(
-            abs(top_a_creation), abs(top_d_creation), abs(top_a_disruption), abs(top_d_disruption)
-        )
+        max_abs_delta = max(abs(top_a_creation), abs(top_d_creation), abs(top_a_disruption), abs(top_d_disruption))
 
-        if max_abs_delta < _NO_EFFECT_THRESHOLD:
-            classification = "no_significant_effect"
-        elif max_abs_delta < _MODERATE_EFFECT_THRESHOLD:
-            classification = "moderate_effect"
-        else:
-            classification = "large_effect"
+        classification = _classify(max_abs_delta)
 
         # Not a calibrated probability -- see the caveat above. Bounded
         # to [0, 1] purely so it's a well-formed number for downstream

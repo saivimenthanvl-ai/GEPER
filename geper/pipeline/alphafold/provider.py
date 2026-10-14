@@ -38,11 +38,12 @@ import os
 import time
 from collections import OrderedDict
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import requests
 
 from config import CONFIG
+from pipeline.alphafold.mapping_gate import check_alphafold_mapping_gate
 from pipeline.alphafold.models import AlphaFoldAnnotation, confidence_band
 from pipeline.alphafold.utils import normalize_accession, parse_pdb_plddt
 from utils.exceptions import ExternalAPIError
@@ -147,8 +148,12 @@ class LiveAPIAlphaFoldProvider(AlphaFoldProviderBase):
         try:
             entries = self._get_json(f"{self.api_base}/{normalized}")
         except ExternalAPIError as exc:
-            logger.warning(f"AlphaFold DB summary query failed for accession '{normalized}': {exc}")
-            return AlphaFoldAnnotation.from_error(accession, str(exc))
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- fall back to the exception's type name
+            # rather than reporting a failure with nothing said about it.
+            detail = str(exc) or type(exc).__name__
+            logger.warning(f"AlphaFold DB summary query failed for accession '{normalized}': {detail}")
+            return AlphaFoldAnnotation.from_error(accession, detail)
 
         if not entries:
             return AlphaFoldAnnotation.not_found(accession, self.name)
@@ -214,7 +219,14 @@ class LiveAPIAlphaFoldProvider(AlphaFoldProviderBase):
                 logger.warning(f"AlphaFold DB API request attempt {attempt} failed: {exc}")
                 if attempt < CONFIG.alphafold.MAX_RETRIES:
                     time.sleep(CONFIG.alphafold.RETRY_BACKOFF_SECS * attempt)
-        raise ExternalAPIError(f"AlphaFold DB API request to '{url}' failed after {CONFIG.alphafold.MAX_RETRIES} attempts: {last_error}")
+        logger.warning(
+            f"AlphaFold DB API request to '{url}' failed after {CONFIG.alphafold.MAX_RETRIES} attempts: {last_error}"
+        )
+        # Round 24: same rationale as `pipeline/uniprot/provider.py`'s
+        # sibling fix -- no url/last_error in what's raised (folded
+        # verbatim into `struct['error']`, rendered unconditionally and
+        # embedded in geper_results.json), only in the log line above.
+        raise ExternalAPIError(f"AlphaFold DB API request failed after {CONFIG.alphafold.MAX_RETRIES} attempts")
 
 
 def _build_annotation(
@@ -227,7 +239,36 @@ def _build_annotation(
 ) -> AlphaFoldAnnotation:
     mean_plddt = (sum(residue_plddt.values()) / len(residue_plddt)) if residue_plddt else None
 
-    affected_plddt = residue_plddt.get(protein_position) if (protein_position is not None and residue_plddt) else None
+    # The residue-level claim is the only part of this annotation that
+    # asserts something about the VARIANT rather than about the protein,
+    # and it is the part a wrong answer is invisible in -- a pLDDT
+    # belonging to another residue reads downstream exactly like a
+    # correct one. It therefore goes through the mapping gate, which is
+    # the single place that decision is made; see
+    # `mapping_gate.py::check_alphafold_mapping_gate`, including its
+    # list of what it deliberately does not check.
+    #
+    # This entry's own two coordinate claims -- the UniProt span from
+    # the summary API and the residue numbers parsed out of the
+    # structure file -- are independent, and `query()` picks
+    # `entries[0]` from a response that may hold several fragments. The
+    # gate is what reconciles them; before it, an entry declaring it
+    # covered residues 1201-1400 would still report a "very_high" band
+    # for residue 175.
+    uniprot_start = summary.get("uniprotStart")
+    uniprot_end = summary.get("uniprotEnd")
+    mapping_ok, mapping_reason = check_alphafold_mapping_gate(
+        protein_position=protein_position,
+        uniprot_start=uniprot_start,
+        uniprot_end=uniprot_end,
+        residue_plddt=residue_plddt,
+    )
+    # No fallback branch by design: there is no approximate residue to
+    # fall back TO. If the gate says no, the residue-level confidence is
+    # withdrawn and the reason recorded; the entry-level facts below
+    # (model URL, version, mean pLDDT) are unaffected because they are
+    # true of the protein regardless of which residue was asked about.
+    affected_plddt = residue_plddt[protein_position] if mapping_ok else None
 
     thresholds = dict(
         very_high=CONFIG.alphafold.PLDDT_VERY_HIGH_THRESHOLD,
@@ -242,8 +283,8 @@ def _build_annotation(
         model_version=str(summary.get("latestVersion")) if summary.get("latestVersion") is not None else None,
         pdb_url=summary.get("pdbUrl"),
         cif_url=summary.get("cifUrl"),
-        uniprot_start=summary.get("uniprotStart"),
-        uniprot_end=summary.get("uniprotEnd"),
+        uniprot_start=uniprot_start,
+        uniprot_end=uniprot_end,
         mean_plddt=mean_plddt,
         mean_plddt_band=confidence_band(mean_plddt, **thresholds),
         protein_position=protein_position,
@@ -251,6 +292,7 @@ def _build_annotation(
         affected_residue_band=confidence_band(affected_plddt, **thresholds),
         protein_position_basis="transcript_cds" if protein_position is not None else None,
         structure_fetched=structure_fetched,
+        mapping_unavailable_reason=mapping_reason,
     )
 
 
@@ -262,7 +304,9 @@ class CompositeAlphaFoldProvider:
         local_provider: Optional[LocalDatasetAlphaFoldProvider] = None,
         api_provider: Optional[LiveAPIAlphaFoldProvider] = None,
     ):
-        self.local_provider = local_provider or LocalDatasetAlphaFoldProvider(dataset_path=CONFIG.alphafold.LOCAL_DATASET_FILE or None)
+        self.local_provider = local_provider or LocalDatasetAlphaFoldProvider(
+            dataset_path=CONFIG.alphafold.LOCAL_DATASET_FILE or None
+        )
         self.api_provider = api_provider or LiveAPIAlphaFoldProvider()
 
     def query(self, accession: str, protein_position: Optional[int] = None) -> AlphaFoldAnnotation:
@@ -283,7 +327,9 @@ class CompositeAlphaFoldProvider:
         return AlphaFoldAnnotation.not_found(accession, "none")
 
     @staticmethod
-    def _try(provider: AlphaFoldProviderBase, accession: str, protein_position: Optional[int]) -> Optional[AlphaFoldAnnotation]:
+    def _try(
+        provider: AlphaFoldProviderBase, accession: str, protein_position: Optional[int]
+    ) -> Optional[AlphaFoldAnnotation]:
         try:
             return provider.query(accession, protein_position)
         except Exception as exc:  # noqa: BLE001

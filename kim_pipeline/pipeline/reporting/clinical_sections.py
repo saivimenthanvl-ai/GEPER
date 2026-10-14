@@ -14,9 +14,22 @@ testable and so stage.py's diff for this feature stays reviewable.
 Nothing here touches alignment, variant calling, annotation, or ACMG
 classification logic — it only reads already-computed dicts.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+
+from pipeline.annotation.stage import CONSEQUENCE_NOT_DETERMINED
+
+
+# ─── What this report is ───────────────────────────────────────────────────────
+
+# Ratified wording (2026-09-11, Option B): names THIS tree as a component of
+# Bij AI rather than as the whole product. One constant, rendered by both the
+# HTML report (stage.py) and the ReportLab PDF (pdf_report.py), so the two
+# cannot drift -- defined in the import-free component_identity.py (so
+# main.py --help can print it too) and re-exported here.
+from pipeline.reporting.component_identity import SCOPE_LINE  # noqa: E402,F401
 
 
 # ─── Patient metadata ───────────────────────────────────────────────────────────
@@ -120,7 +133,9 @@ def qc_status_summary(
         },
         {
             "label": "Q30 Bases",
-            "value": f"{q30_fraction * 100:.1f}%" if isinstance(q30_fraction, (int, float)) else "N/A",
+            "value": f"{q30_fraction * 100:.1f}%"
+            if isinstance(q30_fraction, (int, float))
+            else "N/A",
             "status": _status_for(q30_fraction, th["q30_fraction"]),
         },
     ]
@@ -130,21 +145,21 @@ def qc_status_summary(
 # ─── Variant summary dashboard ──────────────────────────────────────────────────
 
 _CLASSIFICATION_LABELS = [
-    "Pathogenic", "Likely_Pathogenic", "Uncertain_Significance",
-    "Likely_Benign", "Benign",
+    "Pathogenic",
+    "Likely_Pathogenic",
+    "Uncertain_Significance",
+    "Likely_Benign",
+    "Benign",
 ]
 
 
 def variant_dashboard(
     acmg_d: Optional[List[Dict]],
-    pgx_d: Optional[Dict],
     ancestry_d: Optional[Dict],
 ) -> Dict[str, Any]:
     """Aggregate counts for the top-of-report dashboard: total variants,
-    a count per ACMG tier, PGx finding count, and a one-line ancestry
-    summary."""
+    a count per ACMG tier, and a one-line ancestry summary."""
     acmg_d = acmg_d or []
-    pgx_d = pgx_d or {}
     ancestry_d = ancestry_d or {}
 
     counts = {label: 0 for label in _CLASSIFICATION_LABELS}
@@ -153,7 +168,6 @@ def variant_dashboard(
         if cls in counts:
             counts[cls] += 1
 
-    pgx_annotations = pgx_d.get("annotations") or []
     ancestry_primary = ancestry_d.get("primary_population")
     ancestry_confidence = ancestry_d.get("confidence")
     if ancestry_primary:
@@ -168,12 +182,12 @@ def variant_dashboard(
         "vus": counts["Uncertain_Significance"],
         "likely_benign": counts["Likely_Benign"],
         "benign": counts["Benign"],
-        "pgx_findings": len(pgx_annotations),
         "ancestry_summary": ancestry_summary,
     }
 
 
 # ─── Clinical interpretation ────────────────────────────────────────────────────
+
 
 def clinical_interpretation(dashboard: Dict[str, Any]) -> Dict[str, str]:
     """Plain-language summary + recommended follow-up, derived purely
@@ -184,7 +198,6 @@ def clinical_interpretation(dashboard: Dict[str, Any]) -> Dict[str, str]:
     actionable = dashboard.get("pathogenic", 0) + dashboard.get("likely_pathogenic", 0)
     vus = dashboard.get("vus", 0)
     total = dashboard.get("total_variants", 0)
-    pgx = dashboard.get("pgx_findings", 0)
 
     if total == 0:
         summary = "No variants met inclusion criteria for ACMG classification in this sample."
@@ -204,9 +217,6 @@ def clinical_interpretation(dashboard: Dict[str, Any]) -> Dict[str, str]:
             f"All {total} classified variant(s) were classified as Benign or Likely "
             f"Benign — no clinically actionable findings in this analysis."
         )
-
-    if pgx:
-        summary += f" {pgx} pharmacogenomic finding(s) were also identified — see PGx section."
 
     if actionable > 0:
         follow_up = (
@@ -232,6 +242,7 @@ def clinical_interpretation(dashboard: Dict[str, Any]) -> Dict[str, str]:
 
 
 # ─── Variant + ACMG merge ───────────────────────────────────────────────────────
+
 
 def _variant_key(chrom: Any, pos: Any, ref: Any, alt: Any) -> str:
     return f"{str(chrom).lstrip('chr').upper()}:{pos}:{str(ref).upper()}:{str(alt).upper()}"
@@ -274,10 +285,31 @@ def merge_variants_with_acmg(
     # skipped for that variant) still need to be visible in the report.
     for key, a in acmg_by_key.items():
         if key not in seen_keys:
-            merged.append({
-                "chrom": a.get("chrom"), "pos": a.get("pos"),
-                "ref": a.get("ref"), "alt": a.get("alt"),
-                "gene_name": a.get("gene"), "acmg": a,
-            })
+            merged.append(
+                {
+                    "chrom": a.get("chrom"),
+                    "pos": a.get("pos"),
+                    "ref": a.get("ref"),
+                    "alt": a.get("alt"),
+                    "gene_name": a.get("gene"),
+                    "acmg": a,
+                }
+            )
 
     return merged
+
+
+# ─── Consequence display ────────────────────────────────────────────────────────
+
+
+def consequence_display_label(raw: Optional[str]) -> str:
+    """Map a stored consequence value to what a clinician reads.
+
+    Explicit mapping, not a truthy fallback -- CONSEQUENCE_NOT_DETERMINED
+    is a non-empty string and therefore truthy; `raw or "—"` would let it
+    pass through unchanged, which is the exact defect this function
+    exists to prevent.
+    """
+    if raw == CONSEQUENCE_NOT_DETERMINED:
+        return "Not determined"
+    return raw or "—"

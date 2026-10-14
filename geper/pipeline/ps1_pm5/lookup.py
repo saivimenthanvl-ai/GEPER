@@ -21,6 +21,7 @@ Layering: ClinVarCodonLookup -> ClinVarCodonCache -> NCBI E-utilities.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +33,7 @@ from pipeline.ps1_pm5.utils import clinvar_codon_match_from_esummary, dedupe_by_
 from pipeline.pvs1.models import TranscriptContext
 from utils.exceptions import ExternalAPIError
 from utils.logger import get_logger
-from utils.ncbi_eutils import lenient_json_loads, parse_retry_after, warn_if_placeholder_contact
+from utils.ncbi_eutils import lenient_json_loads, parse_retry_after, parse_vcv_submitters, warn_if_placeholder_contact
 
 logger = get_logger(__name__)
 
@@ -58,9 +59,7 @@ class ClinVarCodonLookup:
         )
         warn_if_placeholder_contact(CONFIG.api.NCBI_EMAIL, caller="ClinVarCodonLookup")
 
-    def query_codon(
-        self, transcript: TranscriptContext, codon_number: int, assembly: str = "GRCh38"
-    ) -> Dict[str, Any]:
+    def query_codon(self, transcript: TranscriptContext, codon_number: int, assembly: str = "GRCh38") -> Dict[str, Any]:
         """
         Every ClinVar record with a parseable missense protein change
         found at any genomic position of `codon_number` in `transcript`.
@@ -74,7 +73,9 @@ class ClinVarCodonLookup:
         positions = transcript.genomic_positions_for_codon(codon_number)
         if not positions:
             return {
-                "skipped": False, "found": False, "matches": [],
+                "skipped": False,
+                "found": False,
+                "matches": [],
                 "reason": f"codon {codon_number} is out of range for transcript {transcript.transcript_id}.",
             }
 
@@ -98,9 +99,22 @@ class ClinVarCodonLookup:
                     all_matches.extend(self._esummary(uids))
             except ExternalAPIError as exc:
                 errors.append(str(exc))
-                logger.warning(f"ClinVar codon lookup failed for {transcript.transcript_id} codon {codon_number} @ {chrom}:{pos}: {exc}")
+                logger.warning(
+                    f"ClinVar codon lookup failed for {transcript.transcript_id} codon {codon_number} @ {chrom}:{pos}: {exc}"
+                )
 
         matches = dedupe_by_uid(all_matches)
+        if matches:
+            # Round 30: submitting organisation(s) for every codon-match
+            # record that can actually reach PS1/PM5's evidence trail --
+            # see `database/clinvar_client.py::ClinVarClient._fetch_submitters`
+            # for why this needs a second, separate request (submitter
+            # identity isn't in the `esummary` JSON this class's own
+            # `_esummary` already parses). Best-effort, same as that
+            # method: a lookup failure leaves `submitters` unset rather
+            # than blocking the PS1/PM5 evidence already gathered above.
+            submitters_by_uid = self._fetch_submitters([m.uid for m in matches])
+            matches = [dataclasses.replace(m, submitters=submitters_by_uid.get(m.uid)) for m in matches]
         # `matches` is the plain-dict form throughout -- the same
         # shape whether this result was just fetched or came back from
         # `self.cache` a moment ago, so `pipeline/ps1_pm5/decision.py`
@@ -165,6 +179,45 @@ class ClinVarCodonLookup:
                 matches.append(match)
         return matches
 
+    def _fetch_submitters(self, uids: List[str]) -> Dict[str, List[Dict[str, Optional[str]]]]:
+        """
+        Submitting organisation(s) for each ClinVar `uid` this codon
+        query found, via a single batched `efetch&rettype=vcv` request.
+        Mirrors `database/clinvar_client.py::ClinVarClient._fetch_submitters`
+        (same reasoning: `parse_vcv_submitters`'s docstring has the full
+        esummary-vs-efetch comparison) -- kept as its own copy rather
+        than a shared method, matching this module's own docstring on
+        why its NCBI request plumbing is intentionally mirrored, not
+        centralized, across GEPER's eutils clients.
+
+        Best-effort and never raises, for the same reason as that
+        method: a submitter lookup is supplementary provenance, not
+        something PS1/PM5's own comparison depends on.
+        """
+        if not uids:
+            return {}
+        params = {
+            "db": CONFIG.api.CLINVAR_DB,
+            "id": ",".join(uids),
+            "rettype": "vcv",
+            "is_variationid": "true",
+            "tool": CONFIG.api.NCBI_TOOL_NAME,
+            "email": CONFIG.api.NCBI_EMAIL,
+        }
+        if CONFIG.api.NCBI_API_KEY:
+            params["api_key"] = CONFIG.api.NCBI_API_KEY
+        try:
+            response = requests.get(
+                f"{CONFIG.api.NCBI_EUTILS_BASE}/efetch.fcgi", params=params, timeout=CONFIG.ps1_pm5.QUERY_TIMEOUT_SECS
+            )
+            response.raise_for_status()
+            return parse_vcv_submitters(response.text)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad; see docstring above.
+            logger.warning(
+                f"PS1/PM5 ClinVar submitter lookup failed for {len(uids)} record(s); submitters left unset: {exc}"
+            )
+            return {}
+
     def _request_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """
         GET `url` and return the parsed JSON body, retrying up to
@@ -200,4 +253,19 @@ class ClinVarCodonLookup:
                 logger.warning(f"PS1/PM5 ClinVar request attempt {attempt} failed: {exc}")
                 if attempt < CONFIG.ps1_pm5.MAX_RETRIES:
                     time.sleep(CONFIG.ps1_pm5.RETRY_BACKOFF_SECS * attempt)
-        raise ExternalAPIError(f"PS1/PM5 ClinVar request to '{url}' failed after {CONFIG.ps1_pm5.MAX_RETRIES} attempts: {last_error}")
+        logger.warning(
+            f"PS1/PM5 ClinVar request to '{url}' failed after {CONFIG.ps1_pm5.MAX_RETRIES} attempts: {last_error}",
+            exc_info=last_error,
+        )
+        # Round 27: the message actually raised reaches `errors.append(...)`
+        # in `pipeline/orchestrator.py::_run_clinvar_codon_stage`, which is
+        # (a) embedded verbatim in geper_results.json's top-level `errors`
+        # key by `report/json_builder.py`, AND (b) rendered unconditionally
+        # into every Markdown report's "### ⚠ Stage Warnings / Errors"
+        # section by `report/report_generator.py` -- confirmed live, not
+        # merely reachable, unlike round 26's clinvar_client.py finding
+        # (JSON-only). The raised message must not embed `url`/`last_error`;
+        # full detail goes to the log line above only. Same pattern rounds
+        # 20-24, 26 applied to SpliceBERT/MMSplice/UniProt/InterPro/
+        # ClinGen/AlphaFold DB/ClinVar client.
+        raise ExternalAPIError(f"PS1/PM5 ClinVar request failed after {CONFIG.ps1_pm5.MAX_RETRIES} attempts")

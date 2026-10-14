@@ -1,5 +1,5 @@
-# geper_v8/config/default.yaml
-# GEPER v8 default configuration.
+# kim_pipeline/config/default.yaml
+# Bij AI sequencing-analysis component v8 default configuration.
 # Copy to config/production.yaml and fill in your paths.
 
 # ── Clinical databases ────────────────────────────────────────────────────────
@@ -24,12 +24,6 @@ gnomad:
   # point this at a Google Drive mount in Colab for cross-session persistence.
   cache_dir: null          # default: ~/.cache/geper/gnomad
   cache_ttl_hours: null    # null = never expire (gnomAD frequencies for a fixed release are immutable)
-
-omim:
-  enabled: true
-  # Path to OMIM genemap2.txt (download from omim.org after registration)
-  genemap_path: ""         # e.g. /data/omim/genemap2.txt
-  api_key: ""              # Optional OMIM API key for live queries
 
 # ── RNA analysis ──────────────────────────────────────────────────────────────
 rna_analysis:
@@ -61,11 +55,14 @@ acmg_thresholds:
   pm2_af_max: 0.0001
   pp3_cadd_phred: 20.0
   pp3_revel: 0.5
-  pp3_spliceai: 0.2
   pp3_alphamissense: 0.564
   bp4_cadd_phred: 10.0
   bp4_revel: 0.15
-  bp4_spliceai: 0.1
+  # pp3_spliceai / bp4_spliceai were REMOVED 2026-09-11. They were DEAD: the
+  # SpliceAI input is closed (licence: CC BY-NC 4.0 models, GPL-3.0 code) and
+  # PP3/BP4 no longer read either key, so they governed nothing. Do not re-add
+  # them without re-opening the input -- see
+  # tests/test_spliceai_dead_threshold_keys_removed.py.
 
 # ── Evidence aggregation weights ─────────────────────────────────────────────
 evidence_engine:
@@ -166,6 +163,27 @@ gnomad_constraint:
   loeuf_threshold: 0.35
   pli_threshold: 0.9
 
+# ── ClinGen Dosage Sensitivity (pipeline/clingen) ─────────────────────────────
+# LoF-intolerance fallback for genes with no gnomAD pLI/LOEUF coverage
+# (see pipeline/constraint/lookup.py::GnomadConstraintLookup.is_lof_intolerant).
+# License: ClinGen curated content is CC0 1.0 (public domain, no
+# restriction on commercial use) — see docs/DATA_PROVENANCE.md.
+clingen:
+  enabled: true
+  # Path to a local ClinGen Dosage Sensitivity download (TSV/CSV).
+  # Download from https://search.clinicalgenome.org/kb/dosage/download
+  # or the ftp.clinicalgenome.org mirror.
+  dosage_sensitivity_path: ""   # e.g. /data/clingen/ClinGen_gene_curation_list_GRCh38.tsv
+  # Live API fallback — UNVERIFIED against a real clinicalgenome.org
+  # response in this deployment (no network route to clinicalgenome.org
+  # was available during development; see pipeline/clingen/lookup.py's
+  # docstring). Leave disabled until spot-checked against a live call;
+  # the local dataset above is the only verified path today.
+  api_enabled: false
+  api_endpoint: "https://search.clinicalgenome.org/kb/gene-dosage"
+  timeout: 15
+  max_retries: 3
+
 # ── Hotspot lookup (pipeline/hotspot) ─────────────────────────────────────────
 hotspot:
   enabled: true
@@ -175,6 +193,14 @@ hotspot:
 vep:
   enabled: true
   cache_dir: ""            # e.g. /data/vep_cache
+  dir_plugins: ""          # e.g. /opt/vep/Plugins (VEP's plugin .pm dir)
+  # CADD/REVEL/AlphaMissense are separate VEP plugins, each needing its own
+  # data-file download (see docs/INSTALL_DEPENDENCIES.md). Left unset here,
+  # that plugin is not requested and its score comes back absent rather than
+  # VEP failing to start -- do not set these to a plugin name with no path.
+  cadd_data: ""             # path to CADD's whole_genome_SNVs.tsv.gz
+  revel_data: ""            # path to REVEL's revel.tsv.gz
+  alphamissense_data: ""    # path to AlphaMissense_hg38.tsv.gz
   fasta: ""                # reference FASTA for HGVS
   extra_flags: ""          # any additional VEP flags
   timeout: 600

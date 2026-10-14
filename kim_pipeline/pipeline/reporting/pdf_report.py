@@ -18,11 +18,15 @@ Nothing here touches alignment, variant calling, annotation, or ACMG
 logic — it only renders already-computed dicts (the exact same ones
 pipeline/reporting/clinical_sections.py builds for the HTML report).
 """
+
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+from pipeline.reporting.clinical_sections import SCOPE_LINE, consequence_display_label
+from pipeline.reporting.component_identity import PIPELINE_VERSION, RESEARCH_USE_DISCLAIMER
 
 logger = logging.getLogger("geper.pipeline.reporting.pdf_report")
 
@@ -32,6 +36,7 @@ logger = logging.getLogger("geper.pipeline.reporting.pdf_report")
 # disagree on which color means which tier.
 def _acmg_class_colors():
     from reportlab.lib import colors
+
     return {
         "Pathogenic": colors.HexColor("#f8d7da"),
         "Likely_Pathogenic": colors.HexColor("#ffe8cc"),
@@ -55,6 +60,55 @@ class ReportLabUnavailableError(RuntimeError):
     path — PDF generation must never crash the pipeline."""
 
 
+# ── Footer geometry ──────────────────────────────────────────────────────────
+#
+# ONE declaration of the footer's typography, used twice: to DRAW the footer,
+# and to size the frame the report content is laid out in ABOVE it. They were
+# independent before -- the frame used a flat 0.8 inch bottom margin while the
+# footer drew `lab_disclaimer[:150]` on a single line -- so the footer could
+# not grow, and a disclaimer longer than 150 characters was silently cut off
+# mid-word. Kim adopting GEPER's ratified text (EJ-01) made that real: the
+# sentence ended at "...machine-learning predict", losing the operative clause
+# ("not a substitute for professional clinical genetic interpretation,
+# diagnosis, or advice"). The disclaimer now WRAPS over as many lines as it
+# needs and the frame moves up to make room, so no wording is ever dropped.
+# Do not reintroduce a slice here: shortening the text is a clinical claim.
+_FOOTER_FONT = "Helvetica"
+_FOOTER_FONT_SIZE = 6.5
+_FOOTER_LEADING = 7.5
+# Baselines in points from the bottom of the page, unchanged from the
+# single-line footer: the reference/version/timestamp line, then the LOWEST
+# disclaimer line 16pt above it. Extra disclaimer lines stack upward.
+_FOOTER_METADATA_BASELINE = 28.8  # 0.4 inch
+_FOOTER_DISCLAIMER_BASELINE = 44.8
+# Clearance between the footer's topmost line and the content frame above.
+_FOOTER_FRAME_GAP = 6.0
+# The frame bottom this report used before the footer could wrap; still the
+# floor, so a short disclaimer leaves the layout exactly as it was.
+_MIN_BOTTOM_MARGIN = 0.8 * 72.0
+_PAGE_SIDE_MARGIN = 0.6 * 72.0
+
+
+def footer_disclaimer_lines(lab_disclaimer: str, page_width: float) -> List[str]:
+    """The disclaimer, wrapped to the printable width at the footer's own
+    font and size. Never truncated: every word of the input comes back."""
+    from reportlab.lib.utils import simpleSplit
+
+    available = page_width - 2 * _PAGE_SIDE_MARGIN
+    return simpleSplit(lab_disclaimer or "", _FOOTER_FONT, _FOOTER_FONT_SIZE, available) or [""]
+
+
+def footer_block_top(line_count: int) -> float:
+    """Top edge of the whole footer block, in points from the page bottom."""
+    top_baseline = _FOOTER_DISCLAIMER_BASELINE + (max(line_count, 1) - 1) * _FOOTER_LEADING
+    return top_baseline + _FOOTER_FONT_SIZE
+
+
+def footer_bottom_margin(line_count: int) -> float:
+    """How far up the content frame must start so the footer fits beneath it."""
+    return max(_MIN_BOTTOM_MARGIN, footer_block_top(line_count) + _FOOTER_FRAME_GAP)
+
+
 def render_clinical_pdf(
     pdf_path: str,
     *,
@@ -64,12 +118,12 @@ def render_clinical_pdf(
     dashboard: Dict[str, Any],
     interpretation: Dict[str, str],
     merged_variants: List[Dict[str, Any]],
-    pgx_annotations: Optional[List[Dict[str, Any]]] = None,
     ancestry_summary: Optional[str] = None,
     reference_genome: str = "N/A",
-    pipeline_version: str = "GEPER",
+    pipeline_version: str = PIPELINE_VERSION,
     generated_at: Optional[str] = None,
     lab_disclaimer: Optional[str] = None,
+    codon_resolution_disclaimer: Optional[str] = None,
 ) -> str:
     """Render the full clinical PDF report to `pdf_path` and return it.
 
@@ -86,36 +140,49 @@ def render_clinical_pdf(
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
         from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+            PageBreak,
         )
         from reportlab.pdfgen import canvas as reportlab_canvas
     except ImportError as exc:
         raise ReportLabUnavailableError(str(exc)) from exc
 
     generated_at = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lab_disclaimer = lab_disclaimer or (
-        "This report was generated by an in-development bioinformatics pipeline. "
-        "Results have not been independently validated for diagnostic use and "
-        "must be confirmed by orthogonal clinical-grade testing before any "
-        "clinical action is taken."
-    )
+    lab_disclaimer = lab_disclaimer or RESEARCH_USE_DISCLAIMER
     class_colors = _acmg_class_colors()
 
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        "ClinicalTitle", parent=styles["Title"], fontSize=18, textColor=colors.HexColor("#1a4a8a"),
+        "ClinicalTitle",
+        parent=styles["Title"],
+        fontSize=18,
+        textColor=colors.HexColor("#1a4a8a"),
     )
     section_style = ParagraphStyle(
-        "ClinicalSection", parent=styles["Heading2"], fontSize=13,
-        textColor=colors.HexColor("#2a6ab5"), spaceBefore=14, spaceAfter=6,
+        "ClinicalSection",
+        parent=styles["Heading2"],
+        fontSize=13,
+        textColor=colors.HexColor("#2a6ab5"),
+        spaceBefore=14,
+        spaceAfter=6,
     )
     body_style = ParagraphStyle("ClinicalBody", parent=styles["Normal"], fontSize=9.5, leading=13)
-    small_style = ParagraphStyle("ClinicalSmall", parent=styles["Normal"], fontSize=8, textColor=colors.grey)
+    small_style = ParagraphStyle(
+        "ClinicalSmall", parent=styles["Normal"], fontSize=8, textColor=colors.grey
+    )
 
     story: List[Any] = []
 
     # ── Header / patient banner ──
     story.append(Paragraph(f"{pipeline_version} — Clinical Genomic Report", title_style))
+    # WHAT THIS REPORT IS. Both trees in this repository render a "Clinical
+    # Genomic Report" under the same brand, so either one alone reads as the
+    # whole product. This names what produced THIS one and what it started from.
+    story.append(Paragraph(SCOPE_LINE, body_style))
     story.append(Spacer(1, 4))
     patient_table_data = [
         ["Sample ID", sample_id, "Patient Name", patient_meta.get("name", "")],
@@ -123,24 +190,31 @@ def render_clinical_pdf(
         ["Ordering Physician", patient_meta.get("physician", ""), "Report Generated", generated_at],
     ]
     patient_table = Table(patient_table_data, colWidths=[100, 150, 100, 150])
-    patient_table.setStyle(TableStyle([
-        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#dddddd")),
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f8ff")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
+    patient_table.setStyle(
+        TableStyle(
+            [
+                ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#dddddd")),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f8ff")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
     story.append(patient_table)
     if patient_meta.get("is_deidentified"):
         story.append(Spacer(1, 3))
-        story.append(Paragraph(
-            "<i>No patient-identifying metadata was supplied for this run — "
-            "sample is treated as de-identified / research use.</i>", small_style,
-        ))
+        story.append(
+            Paragraph(
+                "<i>No patient-identifying metadata was supplied for this run — "
+                "sample is treated as de-identified / research use.</i>",
+                small_style,
+            )
+        )
 
     # ── QC summary ──
     story.append(Paragraph("Sequencing QC Summary", section_style))
@@ -179,26 +253,31 @@ def render_clinical_pdf(
         ],
     ]
     dash_table = Table(dash_data, colWidths=[80] * 6)
-    dash_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a6ab5")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cccccc")),
-        ("BACKGROUND", (1, 1), (1, 1), class_colors["Pathogenic"]),
-        ("BACKGROUND", (2, 1), (2, 1), class_colors["Likely_Pathogenic"]),
-        ("BACKGROUND", (3, 1), (3, 1), class_colors["Uncertain_Significance"]),
-        ("BACKGROUND", (4, 1), (4, 1), class_colors["Likely_Benign"]),
-        ("BACKGROUND", (5, 1), (5, 1), class_colors["Benign"]),
-    ]))
+    dash_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a6ab5")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cccccc")),
+                ("BACKGROUND", (1, 1), (1, 1), class_colors["Pathogenic"]),
+                ("BACKGROUND", (2, 1), (2, 1), class_colors["Likely_Pathogenic"]),
+                ("BACKGROUND", (3, 1), (3, 1), class_colors["Uncertain_Significance"]),
+                ("BACKGROUND", (4, 1), (4, 1), class_colors["Likely_Benign"]),
+                ("BACKGROUND", (5, 1), (5, 1), class_colors["Benign"]),
+            ]
+        )
+    )
     story.append(dash_table)
     story.append(Spacer(1, 4))
-    story.append(Paragraph(
-        f"<b>Pharmacogenomic findings:</b> {dashboard.get('pgx_findings', 0)} &nbsp;&nbsp; "
-        f"<b>Ancestry:</b> {ancestry_summary or dashboard.get('ancestry_summary', 'Not performed')}",
-        body_style,
-    ))
+    story.append(
+        Paragraph(
+            f"<b>Ancestry:</b> {ancestry_summary or dashboard.get('ancestry_summary', 'Not performed')}",
+            body_style,
+        )
+    )
 
     # ── Clinical interpretation ──
     story.append(Paragraph("Clinical Interpretation", section_style))
@@ -210,6 +289,9 @@ def render_clinical_pdf(
     # ── Variant table ──
     story.append(PageBreak())
     story.append(Paragraph("Variant Detail", section_style))
+    if codon_resolution_disclaimer:
+        story.append(Paragraph(codon_resolution_disclaimer, small_style))
+        story.append(Spacer(1, 4))
     if merged_variants:
         headers = ["Gene", "Transcript", "HGVS", "Consequence", "Classification", "gnomAD AF"]
         var_data = [headers]
@@ -219,11 +301,13 @@ def render_clinical_pdf(
             gene = v.get("gene_name") or acmg.get("gene") or "—"
             transcript = v.get("transcript_id") or "—"
             hgvs = v.get("hgvs") or "—"
-            consequence = v.get("consequence") or "—"
+            consequence = consequence_display_label(v.get("consequence"))
             classification = acmg.get("classification", "Not classified")
             af = acmg.get("gnomad_af")
-            af_str = f"{af:.2e}" if isinstance(af, (int, float)) else (
-                acmg.get("gnomad_unavailable_reason") or "N/A"
+            af_str = (
+                f"{af:.2e}"
+                if isinstance(af, (int, float))
+                else (acmg.get("gnomad_unavailable_reason") or "N/A")
             )
             var_data.append([gene, transcript, hgvs, consequence, classification, af_str])
             row_class_colors.append(class_colors.get(classification))
@@ -251,48 +335,19 @@ def render_clinical_pdf(
     else:
         story.append(Paragraph("No variants to display.", body_style))
 
-    # ── PGx section ──
-    if pgx_annotations:
-        story.append(Spacer(1, 10))
-        story.append(Paragraph("Pharmacogenomics (PGx)", section_style))
-        pgx_data = [["Gene", "Diplotype", "Phenotype", "Evidence"]]
-        for a in pgx_annotations:
-            pgx_data.append([
-                a.get("gene", ""), a.get("diplotype", ""),
-                a.get("phenotype", ""), a.get("evidence_level", ""),
-            ])
-        pgx_table = Table(pgx_data, colWidths=[70, 90, 150, 90])
-        pgx_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a6ab5")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cccccc")),
-        ]))
-        story.append(pgx_table)
-
-    # ── Signature block ──
-    story.append(Spacer(1, 24))
-    story.append(Paragraph("Laboratory Sign-off", section_style))
-    story.append(Spacer(1, 20))
-    sig_table = Table(
-        [["_________________________", "_________________________"],
-         ["Reviewing Pathologist / Director, Signature", "Date"]],
-        colWidths=[250, 150],
-    )
-    sig_table.setStyle(TableStyle([
-        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-        ("TEXTCOLOR", (0, 1), (-1, 1), colors.grey),
-        ("TOPPADDING", (0, 0), (-1, 0), 0),
-    ]))
-    story.append(sig_table)
-
     # ── Footer (drawn on every page: disclaimer, reference genome,
     #    pipeline version, timestamp, Page X of Y) ──
 
+    # The frame's bottom is derived from the footer that will be drawn under
+    # it, so a disclaimer that needs several lines cannot collide with the
+    # report content (see the footer-geometry block above).
     doc = SimpleDocTemplate(
-        pdf_path, pagesize=letter,
-        topMargin=0.6 * inch, bottomMargin=0.8 * inch,
-        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+        pdf_path,
+        pagesize=letter,
+        topMargin=0.6 * inch,
+        bottomMargin=footer_bottom_margin(len(footer_disclaimer_lines(lab_disclaimer, letter[0]))),
+        leftMargin=0.6 * inch,
+        rightMargin=0.6 * inch,
         title=f"{pipeline_version} Clinical Report — {sample_id}",
     )
 
@@ -322,22 +377,29 @@ def render_clinical_pdf(
             self.setFont("Helvetica", 6.5)
             self.setFillColorRGB(0.4, 0.4, 0.4)
             self.drawRightString(
-                letter[0] - 0.6 * inch, 0.4 * inch,
+                letter[0] - 0.6 * inch,
+                0.4 * inch,
                 f"Page {self.getPageNumber()} of {total_pages}",
             )
             self.restoreState()
 
     doc.build(
         story,
-        onFirstPage=lambda c, d: _draw_footer_without_page_number(c, d, lab_disclaimer, reference_genome, pipeline_version, generated_at),
-        onLaterPages=lambda c, d: _draw_footer_without_page_number(c, d, lab_disclaimer, reference_genome, pipeline_version, generated_at),
+        onFirstPage=lambda c, d: _draw_footer_without_page_number(
+            c, d, lab_disclaimer, reference_genome, pipeline_version, generated_at
+        ),
+        onLaterPages=lambda c, d: _draw_footer_without_page_number(
+            c, d, lab_disclaimer, reference_genome, pipeline_version, generated_at
+        ),
         canvasmaker=_NumberedCanvas,
     )
     logger.info("PDF report rendered via ReportLab: %s", pdf_path)
     return pdf_path
 
 
-def _draw_footer_without_page_number(c, doc_, lab_disclaimer, reference_genome, pipeline_version, generated_at):
+def _draw_footer_without_page_number(
+    c, doc_, lab_disclaimer, reference_genome, pipeline_version, generated_at
+):
     """Draws the disclaimer/reference/version/timestamp line on every
     page; the "Page X of Y" number itself is drawn separately by
     `_NumberedCanvas._draw_page_number` once the total page count is
@@ -348,12 +410,26 @@ def _draw_footer_without_page_number(c, doc_, lab_disclaimer, reference_genome, 
     from reportlab.lib.units import inch
 
     c.saveState()
-    c.setFont("Helvetica", 6.5)
+    c.setFont(_FOOTER_FONT, _FOOTER_FONT_SIZE)
     c.setFillColor(colors.grey)
-    footer_y = 0.4 * inch
-    c.drawString(0.6 * inch, footer_y + 16, lab_disclaimer[:150])
+    footer_y = _FOOTER_METADATA_BASELINE
+    # Whole disclaimer, not truncated -- `render_clinical_pdf` sized the frame
+    # above for exactly these lines. Drawn top line FIRST (highest baseline,
+    # descending), which is both the reading order and the order text
+    # extraction returns it in: a clinician -- or a LIMS parsing this PDF --
+    # gets the sentences in the order they were written.
+    page_width = getattr(doc_, "pagesize", letter)[0]
+    wrapped = footer_disclaimer_lines(lab_disclaimer, page_width)
+    for index, line in enumerate(wrapped):
+        lines_below = len(wrapped) - 1 - index
+        c.drawString(
+            _PAGE_SIDE_MARGIN,
+            _FOOTER_DISCLAIMER_BASELINE + lines_below * _FOOTER_LEADING,
+            line,
+        )
     c.drawString(
-        0.6 * inch, footer_y,
+        0.6 * inch,
+        footer_y,
         f"Reference genome: {reference_genome}  |  Pipeline: {pipeline_version}  |  "
         f"Generated: {generated_at}",
     )

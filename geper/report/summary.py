@@ -16,7 +16,8 @@ provider dicts a second time), a pathologist sign-off block, and a
 standard legal disclaimer.
 
 Entry point: `generate_pdf(document, output_path, patient_meta=None,
-qc_metrics=None, run_id=None, logo_path=None)`.
+run_id=None, logo_path=None)`. Run-level QC is read from `document`
+rather than passed in -- see `_document_qc_metrics`.
 
 Compliance note (India DPDP Act 2023, not HIPAA/GDPR -- this is an
 India-market product): this module parses and renders whatever
@@ -49,17 +50,64 @@ from reportlab.platypus import Image, KeepTogether, PageBreak, Paragraph, Simple
 from reportlab.platypus.flowables import Flowable
 
 from annotation.thousand_genomes_sas import DIASPORA_DISCLOSURE, SAMPLE_SIZE_DISCLOSURE
+from component_identity import SHORT_NAME
 from config import CONFIG
+from pipeline.acmg_rules import mtdna_interpretation_disclaimer
+from pipeline.hgvs_utils import is_mitochondrial_chrom
 from pipeline.models.status import DISABLED as _STATUS_DISABLED
 from pipeline.models.status import FAILED as _STATUS_FAILED
 from pipeline.models.status import SKIPPED as _STATUS_SKIPPED
 from pipeline.models.status import USED as _STATUS_USED
-from pipeline.provenance import EVIDENCE_SOURCE_TO_PROVENANCE_PREFIX
+from pipeline.provenance import EVIDENCE_SOURCE_TO_PROVENANCE_PREFIX, RETRIEVAL_MODE_LABELS
 from pipeline.stage_schemas import StageStatus as _StageStatus
-from report.clinical_report_builder import ACMG_METHODOLOGY_STATEMENT, EVIDENCE_COMPLETENESS_CAPTION
+from report.clinical_report_builder import (
+    candidate_interpretation_of,
+    ACMG_METHODOLOGY_STATEMENT,
+    EVIDENCE_COMPLETENESS_CAPTION,
+    DOCUMENT_POSITIONING_STATEMENT,
+    ISO_RESEARCH_ELEMENT,
+    RESEARCH_USE_DISCLAIMER,
+    # Moved out of this module on 2026-08-21 so the Markdown renderer and
+    # the JSON run-level block could reach them without importing from a
+    # PDF renderer -- see that module's "Shared run-level caveat helpers"
+    # comment. Re-imported here (rather than call sites being rewritten)
+    # so `report.summary._variant_reviewer_flags` and friends still
+    # resolve for existing callers and tests.
+    _consent_value_label,
+    _offline_sources_caveat_text,
+    _variant_hgvs_or_locus,
+    _variant_reviewer_flags,
+    # Relocated 2026-08-21 (A7): the QC vocabulary, thresholds and
+    # `{status, value, reason}` parsing are renderer-neutral, so the
+    # Markdown report can render the same table this module does instead
+    # of rendering nothing. Re-imported here so existing callers and
+    # tests that reach for `report.summary._parse_qc_metrics` still work.
+    _parse_qc_metrics,
+    _qc_status,
+    _qc_threshold_pass_min,
+    _QC_METRIC_LABELS,
+    _QC_METRIC_ORDER,
+    _QC_METRIC_UNITS,
+    # Re-exported for callers/tests that read it from `report.summary`,
+    # where it lived before the A7 move. This module only names it in
+    # comments, so ruff's F401 autofix stripped it when the relocation
+    # landed and broke those readers -- the noqa is what keeps a
+    # deliberate re-export from looking like a dead import.
+    _QC_METRICS_NOT_APPLICABLE_REASON,  # noqa: F401
+    # The single shared rendering of a per-sample allele fraction, called
+    # by this module and by the Markdown renderer, so the two full reports
+    # degrade identically -- the `_variant_hgvs_or_locus` pattern above,
+    # applied to the tri-state this field carries.
+    variant_allele_fraction_text,
+    DATA_ATTRIBUTION_HEADING,
+    EVIDENCE_SOURCES_USED_HEADING,
+    NO_EVIDENCE_SOURCES_TEXT,
+    reference_blocks,
+    report_revision_banners,
+)
+from report.pdf_escape import esc
 from utils.logger import get_logger
-from utils.service_health import HEALTH
-from utils.timezone_utils import format_ist
+from utils.timezone_utils import format_ist, format_ist_from_iso
 
 logger = get_logger(__name__)
 
@@ -98,13 +146,16 @@ _LOGO_TITLE_GAP = 4 * mm
 # same run.
 _SIGNOFF_ROLES = ("Clinical Scientist", "Consultant Clinical Scientist")
 
-_DISCLAIMER_TEXT = (
-    "Limitations and Disclaimer: This test was developed and its performance characteristics "
-    "determined by the Geper Genomic Analysis Pipeline. It is intended for clinical use in "
-    "conjunction with other clinical and diagnostic findings. Decisions regarding patient care "
-    "should not be based solely on this report. All clinical decisions must be made by a "
-    "qualified healthcare professional."
-)
+# The closing disclaimer block. `RESEARCH_USE_DISCLAIMER` is imported
+# rather than restated: this constant previously held US CLIA/LDT
+# template wording asserting the report was "intended for clinical
+# use", which contradicted both the research-use limitation this same
+# PDF prints under every finding and this module's own docstring above
+# (which describes hospital use as pending a compliance sign-off not
+# yet obtained). Retired 2026-08-21. The label is applied here, not
+# carried in the shared constant, so each renderer can present it its
+# own way -- see that constant's own comment.
+_DISCLAIMER_LABEL = "Limitations and Disclaimer: "
 
 # Mandatory ICMR-style AI-disclosure footer, printed on EVERY page of
 # every GEPER clinical PDF (see `_icmr_ai_disclosure_footer_text` for
@@ -117,213 +168,111 @@ _DISCLAIMER_TEXT = (
 # added, it must not apply here.
 _ICMR_DRAFT_FOOTER_TEXT = "DRAFT -- NOT FOR PATIENT USE. Awaiting clinical review."
 
+# The `review_status == "overridden"` counterpart. Deliberately NOT
+# folded into `_ICMR_DRAFT_FOOTER_TEXT`: an override is a real,
+# recorded clinical action, and rendering it as "DRAFT" would discard
+# the fact that a human deliberately changed a classification --
+# information a reporting pathologist needs, and which no other
+# per-page surface carries. It still leads with NOT FOR PATIENT USE,
+# because an overridden run is not export-eligible either
+# (`report/export_lims.py::_require_reviewed` gates on "reviewed"
+# alone), so all three surfaces agree on readiness while differing on
+# how they got there.
+#
+# Phrased so it is true whether or not the run was ever approved --
+# `review/signoff.py::override()` can be called on a never-approved run
+# -- hence "has overridden ... in this run" rather than anything
+# implying a prior sign-off.
+#
+# Deliberately does NOT name `reviewed_by`, even though `override()`
+# preserves it: a clinician's name sitting next to review wording in a
+# footer repeated on every page is exactly the at-a-glance misread this
+# whole change set exists to remove. Identity is not lost -- the
+# override's author, reason and timestamp are already rendered per
+# finding in the report body (see the "Clinician Override" line built
+# below), and `reviewed_by`/`reviewed_at` remain in `geper_results.json`
+# and the sign-off audit log. This footer states the run's STATE; the
+# body carries the IDENTITY.
+_ICMR_OVERRIDDEN_FOOTER_TEXT = (
+    "OVERRIDDEN -- NOT FOR PATIENT USE. A clinician has overridden at least one "
+    "classification in this run; a fresh sign-off is required before use."
+)
 
-def _icmr_ai_disclosure_footer_text(patient: Dict[str, Any]) -> str:
+
+def _icmr_ai_disclosure_footer_text(
+    patient: Dict[str, Any],
+    document: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     The mandatory per-page AI-disclosure footer text for this report.
 
-    Reuses `patient["physician"]` -- the one reviewing-clinician field
-    `_parse_patient_meta` already parses out of `--patient-meta` (see
-    that function's docstring) -- as the sole signal for "has a
-    clinician actually reviewed this run", rather than inventing a new
-    input path GEPER doesn't otherwise have. GEPER has no separate
-    medical-registration-number or hospital/lab-name field anywhere in
-    `patient_meta` (see `patient_metadata.example.json`: `physician` is
-    the one free-text clinician field, e.g. "Dr. A. Sharma, MD"), so
-    rather than printing the requested template's
-    "[Medical Registration Number], [Hospital/Lab Name]" placeholders
-    as literal bracketed text that could be mistaken for real,
-    fabricated-looking identifiers, this renders only the identifying
-    string GEPER actually has. A deployment that wants those additional
-    identifiers rendered should supply them as part of `physician`
-    (e.g. "Dr. A. Sharma, MD, Reg. No. 12345, ABC Diagnostics") --
-    still exactly the same one input field, no new path.
+    REVIEW STATE COMES FROM `document["review_status"]`, and from
+    nothing else. That field is written only by
+    `review/signoff.py::approve()` (`"reviewed"`) and `override()`
+    (`"overridden"`); every other path leaves the `"draft"` that
+    `report/json_builder.py` writes. Three outcomes, matching the three
+    states the Markdown banner already distinguishes
+    (`report/report_generator.py::_render_review_status_banner`):
+    `"reviewed"` names the reviewer, `"overridden"` renders
+    `_ICMR_OVERRIDDEN_FOOTER_TEXT`, and everything else -- `"draft"`, an
+    unrecognised value, a missing key, or a missing `document` entirely
+    -- renders `_ICMR_DRAFT_FOOTER_TEXT`. That last catch-all is the
+    fail-safe direction: a report nobody has attested to reviewing must
+    never look, at a glance, indistinguishable from one that is
+    actually ready for clinical use.
 
-    Before any reviewing-clinician info exists at all (`physician` is
-    `None` -- `--patient-meta` omitted, a corrupt/malformed file, or a
-    file that supplies `patient_name` but not `physician`), this
-    returns `_ICMR_DRAFT_FOOTER_TEXT` instead: a report nobody has
-    attested to reviewing must never look indistinguishable, at a
-    glance, from one that's actually ready for clinical use.
+    This deliberately reverses an earlier design in which
+    `patient["physician"]` -- a free-text field supplied by the caller
+    via `--patient-meta` -- was the sole signal for "has a clinician
+    actually reviewed this run". That made the review claim assertable
+    by an input file: supplying any physician string suppressed the
+    DRAFT warning on every page and printed "has been reviewed by X",
+    with no sign-off ever performed and `review_status` still `"draft"`.
+    An input field must not be able to make the clinician-facing
+    artefact assert something the sign-off record does not.
+
+    `physician` therefore now means ATTRIBUTION ONLY -- the referring
+    clinician, already rendered as "Referring Physician" in the patient
+    identity block of both PDFs -- and no longer carries any review
+    state. It survives here only as a fallback for the reviewer's NAME,
+    and only once `review_status` has already established that a
+    sign-off exists; it can no longer create that state on its own.
+
+    The reviewer named is `document["reviewed_by"]`, which
+    `approve()` writes alongside `review_status` from the same
+    clinician/registration/hospital string it folds into `physician`
+    (e.g. "Dr. A. Sharma, MD, Reg. No. 12345, ABC Diagnostics"), so the
+    rendered sentence is unchanged for the normal sign-off path -- it
+    is now simply sourced from the sign-off record rather than from an
+    input file.
     """
-    physician = (patient or {}).get("physician")
-    if not physician:
+    status = (document or {}).get("review_status")
+    if status == "overridden":
+        return _ICMR_OVERRIDDEN_FOOTER_TEXT
+    if status != "reviewed":
         return _ICMR_DRAFT_FOOTER_TEXT
+    reviewer = (document or {}).get("reviewed_by") or (patient or {}).get("physician")
+    if not reviewer:
+        # Signed off, but no reviewer identity was recorded. Saying DRAFT
+        # here would be the opposite error -- denying a sign-off that did
+        # happen -- so this states the attested fact and omits the name
+        # rather than inventing one.
+        return (
+            "This report was generated using AI-assisted genomic interpretation and has been "
+            "reviewed and signed off. This is not a standalone diagnosis."
+        )
     return (
         f"This report was generated using AI-assisted genomic interpretation and has been "
-        f"reviewed by {physician}. This is not a standalone diagnosis."
+        f"reviewed by {reviewer}. This is not a standalone diagnosis."
     )
 
 
-# Display units for each QC metric -- not a "mock" value (renamed from
-# `_MOCK_QC_METRICS`, report review round 7: the old name predated the
-# honest not-supplied/not-applicable rendering and had stopped
-# describing what this dict is actually used for, which is only ever
-# the unit suffix below).
-_QC_METRIC_UNITS: Dict[str, str] = {
-    "mean_coverage_depth": "x",
-    "bases_at_20x": "%",
-    "q30_score": "%",
-}
-
-_QC_METRIC_LABELS = {
-    "mean_coverage_depth": "Mean Coverage Depth",
-    "bases_at_20x": "Bases at >20x Coverage",
-    "q30_score": "Q30 Score",
-}
-
-_QC_METRIC_ORDER = ("mean_coverage_depth", "bases_at_20x", "q30_score")
-
-
-def _qc_threshold_pass_min(metric_key: str) -> float:
-    """PASS/WARNING threshold for one QC metric -- see QCReportConfig's docstring (config.py) for why these are placeholders, configurable via GEPER_QC_* env vars."""
-    return {
-        "mean_coverage_depth": CONFIG.qc_report.MEAN_COVERAGE_DEPTH_PASS_MIN,
-        "bases_at_20x": CONFIG.qc_report.BASES_AT_20X_PASS_MIN,
-        "q30_score": CONFIG.qc_report.Q30_SCORE_PASS_MIN,
-    }[metric_key]
-
-
-def _qc_status(metric_key: str, value: float) -> str:
-    return "PASS" if value >= _qc_threshold_pass_min(metric_key) else "WARNING"
-
-
-# ---------------------------------------------------------------------------
-# QC metrics parsing (report review round 7)
-#
-# Three states, not two: kim_pipeline genuinely measured a value
-# (FOUND), GEPER was invoked in VCF-only mode so no run-level QC could
-# ever exist (NOT_RUN, "not applicable" -- not a gap), or an upstream
-# step was attempted and failed / a tool to produce this metric simply
-# doesn't exist yet (also NOT_RUN or ERROR depending on which, each
-# with its own `reason`). Reuses `pipeline.stage_schemas.StageStatus`
-# rather than inventing a fourth status vocabulary in this codebase --
-# NOT_FOUND is deliberately unused here (a QC metric either was
-# measured or wasn't; there's no "checked, confirmed absent" reading
-# for a number the way there is for a database lookup).
-# ---------------------------------------------------------------------------
-
-_QC_METRICS_NOT_APPLICABLE_REASON = (
-    "This report was generated directly from a VCF (no --qc-metrics-json was supplied), so GEPER "
-    "never ran or observed any upstream sequencing/alignment step for this sample -- there is no "
-    "run-level QC to show here, not merely an unreported one."
-)
-
-_VALID_QC_STATUSES = {_StageStatus.NOT_RUN.value, _StageStatus.ERROR.value, _StageStatus.FOUND.value}
-
-
-def _parse_one_qc_metric(key: str, entry: Any) -> Dict[str, Any]:
-    """
-    Validates one `qc_metrics[key]` entry against the required
-    `{"status", "value", "reason"}` shape. This is the single choke
-    point a raw number must pass through before `_qc_status`'s `>=`
-    comparison can ever see it -- anything that doesn't parse into
-    exactly this shape (a bare float where the dict belongs, a missing
-    or unrecognized `status`, a `status: "found"` with no usable
-    numeric `value`) fails THIS metric closed to ERROR rather than
-    being coerced into a number to compare against a threshold. This
-    is what makes the B-series fabricated-PASS-on-placeholder-numbers
-    regression structurally impossible here, not merely avoided by
-    convention: there is no code path from an untrusted input to
-    `_qc_status` that skips this validation.
-    """
-    if entry is None:
-        return {
-            "status": _StageStatus.NOT_RUN.value,
-            "value": None,
-            "reason": "Not reported by the upstream sequencing/alignment pipeline for this run.",
-        }
-    if not isinstance(entry, dict):
-        logger.warning(
-            f"qc_metrics['{key}'] was not an object ({entry!r}); a bare number is never accepted here -- "
-            "a real value must be wrapped in {'status': 'found', 'value': ..., 'reason': ...}. Rendering "
-            "as a failed measurement rather than trusting an unvalidated number."
-        )
-        return {
-            "status": _StageStatus.ERROR.value,
-            "value": None,
-            "reason": f"Malformed qc_metrics entry for '{key}': expected an object, got {type(entry).__name__}.",
-        }
-
-    status = entry.get("status")
-    if status not in _VALID_QC_STATUSES:
-        logger.warning(f"qc_metrics['{key}']['status']={status!r} is not a recognized status; treating as ERROR.")
-        return {
-            "status": _StageStatus.ERROR.value,
-            "value": None,
-            "reason": entry.get("reason") or f"Unrecognized status {status!r} reported for '{key}'.",
-        }
-
-    reason = entry.get("reason")
-    if status == _StageStatus.FOUND.value:
-        value = entry.get("value")
-        # bool is an int subclass -- excluded explicitly so a stray
-        # `"value": true` can never be silently read as `1.0`.
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            logger.warning(
-                f"qc_metrics['{key}'] status was 'found' but 'value' was not a real number ({value!r}); "
-                "treating as ERROR rather than coercing it."
-            )
-            return {
-                "status": _StageStatus.ERROR.value,
-                "value": None,
-                "reason": f"'{key}' was reported found but carried no usable numeric value.",
-            }
-        return {"status": _StageStatus.FOUND.value, "value": float(value), "reason": reason}
-
-    # NOT_RUN / ERROR: `value` is deliberately discarded even if present
-    # -- only a FOUND status may ever hand a number to `_qc_status`.
-    return {"status": status, "value": None, "reason": reason}
-
-
-def _parse_qc_metrics(qc_metrics: Optional[Union[Dict[str, Any], str]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Accepts a dict (already-parsed, e.g. from an in-process caller), a
-    path to a JSON sidecar file (see `bridge/combined_pipeline.py`'s
-    translation of kim_pipeline's `checkpoint.json` into this shape),
-    or `None`. Always returns exactly `_QC_METRIC_ORDER`'s three keys,
-    each mapped to a validated `{"status", "value", "reason"}` dict --
-    never a partial result, so `_build_qc_flowables` never has to guess
-    whether a missing key means "not applicable" or "forgot to check".
-
-    `None` (no `--qc-metrics-json` was ever passed to `generate_pdf` --
-    the default for `main.py --vcf` today, and for every fixture/Colab
-    run so far) is NOT "missing data to apologize for". A hospital
-    handing GEPER a bare VCF has no run-level QC GEPER could ever have
-    computed -- GEPER never touched their FASTQ or BAM. Every metric is
-    therefore explicitly NOT_RUN with a reason saying exactly that,
-    distinct from a kim_pipeline-combined run where a metric was
-    genuinely attempted and failed (ERROR), or where the tool to
-    produce it has never been wired at all (also NOT_RUN, but with a
-    per-metric reason naming the missing step -- see
-    `bridge/combined_pipeline.py`'s fixed reason for `bases_at_20x`,
-    which has no computation anywhere in kim_pipeline as of this round).
-
-    A missing file, corrupt JSON, or non-object body all fall back to
-    the same all-NOT_RUN default as `None` (logged for operators, never
-    raised) -- a malformed sidecar must never look like a real
-    measurement any more than an absent one would.
-    """
-    not_applicable = {
-        key: {"status": _StageStatus.NOT_RUN.value, "value": None, "reason": _QC_METRICS_NOT_APPLICABLE_REASON}
-        for key in _QC_METRIC_ORDER
-    }
-    if not qc_metrics:
-        return not_applicable
-
-    try:
-        if isinstance(qc_metrics, dict):
-            raw = qc_metrics
-        else:
-            with open(qc_metrics, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-        if not isinstance(raw, dict):
-            raise ValueError("qc_metrics JSON must be an object")
-    except (OSError, ValueError, TypeError) as exc:
-        logger.warning(f"Could not parse qc_metrics ({exc}); rendering the not-applicable default instead.")
-        return not_applicable
-
-    return {key: _parse_one_qc_metric(key, raw.get(key)) for key in _QC_METRIC_ORDER}
+# Run-level QC parsing, thresholds and vocabulary now live in
+# `report/clinical_report_builder.py` -- they are renderer-neutral (no
+# reportlab), and the Markdown report needs the same labels, thresholds
+# and PASS/WARNING rule this module does. Re-exported via the import
+# above because `pipeline/orchestrator.py` and the test suite import
+# several of them from `report.summary`, where they lived until the A7 fix.
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +371,21 @@ def _parse_patient_meta(patient_meta: Optional[Union[Dict[str, Any], str]]) -> D
         disclaimer text) -- that must remain the common case a lab can
         stay in while still having a named clinician review and sign
         off on a report (see `_icmr_ai_disclosure_footer_text`, which
-        reads exactly this field to decide "DRAFT" vs "reviewed by
-        {physician}"). Coupling `physician` to `patient_name` would
+        NAMES this field as the reviewer once `document["review_status"]`
+        has already established that the report is reviewed).
+        CORRECTED 2026-09-11 -- this sentence previously read: "which
+        reads exactly this field to decide \"DRAFT\" vs \"reviewed by
+        {physician}\"". That describes the design this codebase
+        DELIBERATELY REVERSED on 2026-08-21, and it described it as
+        current: when `physician` decided the DRAFT banner, an input
+        file could assert a review that no sign-off had performed.
+        `_icmr_ai_disclosure_footer_text`'s own docstring, ~170 lines
+        above in this same file, has said since then that review state
+        comes from `document["review_status"]` "and from nothing else"
+        and that `physician` is "ATTRIBUTION ONLY". A caveat corrected
+        in one place and left standing in another is worse than an
+        uncorrected one, because the corrected copy is a reader's
+        evidence that someone checked. Coupling `physician` to `patient_name` would
         force a lab to fabricate or attach a real patient name purely
         to unlock sign-off on an otherwise-intentionally-de-identified
         run -- backwards from what de-identification is for. (Earlier
@@ -527,12 +489,20 @@ def _derive_run_id(document: Dict[str, Any], run_id: Optional[str]) -> str:
     rather than a new one each time). A real LIMS/hospital deployment
     should supply its own authoritative run/accession ID via
     `generate_pdf(run_id=...)` instead of relying on this fallback.
+
+    A missing `generated_at` returns a fixed marker rather than falling
+    back to `datetime.now()`: the same document re-rendered twice with
+    no persisted timestamp must get the same Run ID both times, not a
+    new one each render -- the same fabrication family as the "Report
+    Generated" field (#17/#20).
     """
     if run_id:
         return run_id
-    generated_at = document.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    generated_at = document.get("generated_at")
+    if not generated_at:
+        return "BIJ-RUN-UNAVAILABLE"
     compact = "".join(ch for ch in generated_at if ch.isalnum())
-    return f"GEPER-RUN-{compact[:14]}"
+    return f"BIJ-RUN-{compact[:14]}"
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +655,7 @@ def _make_later_page_decoration(header_label: str):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
         canvas.setFillColor(colors.grey)
-        canvas.drawString(_MARGIN, _PAGE_H - 12 * mm, f"GEPER Clinical Genomic Report -- {header_label}")
+        canvas.drawString(_MARGIN, _PAGE_H - 12 * mm, f"{SHORT_NAME} Clinical Genomic Report -- {header_label}")
         canvas.setStrokeColor(colors.lightgrey)
         canvas.line(_MARGIN, _PAGE_H - 14 * mm, _PAGE_W - _MARGIN, _PAGE_H - 14 * mm)
         canvas.restoreState()
@@ -704,6 +674,25 @@ def _build_stylesheet() -> Dict[str, ParagraphStyle]:
     return {
         "ReportTitle": ParagraphStyle(
             "GeperReportTitle", parent=base["Title"], fontSize=16, textColor=navy, spaceAfter=2
+        ),
+        # Page-1 positioning banner. Sized and boxed to be read, not
+        # skimmed past: the claim it carries was previously in 6.5pt
+        # footer text, which is present-but-unread. Larger than body
+        # text, bold, tinted, and boxed -- the most prominent thing on
+        # the page before the findings table.
+        "PositioningBanner": ParagraphStyle(
+            "GeperPositioningBanner",
+            parent=base["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            leading=13.5,
+            textColor=navy,
+            backColor=colors.HexColor("#eef3f8"),
+            borderColor=navy,
+            borderWidth=0.9,
+            borderPadding=6,
+            spaceBefore=2,
+            spaceAfter=4,
         ),
         "SectionHeading": ParagraphStyle(
             "GeperSectionHeading", parent=base["Heading2"], fontSize=12, textColor=navy, spaceBefore=6, spaceAfter=3
@@ -819,6 +808,14 @@ def _load_cropped_logo_image(path: str) -> BytesIO:
     return buf
 
 
+SCOPE_LINE = (
+    "Variant interpretation from a supplied VCF — produced by the Bij AI "
+    "variant-interpretation component (GEPER). "
+    "Sequencing, alignment and variant calling are performed upstream; any run-level "
+    "QC shown here is supplied by that run and is not computed by this report."
+)
+
+
 def _build_report_header(logo_path: Optional[str], styles: Dict[str, ParagraphStyle]) -> List[Any]:
     """
     First-page report header: the title, with a logo placed to its
@@ -851,7 +848,7 @@ def _build_report_header(logo_path: Optional[str], styles: Dict[str, ParagraphSt
     before this feature existed.
     """
     content_width = _PAGE_W - 2 * _MARGIN
-    title = Paragraph("GEPER Clinical Genomic Analysis Report", styles["ReportTitle"])
+    title = Paragraph(f"{SHORT_NAME} Clinical Genomic Analysis Report", styles["ReportTitle"])
     _, title_height = title.wrap(content_width, 1000)
 
     resolved = _resolve_logo_path(logo_path)
@@ -891,11 +888,73 @@ def _build_report_header(logo_path: Optional[str], styles: Dict[str, ParagraphSt
     return [header_table]
 
 
-def _consent_value_label(value: Optional[bool]) -> str:
-    """ "Yes"/"No"/"Not stated" -- matches the "Not provided" convention `_build_patient_header_table` already uses for a missing DOB/Gender/Physician, applied to a tri-state (True/False/None) field instead of a missing string."""
-    if value is None:
-        return "Not stated"
-    return "Yes" if value else "No"
+def _document_consent(document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    DPDP Act 2023 consent metadata for this run, read from the document
+    and from nowhere else.
+
+    Both PDF renderers previously took consent from whatever
+    `--patient-meta` they were handed, while the Markdown report read
+    `document["patient_consent"]`. Those are two independent inputs
+    answering one question, and a render-and-diff of a single run caught
+    them disagreeing: a document carrying consent, rendered without a
+    patient_meta argument, produced a Markdown report stating consent
+    and PDFs stating none. They had only ever agreed by convention --
+    `pipeline/orchestrator.py` happens to populate the document field by
+    calling `_parse_patient_meta` on the same file it later passes to
+    these renderers -- never by construction.
+
+    The document wins because it is the unified shape every other field
+    already flows through, and because it is what survives to
+    `geper_results.json` for `report/export_lims.py` and any other
+    machine consumer. Consequence, stated rather than buried: a
+    `--patient-meta` consent object no longer reaches a PDF on its own.
+    For a real pipeline run that changes nothing (the orchestrator
+    populates the document from that same file), but a caller invoking
+    `generate_pdf` directly against a document with no
+    `patient_consent` key will no longer see consent rows.
+
+    Same "absent, not fabricated" contract as before: `None` when the
+    run recorded no consent object at all, which `_consent_rows` renders
+    as no rows rather than three "Not stated" ones.
+    """
+    return (document or {}).get("patient_consent")
+
+
+def _document_qc_metrics(document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Run-level sequencing/alignment QC for this run, read from the document
+    and from nowhere else -- the same consolidation `_document_consent`
+    performs one function above, for the same reason.
+
+    QC used to arrive only as a `generate_pdf(qc_metrics=...)` argument,
+    which made it a PDF-only fact that nothing else could see. Two
+    consequences, both real:
+
+      - `report/report_generator.py` rendered no QC at all and had no way
+        to -- the data never reached it. That is the A7 gap: a
+        full-fidelity human-readable renderer silently omitting a section
+        the PDF shows, which in this codebase reads identically to a run
+        that genuinely had none.
+      - `review/signoff.py` re-rendered from the stored document days
+        later with no argument to pass, so a signed report claimed no
+        upstream QC existed for runs that had supplied it (fixed in
+        ae0d9f7 by threading the document's copy through; this commit
+        removes the need to thread anything).
+
+    The document wins for the same reason it does for consent: it is the
+    unified shape every other field already flows through, and it is what
+    survives to `geper_results.json` for machine consumers.
+
+    `None` -- no `--qc-metrics-json` was supplied, or a document written
+    before QC was stored -- keeps its exact meaning. `_parse_qc_metrics`
+    turns it into the all-NOT_RUN default whose per-metric reasons say
+    plainly that GEPER never observed an upstream sequencing step, which
+    is a true statement rather than a gap. That contract is the whole
+    point: a run that DID supply QC must never render as one that did
+    not, and a run that genuinely had none must keep saying so honestly.
+    """
+    return (document or {}).get("qc_metrics")
 
 
 def _consent_rows(patient: Dict[str, Any], lbl: ParagraphStyle, val: ParagraphStyle) -> List[List[Paragraph]]:
@@ -924,12 +983,17 @@ def _consent_rows(patient: Dict[str, Any], lbl: ParagraphStyle, val: ParagraphSt
         [Paragraph("Consent -- Research Use", lbl), Paragraph(_consent_value_label(consent["research"]), val)],
     ]
     if consent.get("timestamp"):
-        rows.append([Paragraph("Consent Recorded", lbl), Paragraph(consent["timestamp"], val)])
+        rows.append([Paragraph("Consent Recorded", lbl), Paragraph(esc(consent["timestamp"]), val)])
     return rows
 
 
 def _build_patient_header_table(
-    patient: Dict[str, Any], sample_id: str, run_id: str, assembly: Optional[str], styles: Dict[str, ParagraphStyle]
+    patient: Dict[str, Any],
+    sample_id: str,
+    run_id: str,
+    assembly: Optional[str],
+    generated_at: Optional[str],
+    styles: Dict[str, ParagraphStyle],
 ) -> Table:
     lbl, val = styles["TableLabel"], styles["TableValue"]
     rows: List[List[Paragraph]] = []
@@ -939,22 +1003,28 @@ def _build_patient_header_table(
         # plus Sample ID / Run ID, no DOB/Gender/Physician rows at all.
         rows.append([Paragraph("Patient", lbl), Paragraph(_DEIDENTIFIED_LABEL, val)])
     else:
-        rows.append([Paragraph("Patient Name", lbl), Paragraph(patient["patient_name"], val)])
-        rows.append([Paragraph("Date of Birth", lbl), Paragraph(patient["dob"] or "Not provided", val)])
-        rows.append([Paragraph("Gender", lbl), Paragraph(patient["gender"] or "Not provided", val)])
-        rows.append([Paragraph("Referring Physician", lbl), Paragraph(patient["physician"] or "Not provided", val)])
+        rows.append([Paragraph("Patient Name", lbl), Paragraph(esc(patient["patient_name"]), val)])
+        rows.append([Paragraph("Date of Birth", lbl), Paragraph(esc(patient["dob"]) or "Not provided", val)])
+        rows.append([Paragraph("Gender", lbl), Paragraph(esc(patient["gender"]) or "Not provided", val)])
+        rows.append(
+            [Paragraph("Referring Physician", lbl), Paragraph(esc(patient["physician"]) or "Not provided", val)]
+        )
 
     rows.extend(_consent_rows(patient, lbl, val))
 
-    rows.append([Paragraph("Sample ID", lbl), Paragraph(sample_id, val)])
-    rows.append([Paragraph("Run ID", lbl), Paragraph(run_id, val)])
+    rows.append([Paragraph("Sample ID", lbl), Paragraph(esc(sample_id), val)])
+    rows.append([Paragraph("Run ID", lbl), Paragraph(esc(run_id), val)])
     rows.append([Paragraph("Genome Reference Build", lbl), Paragraph(assembly or "Not specified", val)])
-    # Displayed in IST (report is for Indian hospitals) -- the
-    # underlying timestamp is still generated in UTC
-    # (`datetime.now(timezone.utc)`) and only converted for this
-    # human-facing label; nothing stored/logged changes. See
-    # `utils/timezone_utils.py`.
-    rows.append([Paragraph("Report Generated", lbl), Paragraph(format_ist(datetime.now(timezone.utc)), val)])
+    # Two different facts, not alternatives (#17): the document's own
+    # persisted `generated_at` (when this analysis was actually run --
+    # falls back to the same "Not available" marker Markdown already
+    # uses via `format_ist_from_iso`, never to `datetime.now()`), and
+    # separately the moment THIS PDF FILE was rendered, which can be
+    # long after the analysis if the PDF is re-printed from saved JSON.
+    # Displayed in IST (report is for Indian hospitals); stored/logged
+    # timestamps stay UTC. See `utils/timezone_utils.py`.
+    rows.append([Paragraph("Report Generated", lbl), Paragraph(format_ist_from_iso(generated_at), val)])
+    rows.append([Paragraph("PDF Rendered", lbl), Paragraph(format_ist(datetime.now(timezone.utc)), val)])
 
     table = Table(rows, colWidths=[55 * mm, 110 * mm], hAlign="LEFT")
     table.setStyle(
@@ -1014,23 +1084,38 @@ def _build_provenance_flowables(document: Dict[str, Any], styles: Dict[str, Para
             styles["Footnote"],
         ),
         Spacer(1, 2 * mm),
-        Paragraph(f"<b>GEPER code version:</b> {document.get('code_version') or 'unknown'}", styles["BodyText"]),
+        Paragraph(f"<b>{SHORT_NAME} code version:</b> {document.get('code_version') or 'unknown'}", styles["BodyText"]),
         Spacer(1, 2 * mm),
     ]
 
     checkpoints = document.get("model_checkpoints") or {}
     flow.append(Paragraph("<b>AI model checkpoints:</b>", styles["BodyText"]))
+    # Round 17: see `report/report_generator.py::_render_provenance`'s
+    # identical branch for the full reasoning (ROUND_CANDIDATES.md,
+    # round 12) -- a run that died mid-loop leaves `run_complete` at its
+    # honest `False` default (also what a pre-round-17 file with no
+    # such key reads as, via `bool(...)`), and every checkpoint below is
+    # then still a bare config identifier with no real run status.
+    if not bool(document.get("run_complete")):
+        flow.append(
+            Paragraph(
+                "This run did not complete (no post-loop status enrichment was recorded) -- the "
+                "identifiers below are configuration only. Whether each model actually ran, failed to "
+                "load, or was skipped this run is not yet known.",
+                styles["StatusWarn"],
+            )
+        )
     if checkpoints:
         for name, value in sorted(checkpoints.items()):
             # See `report/report_generator.py`'s identical branch for
             # why both shapes are handled (F1a, report review round 4).
             if isinstance(value, dict):
                 status_label = _MODEL_STATUS_LABELS.get(value.get("status"), value.get("status") or "unknown")
-                text = f"• {name}: {value.get('identifier')} -- {status_label}"
+                text = f"• {esc(name)}: {esc(value.get('identifier'))} -- {esc(status_label)}"
                 if value.get("reason"):
-                    text += f" ({value['reason']})"
+                    text += f" ({esc(value['reason'])})"
             else:
-                text = f"• {name}: {value}"
+                text = f"• {esc(name)}: {esc(value)}"
             flow.append(Paragraph(text, styles["BulletText"]))
     else:
         flow.append(Paragraph("No AI model checkpoint identifiers recorded for this run.", styles["Footnote"]))
@@ -1045,15 +1130,28 @@ def _build_provenance_flowables(document: Dict[str, Any], styles: Dict[str, Para
     for record in provenance:
         status = record.get("status", "unknown")
         label = _PROVENANCE_STATUS_LABELS.get(status, status)
-        detail_bits = [f"{record.get('source')}: {label}"]
+        detail_bits = [f"{esc(record.get('source'))}: {esc(label)}"]
         if record.get("version"):
-            detail_bits.append(f"version {record['version']}")
+            detail_bits.append(f"version {esc(record['version'])}")
         if record.get("release_date"):
-            detail_bits.append(f"released {record['release_date']}")
+            detail_bits.append(f"released {esc(record['release_date'])}")
         if record.get("content_hash"):
             detail_bits.append(
-                f"hash ({record.get('hash_algorithm') or 'unknown algorithm'}): {record['content_hash']}"
+                f"hash ({esc(record.get('hash_algorithm') or 'unknown algorithm')}): {esc(record['content_hash'])}"
             )
+        # Second axis -- see `report_generator.py::_render_provenance`
+        # and `pipeline/provenance.py::RetrievalMode`. Same shared
+        # label map as the Markdown, so the two formats cannot drift
+        # on this the way the status labels above are only kept in step
+        # by a comment.
+        retrieval = record.get("retrieval")
+        if retrieval:
+            detail_bits.append(f"retrieval: {esc(RETRIEVAL_MODE_LABELS.get(retrieval, retrieval))}")
+        # The reason, as the Markdown already prints it: without it an
+        # UNKNOWN row is a label with no explanation -- e.g. samtools'
+        # "not recorded, and why" (2026-09-11).
+        if record.get("notes"):
+            detail_bits.append(esc(record["notes"]))
         flow.append(Paragraph("• " + "; ".join(detail_bits), styles["BulletText"]))
     return flow
 
@@ -1168,14 +1266,40 @@ def _build_qc_flowables(qc_metrics: Dict[str, Dict[str, Any]], styles: Dict[str,
 
     if not_run_entries:
         flowables.append(Spacer(1, 2 * mm))
-        reasons = "; ".join(
-            f"{label} -- {entry.get('reason') or 'not applicable this run.'}" for label, entry in not_run_entries
-        )
+        # Grouped by the EXACT reason string, not a fixed enum of the
+        # three reasons known at the time this was written
+        # (VCF-only's `_QC_METRICS_NOT_APPLICABLE_REASON`, the per-key
+        # "not reported" fallback in `_parse_one_qc_metric`, and
+        # `bridge/combined_pipeline.py`'s per-metric tool-absence
+        # reason for bases_at_20x). `_parse_one_qc_metric` passes any
+        # caller-supplied `reason` through verbatim for a NOT_RUN
+        # entry, so a future or third-party --qc-metrics-json producer
+        # can introduce a reason this code has never seen -- keying on
+        # the string itself, not a name-based special case, is what
+        # keeps grouping correct for that reason too, not just the
+        # three known today. When two or more metrics share the exact
+        # same reason (round 13: this was previously the SAME ~40-word
+        # VCF-only sentence repeated once per metric, verbatim, in one
+        # paragraph), it is now stated once, naming every metric label
+        # that shares it -- content and wording untouched, see
+        # `_QC_METRICS_NOT_APPLICABLE_REASON`'s and
+        # `_BASES_AT_20X_NOT_RUN_REASON`'s own docstrings/comments for
+        # why neither may be shortened. Distinct reasons (e.g. Run 2's
+        # real shape: two metrics found, bases_at_20x NOT_RUN for a
+        # tool-absence reason wholly unrelated to VCF-only) still each
+        # get their own clause -- grouping only ever merges entries
+        # whose reason text is identical, never entries whose reasons
+        # merely both happen to be NOT_RUN.
+        reason_groups: Dict[str, List[str]] = {}
+        for label, entry in not_run_entries:
+            reason = entry.get("reason") or "not applicable this run."
+            reason_groups.setdefault(reason, []).append(label)
+        clauses = "; ".join(f"{', '.join(labels)} -- {esc(reason)}" for reason, labels in reason_groups.items())
         flowables.append(
             Paragraph(
-                f"Not applicable this run: {reasons} To supply real values from a kim_pipeline-combined "
-                "run, see bridge/combined_pipeline.py's --qc-metrics-json handoff to "
-                "generate_pdf(qc_metrics=...).",
+                f"Not applicable this run: {clauses} To supply real values from a kim_pipeline-combined "
+                "run, see bridge/combined_pipeline.py's --qc-metrics-json handoff, which the "
+                "orchestrator records on the report document itself.",
                 styles["Footnote"],
             )
         )
@@ -1183,7 +1307,7 @@ def _build_qc_flowables(qc_metrics: Dict[str, Dict[str, Any]], styles: Dict[str,
     if error_entries:
         flowables.append(Spacer(1, 2 * mm))
         reasons = "; ".join(
-            f"{label} -- {entry.get('reason') or 'measurement failed.'}" for label, entry in error_entries
+            f"{label} -- {esc(entry.get('reason') or 'measurement failed.')}" for label, entry in error_entries
         )
         flowables.append(
             Paragraph(
@@ -1225,48 +1349,6 @@ def _normalize_evidence_text(item: Any) -> str:
     return str(item) if item is not None else ""
 
 
-def _variant_reviewer_flags(variant_result: Dict[str, Any], clinical: Optional[Dict[str, Any]]) -> List[str]:
-    """
-    Short, plain-language reasons this one variant's finding may need a
-    reviewer's attention before sign-off -- deliberately narrow (not every
-    caveat the full report carries, e.g. routine "not yet scored" pending
-    states are left to the detailed sections) so this stays a genuine
-    signal on a 30-second skim, not noise.
-
-      - No clinical interpretation could be built at all (a data gap, not
-        a benign finding -- see `_build_variant_section`'s identical
-        framing for the full-detail section).
-      - A real (Minor/Moderate/Major/Critical) evidence conflict was
-        detected -- `clinical_report["conflict_resolution"]["severity"]`,
-        the same field the Conflict Resolution Engine (Phase 6) computes.
-        "Critical" means GEPER's own classification disagrees with an
-        expert-panel/practice-guideline ClinVar record for this exact
-        variant -- see `pipeline/conflict_resolution_engine.py::
-        _expert_panel_disagreement_conflict`.
-      - Gene resolution came back genuinely ambiguous (multiple candidate
-        genes overlap this position and could not be disambiguated) --
-        see `pipeline/orchestrator.py::GeperPipeline._with_gene_resolution_context`
-        and `pipeline/clingen/utils.py::GeneResolutionStatus`. Checked
-        against the ClinGen and transcript-structure stages, the two
-        stages that surface this status onto their own result dict.
-    """
-    if not clinical:
-        return ["No clinical interpretation available"]
-
-    flags: List[str] = []
-
-    severity = (clinical.get("conflict_resolution") or {}).get("severity")
-    if severity in ("Minor", "Moderate", "Major", "Critical"):
-        flags.append(f"Conflicting evidence ({severity})")
-
-    for stage_key in ("clingen", "transcript"):
-        if (variant_result.get(stage_key) or {}).get("gene_resolution_status") == "ambiguous":
-            flags.append("Ambiguous gene resolution")
-            break
-
-    return flags
-
-
 def _provenance_gap_sources(document: Dict[str, Any], variants: List[Dict[str, Any]]) -> List[str]:
     """
     Data sources this report actually cited as evidence (union of every
@@ -1292,7 +1374,7 @@ def _provenance_gap_sources(document: Dict[str, Any], variants: List[Dict[str, A
     """
     cited: set = set()
     for variant_result in variants:
-        clinical = variant_result.get("clinical_report") or {}
+        clinical = candidate_interpretation_of(variant_result) or {}
         cited.update(clinical.get("evidence_sources") or [])
     if not cited:
         return []
@@ -1309,36 +1391,6 @@ def _provenance_gap_sources(document: Dict[str, Any], variants: List[Dict[str, A
         if record.get("status") == "unknown" and any(source.startswith(p) for p in prefixes):
             gaps.append(source)
     return gaps
-
-
-def _offline_sources_caveat_text() -> Optional[str]:
-    """
-    Run-level, not per-finding: which external evidence sources (see
-    `utils/service_health.py`) were confirmed offline at startup and
-    therefore skipped for every variant in this run, rather than
-    genuinely queried and found to have nothing. Read once here so any
-    "not evaluated" or "not found" text for one of these sources
-    elsewhere in the report is not mistaken for a completed, negative
-    search. Returns `None` when every configured source was reachable
-    at startup (the common case, no caveat needed).
-
-    IndiGenomes no longer appears here as of 2026-08-08: it's retired
-    from GEPER's active query path (see `config.py::IndiGenomesConfig`'s
-    docstring and `DATA_SOURCE_LICENSE_AUDIT.md`), which also disables
-    its `utils/service_health.py` startup probe by default -- a source
-    that's never checked can never show up as "confirmed offline"
-    here, so this caveat mechanism naturally stops mentioning it
-    without needing a special case.
-    """
-    offline = HEALTH.offline_services()
-    if not offline:
-        return None
-    return (
-        "The following data source(s) were unreachable during this analysis run and were not queried for "
-        "any variant in this report: " + ", ".join(offline) + '. Any finding reported as "not evaluated" '
-        "or lacking data from these sources reflects a data-collection gap for this run, not a confirmed "
-        "absence -- it should not be treated as a negative result."
-    )
 
 
 def _build_clinician_summary_table(variants: List[Dict[str, Any]], styles: Dict[str, ParagraphStyle]) -> Table:
@@ -1385,7 +1437,7 @@ def _build_clinician_summary_table(variants: List[Dict[str, Any]], styles: Dict[
 
     for row_num, (idx, variant_result) in enumerate(indexed, start=1):
         variant = variant_result.get("variant", {})
-        locus = f"{variant.get('chrom')}:{variant.get('pos')} {variant.get('ref')}>{variant.get('alt')}"
+        locus = esc(f"{variant.get('chrom')}:{variant.get('pos')} {variant.get('ref')}>{variant.get('alt')}")
 
         if variant_result.get("out_of_scope"):
             # Report review round 8: must never render as "Not
@@ -1407,9 +1459,9 @@ def _build_clinician_summary_table(variants: List[Dict[str, Any]], styles: Dict[
             rows.append(row)
             continue
 
-        clinical = variant_result.get("clinical_report")
+        clinical = candidate_interpretation_of(variant_result)
         gene = (variant_result.get("interpretation_result") or {}).get("gene_symbol")
-        gene_line = f"{locus}<br/><b>{gene}</b>" if gene else locus
+        gene_line = f"{locus}<br/><b>{esc(gene)}</b>" if gene else locus
 
         acmg = (clinical or {}).get("acmg_classification") or {}
         classification = acmg.get("classification") or "Not classified"
@@ -1444,7 +1496,7 @@ def _build_clinician_summary_table(variants: List[Dict[str, Any]], styles: Dict[
             _normalize_evidence_text(item) for item in ((clinical or {}).get("supporting_evidence") or [])[:3]
         ]
         top_evidence = [t for t in top_evidence if t]
-        evidence_text = "<br/>".join(f"• {t}" for t in top_evidence) if top_evidence else "—"
+        evidence_text = "<br/>".join(f"• {esc(t)}" for t in top_evidence) if top_evidence else "—"
 
         flags = _variant_reviewer_flags(variant_result, clinical)
         # "!" not the Unicode warning-sign glyph (U+26A0): Helvetica's
@@ -1478,7 +1530,8 @@ def _build_clinician_summary_table(variants: List[Dict[str, Any]], styles: Dict[
                 )[:2]
                 term_text = (
                     "; ".join(
-                        f"{m.get('matched_gene_term_name') or m.get('matched_gene_term_id')} ({m['match_type']})"
+                        f"{esc(m.get('matched_gene_term_name') or m.get('matched_gene_term_id'))} "
+                        f"({esc(m['match_type'])})"
                         for m in top_terms
                     )
                     or "no term overlap"
@@ -1598,7 +1651,7 @@ def _multi_finding_observation_lines(document: Dict[str, Any], variants: List[Di
         finding_list = ", ".join(f"#{i}" for i in cluster)
         lines.append(
             f"Findings {finding_list} sit within {window_bp:,} bp of each other on chromosome {chrom} "
-            f"(positions {min(positions)}-{max(positions)}). GEPER has no phase data and does not infer "
+            f"(positions {min(positions)}-{max(positions)}). {SHORT_NAME} has no phase data and does not infer "
             "compound heterozygosity or a cis/trans relationship from this -- proximity is noted for "
             "reviewer awareness only."
         )
@@ -1648,8 +1701,8 @@ def _build_clinician_summary_flowables(
     ]
 
     identity = (
-        f"<b>Sample:</b> {sample_id} &nbsp;&nbsp; <b>Run:</b> {run_id} &nbsp;&nbsp; "
-        f"<b>Reference build:</b> {assembly or 'not specified'} &nbsp;&nbsp; "
+        f"<b>Sample:</b> {esc(sample_id)} &nbsp;&nbsp; <b>Run:</b> {esc(run_id)} &nbsp;&nbsp; "
+        f"<b>Reference build:</b> {esc(assembly) or 'not specified'} &nbsp;&nbsp; "
         f"<b>Variants analyzed:</b> {len(variants)}"
     )
     flow.append(Paragraph(identity, styles["BodyText"]))
@@ -1676,23 +1729,23 @@ def _build_clinician_summary_flowables(
     multi_finding_lines = _multi_finding_observation_lines(document, variants)
     if multi_finding_lines:
         flow.append(Paragraph("Multi-Finding Observations", styles["SectionHeading"]))
-        flow.extend(Paragraph(f"• {line}", styles["BulletText"]) for line in multi_finding_lines)
+        flow.extend(Paragraph(f"• {esc(line)}", styles["BulletText"]) for line in multi_finding_lines)
         flow.append(Spacer(1, 3 * mm))
 
     attention_lines: List[str] = []
     for idx, variant_result in enumerate(variants, start=1):
-        clinical = variant_result.get("clinical_report")
+        clinical = candidate_interpretation_of(variant_result)
         flags = _variant_reviewer_flags(variant_result, clinical)
         if flags:
             variant = variant_result.get("variant", {})
-            locus = f"{variant.get('chrom')}:{variant.get('pos')} {variant.get('ref')}>{variant.get('alt')}"
+            locus = esc(f"{variant.get('chrom')}:{variant.get('pos')} {variant.get('ref')}>{variant.get('alt')}")
             attention_lines.append(f"Finding {idx} ({locus}): {'; '.join(flags)}")
     gap_sources = _provenance_gap_sources(document, variants)
     if gap_sources:
         attention_lines.append(
             "Data-source version not determinable for cited evidence from: " + ", ".join(sorted(gap_sources)) + "."
         )
-    offline_caveat = _offline_sources_caveat_text()
+    offline_caveat = _offline_sources_caveat_text(document)
     if offline_caveat:
         attention_lines.append(offline_caveat)
 
@@ -1775,7 +1828,7 @@ def _build_1000_genomes_sas_flowables(ipf: Dict[str, Any], styles: Dict[str, Par
     elif ipf.get("sas_error"):
         flow.append(
             Paragraph(
-                f"&nbsp;&nbsp;&nbsp;&nbsp;- Lookup failed (external service issue: {ipf['sas_error']}).",
+                f"&nbsp;&nbsp;&nbsp;&nbsp;- Lookup failed (external service issue: {esc(ipf['sas_error'])}).",
                 styles["BulletText"],
             )
         )
@@ -1812,7 +1865,22 @@ def _build_indian_population_frequency_flowables(
     gnomad_sas_af = ipf.get("gnomad_af_sas")
 
     flow: List[Any] = [Spacer(1, 2 * mm), Paragraph("<b>Indian Population Frequency:</b>", styles["BodyText"])]
-    if gnomad_sas_af is not None:
+    if ipf.get("gnomad_sas_error") is not None:
+        # Same fix and same wording as `_build_1000_genomes_sas_flowables`'s
+        # `sas_error` branch four lines below, and as
+        # `report_generator.py`'s Section 11 Markdown equivalent -- a
+        # genuine gnomAD lookup failure must not render identically to a
+        # variant that was never queried (2026-09-11 fix; this bullet was
+        # the one sub-block of this function that still collapsed the two).
+        flow.append(
+            Paragraph(
+                f"• gnomAD (South Asian, SAS): Lookup failed (external service issue: "
+                f"{esc(ipf['gnomad_sas_error'])}) -- not evidence of no South Asian subpopulation "
+                "data, see Annotation Detail below.",
+                styles["BulletText"],
+            )
+        )
+    elif gnomad_sas_af is not None:
         flow.append(Paragraph(f"• gnomAD (South Asian, SAS): AF = {gnomad_sas_af:.2e}", styles["BulletText"]))
     elif ipf.get("gnomad_sas_queried"):
         flow.append(Paragraph("• gnomAD (South Asian, SAS): variant not found in this source.", styles["BulletText"]))
@@ -1825,12 +1893,15 @@ def _build_indian_population_frequency_flowables(
             Paragraph("• 1000 Genomes Project (South Asian, SAS): not queried for this variant.", styles["BulletText"])
         )
     if ipf.get("common_in_indian_population"):
-        threshold_pct = f"{ipf.get('common_af_threshold', 0.01):.0%}"
-        flow.append(
-            Paragraph(
-                f"! Common in Indian populations (at or above the {threshold_pct} threshold).", styles["StatusWarn"]
-            )
+        # Ruling #18 (2026-09-11): the number only when recorded; `:g` so a
+        # recorded 0.5% is not rounded to a "0%"/"1%" the pipeline never used.
+        recorded_threshold = ipf.get("common_af_threshold")
+        threshold_text = (
+            f"the {recorded_threshold * 100:g}% threshold"
+            if recorded_threshold is not None
+            else "the pipeline's configured threshold"
         )
+        flow.append(Paragraph(f"! Common in Indian populations (at or above {threshold_text}).", styles["StatusWarn"]))
     return flow
 
 
@@ -1838,29 +1909,102 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
     """Renders one variant's already-computed `clinical_report` dict (see report/clinical_report_builder.py) -- no evidence is re-derived here."""
     variant = variant_result.get("variant", {})
     locus = f"{variant.get('chrom')}:{variant.get('pos')} {variant.get('ref')}>{variant.get('alt')}"
-    clinical = variant_result.get("clinical_report")
+    # Card T3-F4: HGVS added alongside the coordinate string (not a
+    # replacement -- the coordinate stays for precision, HGVS is the
+    # identifier clinicians actually use), via the same shared fallback
+    # helper the full Markdown heading and the short PDF heading both
+    # call, so all three degrade identically when neither hgvs_c nor
+    # hgvs_g is available. In that fallback-to-locus case the
+    # parenthetical below repeats `locus` verbatim -- an accepted
+    # consequence of one shared rule, not a fourth special case.
+    locus_with_hgvs = f"{locus} ({_variant_hgvs_or_locus(variant_result)})"
+    clinical = candidate_interpretation_of(variant_result)
 
     flow: List[Any] = [
-        _Bookmark(f"bm_finding_{idx}", f"Finding {idx}: {locus}"),
+        # `_Bookmark`'s title is a raw PDF outline string (`Canvas.
+        # addOutlineEntry`), never parsed as XML the way `Paragraph`
+        # text is -- deliberately built from the unescaped
+        # `locus_with_hgvs` here (escaping it would show a literal
+        # "&gt;" in the PDF's sidebar/outline panel instead of decoding
+        # it). Only the `Paragraph` heading right below needs `esc()`.
+        # The bookmark carries the same HGVS-augmented text as the
+        # heading (Card T3-F4) -- a PDF outline entry is itself a
+        # navigation identifier, and giving it a different string from
+        # the heading it points to would be the same correlation
+        # failure one level down.
+        _Bookmark(f"bm_finding_{idx}", f"Finding {idx}: {locus_with_hgvs}"),
         Spacer(1, 4 * mm),
-        Paragraph(f"Finding {idx}: {locus}", styles["SectionHeading"]),
+        Paragraph(f"Finding {idx}: {esc(locus_with_hgvs)}", styles["SectionHeading"]),
     ]
+
+    # Per-variant stage errors (wording approved by the human 2026-09-11,
+    # card HUMAN-TEXT-the-dbSNP-stage-error-sentence-on-both-PDFs; drafted
+    # by angela in 9765c41). Mirrors report/report_generator.py's
+    # Markdown "### Stage Warnings / Errors" section, which already
+    # renders this same `variant_result["errors"]` list -- this PDF had
+    # never rendered it, so the two renderers disagreed about whether a
+    # stage failure is visible. Same text as Markdown, not a new
+    # clinician-facing rewrite. Pinned by tests/test_stage_errors_on_both_pdfs.py.
+    stage_errors = variant_result.get("errors") or []
+    if stage_errors:
+        flow.append(Paragraph("Stage Warnings / Errors:", styles["StatusError"]))
+        for err in stage_errors:
+            flow.append(Paragraph(f"• {esc(err)}", styles["StatusError"]))
+        flow.append(Spacer(1, 2 * mm))
+
+    # Within-sample read support (NABL 112A s.7.8.5(b)(iii)). Read from
+    # `variant_result["variant"]` directly -- the same way this function
+    # already reads the locus above and the mitochondrial chromosome
+    # below, and the same way the Markdown renderer reads it -- through
+    # the ONE shared helper both renderers call, so the two full reports
+    # cannot drift on how an absent or unparseable fraction reads. It is
+    # deliberately not a `candidate_interpretation_of()` section: that
+    # dict is `None` whenever interpretation failed, which would make a
+    # failed interpretation and a VCF with no per-sample data render
+    # identically. Explicitly labelled "within-sample" because the
+    # Population Evidence section further down carries gnomAD's
+    # population allele frequency -- a different quantity with the same
+    # name, and the confusion this label exists to prevent.
+    flow.append(
+        Paragraph(
+            f"<b>Allele fraction (within this sample):</b> {esc(variant_allele_fraction_text(variant_result))}",
+            styles["BodyText"],
+        )
+    )
+
+    # Round 14, B2: per-finding, not report-level -- see
+    # report/report_generator.py's identical placement/reasoning.
+    if is_mitochondrial_chrom(variant.get("chrom")):
+        # Round 16: see report/report_generator.py's identical change for why
+        # `not_evaluated_rules` is threaded through here.
+        not_evaluated_rules = (variant_result.get("interpretation_result") or {}).get("not_evaluated_rules", [])
+        flow.append(
+            Paragraph(
+                esc(mtdna_interpretation_disclaimer(variant_result.get("transcript"), not_evaluated_rules)),
+                styles["StatusWarn"],
+            )
+        )
+        flow.append(Spacer(1, 2 * mm))
 
     out_of_scope = variant_result.get("out_of_scope")
     if out_of_scope:
-        # Report review round 8: distinct from the "no clinical
-        # interpretation available" fallback just below -- that one
-        # means GEPER tried and the interpretation engine produced
-        # nothing; this means GEPER never attempted anything for this
-        # variant at all, by design (see
-        # `pipeline/orchestrator.py::GeperPipeline
-        # ._mitochondrial_out_of_scope_result`).
+        # Distinct from the "no clinical interpretation available"
+        # fallback just below -- that one means GEPER tried and the
+        # interpretation engine produced nothing; this means GEPER never
+        # attempted anything for this variant at all, by design. No
+        # current producer as of round 14, B2 (which replaced the
+        # mitochondrial compartment's whole-variant rejection with
+        # per-criterion gating -- see `pipeline/acmg_rules.py`) -- kept
+        # as reusable infrastructure for a future genuinely-unassessable
+        # variant class.
         flow.append(
-            Paragraph(f"<b>Status:</b> Out of scope ({out_of_scope.get('scope', 'unspecified')})", styles["StatusWarn"])
+            Paragraph(
+                f"<b>Status:</b> Out of scope ({esc(out_of_scope.get('scope', 'unspecified'))})", styles["StatusWarn"]
+            )
         )
         flow.append(
             Paragraph(
-                out_of_scope.get("reason") or "This variant is out of scope for this GEPER build.",
+                esc(out_of_scope.get("reason")) or f"This variant is out of scope for this {SHORT_NAME} build.",
                 styles["BodyText"],
             )
         )
@@ -1883,7 +2027,7 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
         )
         return flow
 
-    flow.append(Paragraph(clinical["executive_summary"], styles["BodyText"]))
+    flow.append(Paragraph(esc(clinical["executive_summary"]), styles["BodyText"]))
 
     acmg = clinical.get("acmg_classification") or {}
     if acmg.get("classification"):
@@ -1919,9 +2063,10 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
     if override:
         flow.append(
             Paragraph(
-                f"<b>Clinician Override:</b> GEPER classification: {override.get('original_classification') or 'Not classified'}; "
-                f"Clinician override: <b>{override.get('new_classification')}</b> -- {override.get('reason')} "
-                f"(by {override.get('clinician_id')}, {override.get('timestamp')})",
+                f"<b>Clinician Override:</b> GEPER classification: "
+                f"{esc(override.get('original_classification')) or 'Not classified'}; "
+                f"Clinician override: <b>{esc(override.get('new_classification'))}</b> -- {esc(override.get('reason'))} "
+                f"(by {esc(override.get('clinician_id'))}, {esc(override.get('timestamp'))})",
                 styles["StatusWarn"],
             )
         )
@@ -1954,10 +2099,10 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
             for cat in category_breakdown:
                 cb_rows.append(
                     [
-                        Paragraph(str(cat.get("category") or ""), styles["TableValue"]),
+                        Paragraph(esc(cat.get("category")), styles["TableValue"]),
                         Paragraph(f"{cat.get('presence', 0):.0%}", styles["TableValue"]),
                         Paragraph(f"{cat.get('quality', 0):.0%}", styles["TableValue"]),
-                        Paragraph(str(cat.get("rationale") or ""), styles["TableValueSmall"]),
+                        Paragraph(esc(cat.get("rationale")), styles["TableValueSmall"]),
                     ]
                 )
             cb_table = Table(cb_rows, colWidths=[28 * mm, 18 * mm, 18 * mm, 96 * mm], hAlign="LEFT", repeatRows=1)
@@ -1974,6 +2119,28 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
             flow.append(Spacer(1, 1 * mm))
             flow.append(cb_table)
 
+    # Priority Score: computed by `report/clinical_report_builder.py` and
+    # rendered by the Markdown report as its section 4, but never by this
+    # one -- so a clinician reading only the PDF never saw this variant's
+    # triage priority, while the same run's Markdown listed it.
+    priority = clinical.get("priority") or {}
+    if priority.get("pending"):
+        flow.append(
+            Paragraph("<b>Priority:</b> Priority scoring did not complete for this variant.", styles["BodyText"])
+        )
+    elif priority:
+        rank_text = f" (rank {priority['rank']} in this run)" if priority.get("rank") is not None else ""
+        prio_score = priority.get("score")
+        prio_score_text = f"{prio_score:.1f}" if isinstance(prio_score, (int, float)) else str(prio_score)
+        flow.append(
+            Paragraph(
+                f"<b>Priority:</b> {esc(priority.get('category'))} -- score {prio_score_text}{rank_text}",
+                styles["BodyText"],
+            )
+        )
+        if priority.get("explanation"):
+            flow.extend(Paragraph(f"• {esc(reason)}", styles["BulletText"]) for reason in priority["explanation"])
+
     triggered = acmg.get("triggered_criteria") or []
     if triggered:
         rows = [
@@ -1986,9 +2153,9 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
         for crit in triggered:
             rows.append(
                 [
-                    Paragraph(str(crit.get("code") or ""), styles["TableValue"]),
-                    Paragraph(str(crit.get("strength") or ""), styles["TableValue"]),
-                    Paragraph(str(crit.get("rationale") or ""), styles["TableValueSmall"]),
+                    Paragraph(esc(crit.get("code")), styles["TableValue"]),
+                    Paragraph(esc(crit.get("strength")), styles["TableValue"]),
+                    Paragraph(esc(crit.get("rationale")), styles["TableValueSmall"]),
                 ]
             )
         # `repeatRows=1` -- same as `_build_clinician_summary_table`'s table
@@ -2034,8 +2201,8 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
         for crit in not_triggered:
             nt_rows.append(
                 [
-                    Paragraph(str(crit.get("code") or ""), styles["TableValue"]),
-                    Paragraph(str(crit.get("rationale") or ""), styles["TableValueSmall"]),
+                    Paragraph(esc(crit.get("code")), styles["TableValue"]),
+                    Paragraph(esc(crit.get("rationale")), styles["TableValueSmall"]),
                 ]
             )
         nt_table = Table(nt_rows, colWidths=[22 * mm, 138 * mm], hAlign="LEFT", repeatRows=1)
@@ -2070,12 +2237,12 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
         if decision_path:
             flow.append(Spacer(1, 2 * mm))
             flow.append(Paragraph("<b>PVS1 Decision-Tree Path:</b>", styles["BodyText"]))
-            flow.extend(Paragraph(f"{i}. {step}", styles["BulletText"]) for i, step in enumerate(decision_path, 1))
+            flow.extend(Paragraph(f"{i}. {esc(step)}", styles["BulletText"]) for i, step in enumerate(decision_path, 1))
         unchecked_caveats = pvs1_entry["details"].get("unchecked_caveats") or []
         if unchecked_caveats:
             flow.append(Spacer(1, 1 * mm))
             flow.append(Paragraph("<i>PVS1 caveats not checked this run:</i>", styles["Footnote"]))
-            flow.extend(Paragraph(f"• {c}", styles["Footnote"]) for c in unchecked_caveats)
+            flow.extend(Paragraph(f"• {esc(c)}", styles["Footnote"]) for c in unchecked_caveats)
 
     # Combining-rule trace (C3, report review round 2): already
     # computed by `ACMGRuleEngine._combine` and already rendered in the
@@ -2089,34 +2256,505 @@ def _build_variant_section(idx: int, variant_result: Dict[str, Any], styles: Dic
     if combining_trace:
         flow.append(Spacer(1, 2 * mm))
         flow.append(Paragraph("<b>Classification Combining-Rule Trace:</b>", styles["BodyText"]))
-        flow.extend(Paragraph(f"• {line}", styles["BulletText"]) for line in combining_trace)
+        flow.extend(Paragraph(f"• {esc(line)}", styles["BulletText"]) for line in combining_trace)
 
     supporting = clinical.get("supporting_evidence") or []
     if supporting:
         flow.append(Spacer(1, 2 * mm))
         flow.append(Paragraph("<b>Supporting Evidence:</b>", styles["BodyText"]))
-        flow.extend(Paragraph(f"• {item}", styles["BulletText"]) for item in supporting)
+        flow.extend(Paragraph(f"• {esc(item)}", styles["BulletText"]) for item in supporting)
+
+    # Conflicting evidence: computed by the same
+    # `report/clinical_report_builder.py` pass that fills
+    # `supporting_evidence` above, and rendered by the Markdown report
+    # ("### 6. Conflicting Evidence" in `report/report_generator.py`),
+    # but never rendered in this PDF -- the same "cited but not shown"
+    # asymmetry already noted for `decision_path` and the combining-rule
+    # trace above, and the more dangerous direction of it: this is where
+    # evidence AGAINST the benign-direction reading is stated. BP7's
+    # uncalibrated-splice-predictor disclosure lands here (see
+    # `pipeline/acmg_rules.py::ACMGRuleEngine._bp7`), so dropping the
+    # section silently dropped that caveat from the PDF while the
+    # Markdown report showed it. Placed before Limitations deliberately:
+    # a per-variant evidence caveat belongs next to that variant's
+    # evidence, not pooled into the report-wide boilerplate at the end.
+    conflicting = clinical.get("conflicting_evidence") or []
+    if conflicting:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>Conflicting Evidence:</b>", styles["BodyText"]))
+        flow.extend(Paragraph(f"• {esc(item)}", styles["BulletText"]) for item in conflicting)
+
+    # Structured conflict-resolution detail (Phase 6) -- same underlying
+    # `conflict_resolution` dict the Markdown report renders as a table plus
+    # a per-conflict resolution/rationale/confidence-impact/priority-impact
+    # block in its section 6, additive to the free-text bullets just above.
+    conflict_res = clinical.get("conflict_resolution") or {}
+    real_conflicts = [
+        c for c in (conflict_res.get("conflicts") or []) if c.get("severity") in ("Minor", "Moderate", "Major")
+    ]
+    if real_conflicts:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(
+            Paragraph(
+                f"<b>Conflict Resolution</b> (score {esc(str(conflict_res.get('score')))}, "
+                f"{esc(conflict_res.get('severity'))}):",
+                styles["BodyText"],
+            )
+        )
+        for c in real_conflicts:
+            flow.append(
+                Paragraph(
+                    f"• {esc(c.get('conflict_type'))} -- Resolution: {esc(c.get('resolution'))}; "
+                    f"Rationale: {esc(c.get('resolution_rationale'))}; "
+                    f"Confidence impact: {esc(c.get('confidence_impact'))}; "
+                    f"Priority impact: {esc(c.get('priority_impact'))}",
+                    styles["BulletText"],
+                )
+            )
+
+    # AI Consensus: per-model AlphaMissense/MMSplice votes, rendered by the
+    # Markdown report as its section 7 but never by this one -- the
+    # AlphaMissense "not clinically validated" caveat is attached to its
+    # own bullet here exactly as the Markdown renderer attaches it, since a
+    # PDF reader must see the same caveat next to the same score a
+    # Markdown reader sees.
+    ai_consensus = clinical.get("ai_consensus") or {}
+    votes = ai_consensus.get("classifying_models") or []
+    model_errors = ai_consensus.get("model_errors") or []
+    if votes or model_errors:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>AI Consensus:</b>", styles["BodyText"]))
+        for v in votes:
+            source = v.get("source")
+            line = f"{esc(source)}: {esc(v.get('prediction'))} (score={esc(str(v.get('score')))})"
+            if source == "AlphaMissense":
+                line += (
+                    " -- not clinically validated; not approved for clinical use. This is a raw model "
+                    "score, not a validated clinical pathogenicity measure."
+                )
+            flow.append(Paragraph(f"• {line}", styles["BulletText"]))
+        for err in model_errors:
+            flow.append(
+                Paragraph(
+                    f"• {esc(err.get('source'))}: lookup failed ({esc(err.get('error'))}) -- not evidence "
+                    "of no effect, see Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        context_models = ai_consensus.get("context_models_used") or []
+        flow.append(
+            Paragraph(
+                "<i>Sequence-context models used (routing/embedding only, no direct pathogenicity verdict): "
+                f"{esc(', '.join(context_models) if context_models else 'none')}.</i>",
+                styles["Footnote"],
+            )
+        )
+
+    # Protein Knowledge (UniProt/InterPro), Markdown section 8 -- never
+    # previously rendered here.
+    protein_knowledge = clinical.get("protein_knowledge") or {}
+    if protein_knowledge:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>Protein Knowledge:</b>", styles["BodyText"]))
+        if protein_knowledge.get("uniprot_available"):
+            u = protein_knowledge["uniprot"]
+            flow.append(
+                Paragraph(
+                    f"• UniProt: {esc(u.get('protein_name')) or 'n/a'} ({esc(u.get('accession')) or 'n/a'}, "
+                    f"{'reviewed' if u.get('reviewed') else 'unreviewed'})",
+                    styles["BulletText"],
+                )
+            )
+        elif protein_knowledge.get("uniprot_error"):
+            flow.append(
+                Paragraph(
+                    f"• UniProt: lookup failed (external service issue: {esc(protein_knowledge['uniprot_error'])}) "
+                    "-- not evidence of a missing entry, see Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        elif protein_knowledge.get("uniprot_reason"):
+            flow.append(Paragraph(f"• UniProt: {esc(protein_knowledge['uniprot_reason'])}", styles["BulletText"]))
+        else:
+            flow.append(Paragraph("• UniProt: no entry resolved.", styles["BulletText"]))
+        if protein_knowledge.get("interpro_available"):
+            domains = protein_knowledge["interpro"].get("affected_domains")
+            position = protein_knowledge["interpro"].get("protein_position")
+            if domains:
+                names = ", ".join(d.get("name") or d.get("member_accession") or "unnamed" for d in domains)
+                flow.append(
+                    Paragraph(
+                        f"• InterPro/Pfam: residue {position} (transcript-verified) overlaps {len(domains)} "
+                        f"domain(s): {esc(names)}",
+                        styles["BulletText"],
+                    )
+                )
+            elif domains is None:
+                flow.append(
+                    Paragraph(
+                        "• InterPro/Pfam: annotation available, but this variant's residue position could "
+                        "not be determined from the transcript structure -- domain overlap was not checked.",
+                        styles["BulletText"],
+                    )
+                )
+            else:
+                flow.append(
+                    Paragraph(
+                        f"• InterPro/Pfam: annotation available; no domain overlap at residue {position} "
+                        "(transcript-verified).",
+                        styles["BulletText"],
+                    )
+                )
+        elif protein_knowledge.get("interpro_error"):
+            flow.append(
+                Paragraph(
+                    "• InterPro/Pfam: lookup failed (external service issue: "
+                    f"{esc(protein_knowledge['interpro_error'])}) -- not evidence of an absent domain, see "
+                    "Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        elif protein_knowledge.get("interpro_reason"):
+            flow.append(
+                Paragraph(f"• InterPro/Pfam: {esc(protein_knowledge['interpro_reason'])}", styles["BulletText"])
+            )
+        else:
+            flow.append(Paragraph("• InterPro/Pfam: no annotation available.", styles["BulletText"]))
+
+    # Structural Knowledge (AlphaFold DB), Markdown section 9 -- never
+    # previously rendered here.
+    structural_knowledge = clinical.get("structural_knowledge") or {}
+    if structural_knowledge:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>Structural Knowledge:</b>", styles["BodyText"]))
+        if structural_knowledge.get("available"):
+            band_label = (
+                f"at residue {structural_knowledge.get('protein_position')} (transcript-verified)"
+                if structural_knowledge.get("confidence_band_is_residue_specific")
+                else "whole-protein mean ("
+                f"{esc(structural_knowledge.get('mapping_unavailable_reason')) or 'variant residue position unknown'})"
+            )
+            flow.append(
+                Paragraph(
+                    f"• AlphaFold DB: confidence band '{esc(structural_knowledge.get('confidence_band')) or 'n/a'}' "
+                    f"{band_label} (model {esc(structural_knowledge.get('model_version')) or 'n/a'})",
+                    styles["BulletText"],
+                )
+            )
+            if structural_knowledge.get("pdb_url"):
+                flow.append(
+                    Paragraph(f"&nbsp;&nbsp;- Structure: {esc(structural_knowledge['pdb_url'])}", styles["BulletText"])
+                )
+        elif structural_knowledge.get("error") is not None:
+            flow.append(
+                Paragraph(
+                    f"AlphaFold DB lookup failed (external service issue: {esc(structural_knowledge['error'])}) "
+                    "-- not evidence of an unresolved structure, see Annotation Detail below.",
+                    styles["Footnote"],
+                )
+            )
+        elif structural_knowledge.get("reason"):
+            flow.append(Paragraph(esc(structural_knowledge["reason"]), styles["Footnote"]))
+        else:
+            flow.append(Paragraph("No AlphaFold DB structure resolved for this protein.", styles["Footnote"]))
+
+    # Population Evidence (main gnomAD/dbSNP result), Markdown section 10.
+    # `summary.py:1890`'s own comment referred to "the Population Evidence
+    # section further down", which no function ever built -- this is that
+    # section. Distinct from the Indian Population Frequency block below,
+    # which carries the South Asian subpopulation figures only.
+    population_evidence = clinical.get("population_evidence") or {}
+    if population_evidence:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>Population Evidence:</b>", styles["BodyText"]))
+        g = population_evidence.get("gnomad") or {}
+        if g.get("skip_reason"):
+            flow.append(Paragraph(f"• gnomAD: {esc(g['skip_reason'])}", styles["BulletText"]))
+        elif g.get("error") is not None:
+            flow.append(
+                Paragraph(
+                    f"• gnomAD: lookup failed (external service issue: {esc(g['error'])}) -- not evidence "
+                    "of an absent variant, see Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        elif g.get("queried"):
+            flow.append(
+                Paragraph(
+                    "• gnomAD: "
+                    + (
+                        f"found, AF={esc(str(g.get('global_af')))}"
+                        if g.get("found")
+                        else "variant not found (absent from gnomAD)"
+                    ),
+                    styles["BulletText"],
+                )
+            )
+        else:
+            flow.append(Paragraph("• gnomAD: lookup unavailable for this variant.", styles["BulletText"]))
+        d = population_evidence.get("dbsnp") or {}
+        if d.get("skip_reason"):
+            flow.append(Paragraph(f"• dbSNP: {esc(d['skip_reason'])}", styles["BulletText"]))
+        elif d.get("error") is not None:
+            flow.append(
+                Paragraph(
+                    f"• dbSNP: lookup failed (external service issue: {esc(d['error'])}) -- not evidence "
+                    "of no dbSNP record, see Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        elif d.get("queried"):
+            flow.append(
+                Paragraph(
+                    "• dbSNP: " + (f"catalogued as {esc(d.get('rsid'))}" if d.get("found") else "not found"),
+                    styles["BulletText"],
+                )
+            )
+        else:
+            flow.append(Paragraph("• dbSNP: lookup unavailable for this variant.", styles["BulletText"]))
 
     flow.extend(_build_indian_population_frequency_flowables(clinical, styles))
+
+    # Clinical Evidence (ClinVar/ClinGen), Markdown section 12 -- never
+    # previously rendered here.
+    clinical_evidence = clinical.get("clinical_evidence") or {}
+    if clinical_evidence:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>Clinical Evidence:</b>", styles["BodyText"]))
+        if clinical_evidence.get("clinvar_available"):
+            cv = clinical_evidence["clinvar"]
+            flow.append(
+                Paragraph(
+                    f"• ClinVar: {esc(cv.get('clinical_significance')) or 'n/a'} "
+                    f"({esc(cv.get('review_status')) or 'n/a'})",
+                    styles["BulletText"],
+                )
+            )
+        elif clinical_evidence.get("clinvar_error"):
+            flow.append(
+                Paragraph(
+                    f"• ClinVar: lookup failed (external service issue: {esc(clinical_evidence['clinvar_error'])}) "
+                    "-- not evidence of an absent record, see Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        elif clinical_evidence.get("clinvar_co_located_count"):
+            flow.append(
+                Paragraph(
+                    "• ClinVar: no record found for this exact variant "
+                    f"({clinical_evidence['clinvar_co_located_count']} other variant(s) catalogued at this "
+                    "genomic position, but none match this allele -- see Annotation Detail below).",
+                    styles["BulletText"],
+                )
+            )
+        else:
+            flow.append(Paragraph("• ClinVar: no record found.", styles["BulletText"]))
+        if clinical_evidence.get("clingen_available"):
+            cg = clinical_evidence["clingen"]
+            flow.append(
+                Paragraph(
+                    f"• ClinGen: {esc(cg.get('gene_symbol')) or 'n/a'} -- gene-disease validity: "
+                    f"{esc(cg.get('clinical_validity_summary')) or 'n/a'}",
+                    styles["BulletText"],
+                )
+            )
+        elif clinical_evidence.get("clingen_error"):
+            flow.append(
+                Paragraph(
+                    f"• ClinGen: lookup failed (external service issue: {esc(clinical_evidence['clingen_error'])}) "
+                    "-- not evidence of an absent curation, see Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        else:
+            flow.append(Paragraph("• ClinGen: no curation found for this gene.", styles["BulletText"]))
+
+    # Sequence Context (BLAST homology + context-model routing), Markdown
+    # section 13 -- never previously rendered here.
+    sequence_context = clinical.get("sequence_context") or {}
+    if sequence_context:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>Sequence Context:</b>", styles["BodyText"]))
+        seq_context_models = sequence_context.get("context_models_used") or []
+        flow.append(
+            Paragraph(
+                f"• Context models used: {esc(', '.join(seq_context_models) if seq_context_models else 'none')}",
+                styles["BulletText"],
+            )
+        )
+        blast = sequence_context.get("blast") or {}
+        blast_error = blast.get("error")
+        if blast_error is not None:
+            flow.append(
+                Paragraph(
+                    f"• BLAST: lookup failed ({esc(blast_error)}) -- not evidence of no homology, see "
+                    "Annotation Detail below.",
+                    styles["BulletText"],
+                )
+            )
+        elif blast.get("skipped"):
+            flow.append(
+                Paragraph(
+                    f"• BLAST: not run for this variant ({esc(blast.get('reason') or 'no reason recorded')}) -- "
+                    "not evidence of no homology.",
+                    styles["BulletText"],
+                )
+            )
+        elif blast.get("hit_count") is None:
+            flow.append(
+                Paragraph("• BLAST: hit count not recorded -- not evidence of no homology.", styles["BulletText"])
+            )
+        else:
+            flow.append(Paragraph(f"• BLAST: {blast['hit_count']} homology hit(s)", styles["BulletText"]))
+        if sequence_context.get("ensembl_note"):
+            flow.append(Paragraph(esc(sequence_context["ensembl_note"]), styles["Footnote"]))
+
+    # Recommendations: computed per finding by
+    # `report/clinical_report_builder.py` and rendered by the Markdown
+    # report as its section 14, but never by this one -- so a clinician
+    # reading the PDF saw no follow-up actions at all, while the same
+    # run's Markdown listed them. Per-finding, not run-level: each
+    # recommendation is attached to the variant that prompted it, and
+    # aggregating them to the document would strip which finding a
+    # "refer for genetic counselling" actually came from.
+    #
+    # Rendered only when non-empty, unlike Markdown's explicit "no
+    # recommendations generated" line: this section sits inside a
+    # finding's detail block rather than a fixed numbered outline, and
+    # the surrounding blocks here follow the same
+    # omit-when-absent convention (Supporting Evidence, Conflicting
+    # Evidence, Limitations above and below all do).
+    recommendations = clinical.get("recommendations") or []
+    if recommendations:
+        flow.append(Spacer(1, 2 * mm))
+        flow.append(Paragraph("<b>Recommendations:</b>", styles["BodyText"]))
+        flow.extend(Paragraph(f"• {esc(item)}", styles["BulletText"]) for item in recommendations)
 
     limitations = clinical.get("limitations") or []
     if limitations:
         flow.append(Spacer(1, 2 * mm))
         flow.append(Paragraph("<b>Limitations:</b>", styles["BodyText"]))
-        flow.extend(Paragraph(f"• {item}", styles["BulletText"]) for item in limitations)
+        flow.extend(Paragraph(f"• {esc(item)}", styles["BulletText"]) for item in limitations)
 
     # `clinical["references"]` (see `report/clinical_report_builder.py
     # ::_references`) was already computed for the Markdown report's own
     # "References" section, but this PDF path never rendered it -- found
-    # while adding HPO/Orphanet citations (2026-08-08). `_references()`
-    # now always returns at least the unconditional Orphanet entry, so
-    # this list is never empty in practice, but the `if` guard is kept
-    # for defensive symmetry with every other optional section here.
-    references = clinical.get("references") or []
-    if references:
-        flow.append(Spacer(1, 2 * mm))
-        flow.append(Paragraph("<b>References:</b>", styles["BodyText"]))
-        flow.extend(Paragraph(f"• {item}", styles["BulletText"]) for item in references)
+    # while adding HPO/Orphanet citations (2026-08-08).
+    #
+    # Ruling (A), 2026-09-11: rendered as TWO labelled blocks -- what this run
+    # used (gated on evidence_sources), then the fixed licence notices -- where
+    # a single "References:" list used to mix both. Both are always shown now:
+    # attribution is unconditional, and an empty evidence block says so.
+    evidence_refs, attribution = reference_blocks(clinical)
+    flow.append(Spacer(1, 2 * mm))
+    flow.append(Paragraph(f"<b>{EVIDENCE_SOURCES_USED_HEADING}:</b>", styles["BodyText"]))
+    if evidence_refs:
+        flow.extend(Paragraph(f"• {esc(item)}", styles["BulletText"]) for item in evidence_refs)
+    else:
+        flow.append(Paragraph(esc(NO_EVIDENCE_SOURCES_TEXT), styles["BulletText"]))
+    flow.append(Spacer(1, 2 * mm))
+    flow.append(Paragraph(f"<b>{DATA_ATTRIBUTION_HEADING}:</b>", styles["BodyText"]))
+    flow.extend(Paragraph(f"• {esc(item)}", styles["BulletText"]) for item in attribution)
+
+    # Evidence Sources: the short list of provider names that actually
+    # contributed to this finding's interpretation -- computed for the
+    # Markdown report's section 17, but never rendered here.
+    evidence_sources = clinical.get("evidence_sources") or []
+    flow.append(Spacer(1, 2 * mm))
+    flow.append(
+        Paragraph(
+            f"<b>Evidence Sources:</b> {esc(', '.join(evidence_sources)) if evidence_sources else 'none'}",
+            styles["BodyText"],
+        )
+    )
+
+    flow.extend(_build_explainability_flowables(clinical.get("explainability"), styles))
+
+    return flow
+
+
+def _build_explainability_flowables(
+    explainability: Optional[Dict[str, Any]], styles: Dict[str, ParagraphStyle]
+) -> List[Any]:
+    """
+    Renders the Phase 7 explainability trace -- the same `explainability`
+    dict `report/report_generator.py::_render_explainability` renders as
+    the Markdown report's section 17, previously never rendered in this
+    PDF at all.
+    """
+    flow: List[Any] = [Spacer(1, 2 * mm), Paragraph("<b>Explainability:</b>", styles["BodyText"])]
+    if not explainability:
+        flow.append(Paragraph("Explainability trace unavailable for this variant.", styles["Footnote"]))
+        return flow
+
+    flow.append(Paragraph(f"Decision summary: {esc(explainability['decision_summary'])}", styles["BulletText"]))
+
+    reasoning_chain = explainability.get("reasoning_chain") or []
+    if reasoning_chain:
+        flow.append(Paragraph("Reasoning chain:", styles["BulletText"]))
+        flow.extend(Paragraph(f"&nbsp;&nbsp;- {esc(step)}", styles["BulletText"]) for step in reasoning_chain)
+
+    contributed = explainability.get("evidence_contributed") or []
+    flow.append(
+        Paragraph(
+            f"Evidence sources that contributed: {esc(', '.join(contributed)) if contributed else 'none'}",
+            styles["BulletText"],
+        )
+    )
+    not_contributed = explainability.get("evidence_not_contributed") or []
+    if not_contributed:
+        flow.append(Paragraph("Evidence sources that did not contribute:", styles["BulletText"]))
+        flow.extend(
+            Paragraph(f"&nbsp;&nbsp;- {esc(e['source'])}: {esc(e['reason'])}", styles["BulletText"])
+            for e in not_contributed
+        )
+
+    influential = explainability.get("ai_models_influential") or []
+    flow.append(
+        Paragraph(
+            "AI models that influenced the decision: "
+            + (
+                esc(", ".join(f"{v.get('source')} ({v.get('prediction')})" for v in influential))
+                if influential
+                else "none"
+            ),
+            styles["BulletText"],
+        )
+    )
+    contextual = explainability.get("ai_models_contextual_only") or []
+    flow.append(
+        Paragraph(
+            f"AI models used for context only (no verdict): {esc(', '.join(contextual)) if contextual else 'none'}",
+            styles["BulletText"],
+        )
+    )
+
+    conflicts = explainability.get("conflicts_detected") or []
+    flow.append(Paragraph(f"Conflicts detected: {len(conflicts)}", styles["BulletText"]))
+    flow.extend(
+        Paragraph(f"&nbsp;&nbsp;- {esc(c['conflict_type'])} ({esc(c['severity'])})", styles["BulletText"])
+        for c in conflicts
+    )
+    flow.append(
+        Paragraph(
+            "How conflicts were resolved: " + esc(explainability.get("conflicts_resolved", "No conflicts to resolve.")),
+            styles["BulletText"],
+        )
+    )
+
+    uncertainties = explainability.get("remaining_uncertainties") or []
+    if uncertainties:
+        flow.append(Paragraph("Remaining uncertainties:", styles["BulletText"]))
+        flow.extend(Paragraph(f"&nbsp;&nbsp;- {esc(u)}", styles["BulletText"]) for u in uncertainties)
+    else:
+        flow.append(Paragraph("Remaining uncertainties: none identified.", styles["BulletText"]))
+
+    flow.append(
+        Paragraph(f"Confidence rationale: {esc(explainability.get('confidence_rationale', ''))}", styles["BulletText"])
+    )
+    flow.append(
+        Paragraph(f"Priority rationale: {esc(explainability.get('priority_rationale', ''))}", styles["BulletText"])
+    )
 
     return flow
 
@@ -2183,7 +2821,15 @@ def _build_signoff_block(styles: Dict[str, ParagraphStyle]) -> List[Any]:
             ]
         ),
         Spacer(1, 8 * mm),
-        Paragraph(_DISCLAIMER_TEXT, styles["Disclaimer"]),
+        Paragraph(
+            _DISCLAIMER_LABEL + RESEARCH_USE_DISCLAIMER,
+            styles["Disclaimer"],
+        ),
+        Spacer(1, 3 * mm),
+        Paragraph(
+            ISO_RESEARCH_ELEMENT,
+            styles["Disclaimer"],
+        ),
     ]
 
 
@@ -2196,7 +2842,6 @@ def generate_pdf(
     document: Dict[str, Any],
     output_path: str,
     patient_meta: Optional[Union[Dict[str, Any], str]] = None,
-    qc_metrics: Optional[Union[Dict[str, Any], str]] = None,
     run_id: Optional[str] = None,
     logo_path: Optional[str] = None,
 ) -> str:
@@ -2214,7 +2859,8 @@ def generate_pdf(
     `patient_meta`: dict, path to a JSON file, or None -- see
     `_parse_patient_meta`'s docstring for the DPDP Act framing and
     de-identified fallback.
-    `qc_metrics`: dict, path to a JSON sidecar file, or None -- see
+    Run-level QC is NOT a parameter: it is read from
+    `document["qc_metrics"]` by `_document_qc_metrics`. See
     `_parse_qc_metrics`'s docstring for the three-state (found/not
     applicable/failed) shape each of "mean_coverage_depth",
     "bases_at_20x", "q30_score" is validated into, and
@@ -2251,10 +2897,13 @@ def generate_pdf(
         variants = []
 
     patient = _parse_patient_meta(patient_meta)
-    parsed_qc_metrics = _parse_qc_metrics(qc_metrics)
+    patient["consent"] = _document_consent(document)
+    parsed_qc_metrics = _parse_qc_metrics(_document_qc_metrics(document))
     sample_id = _derive_sample_id(document)
     resolved_run_id = _derive_run_id(document, run_id)
-    assembly = document.get("assembly")
+    # Display only: `assembly_note` (card #15) says why an all-mitochondrial
+    # run has no build, and fills both build slots in its place.
+    assembly = document.get("assembly") or document.get("assembly_note")
     header_label = patient["patient_name"] if not patient["deidentified"] else sample_id
 
     styles = _build_stylesheet()
@@ -2270,11 +2919,37 @@ def generate_pdf(
         bottomMargin=30 * mm,
         leftMargin=_MARGIN,
         rightMargin=_MARGIN,
-        title="GEPER Clinical Genomic Analysis Report",
+        title=(
+            "Bij AI Clinical Genomic Analysis Report — variant interpretation from a supplied VCF"
+            " — Bij AI variant-interpretation component (GEPER)"
+        ),
     )
 
     story: List[Any] = list(_build_report_header(logo_path, styles))
+    # WHAT THIS REPORT IS, said on the report itself -- see SCOPE_LINE.
+    # Added to the STORY rather than inside _build_report_header on purpose:
+    # that function's letterhead sizes the logo to the TITLE's height
+    # (`logo_h = title_height`), so putting this in the title would double
+    # the logo, and adding it to the header's return value would change a
+    # contract its own tests pin.
+    story.append(Paragraph(SCOPE_LINE, styles["Footnote"]))
     story.append(Spacer(1, 4 * mm))
+    # What this document IS, before it says what it found. Placement,
+    # not emphasis: this claim was already in the page footer at 6.5pt,
+    # so making it bigger down there would have changed how it looks
+    # without changing when it is read. The Markdown report puts its
+    # banner on line 3 and this is the PDF's equivalent position --
+    # above the findings table whose first column is "Classification".
+    # See `DOCUMENT_POSITIONING_STATEMENT` in clinical_report_builder.py
+    # for why it is that constant and not a copy of it.
+    story.append(Paragraph(DOCUMENT_POSITIONING_STATEMENT, styles["PositioningBanner"]))
+    story.append(Spacer(1, 4 * mm))
+    # Revision traceability (amended / superseded / re-analysis), page 1,
+    # above every finding -- same block, same wording, as the Markdown and
+    # short PDF. Reasons/ids are caller-supplied text, hence esc().
+    for banner in report_revision_banners(document):
+        story.append(Paragraph(esc(banner), styles["PositioningBanner"]))
+        story.append(Spacer(1, 4 * mm))
     # Report-header-level methodology disclosure (C0, report review
     # round 2): stated once, up front, before any classification is
     # shown, so a reviewer never has to infer which combining system
@@ -2287,7 +2962,9 @@ def generate_pdf(
     story.extend(_build_clinician_summary_flowables(document, variants, sample_id, resolved_run_id, assembly, styles))
     story.extend(
         [
-            _build_patient_header_table(patient, sample_id, resolved_run_id, assembly, styles),
+            _build_patient_header_table(
+                patient, sample_id, resolved_run_id, assembly, document.get("generated_at"), styles
+            ),
             Spacer(1, 6 * mm),
             _Bookmark("bm_qc", "Sequencing Quality Control Metrics"),
             Paragraph("Sequencing Quality Control Metrics", styles["SectionHeading"]),
@@ -2318,7 +2995,7 @@ def generate_pdf(
         # docstring) -- bound in via `functools.partial` since
         # `canvasmaker` is called as `canvasmaker(filename, **kwargs)`
         # by ReportLab itself, not pre-instantiated by this function.
-        canvasmaker=functools.partial(_NumberedCanvas, footer_text=_icmr_ai_disclosure_footer_text(patient)),
+        canvasmaker=functools.partial(_NumberedCanvas, footer_text=_icmr_ai_disclosure_footer_text(patient, document)),
     )
     logger.info(f"Wrote clinical PDF report to '{output_path}' ({len(variants)} variant finding(s)).")
     return output_path

@@ -110,21 +110,21 @@ class ConfidenceEngine:
     def score(
         self,
         *,
-        clinvar_result: Dict[str, Any] = None,
-        clingen_result: Dict[str, Any] = None,
-        gnomad_result: Dict[str, Any] = None,
-        dbsnp_result: Dict[str, Any] = None,
-        alphamissense_result: Dict[str, Any] = None,
-        mmsplice_result: Dict[str, Any] = None,
-        dna_models_used: List[str] = None,
-        rna_result: Dict[str, Any] = None,
-        protein_result: Dict[str, Any] = None,
-        uniprot_result: Dict[str, Any] = None,
-        interpro_result: Dict[str, Any] = None,
-        alphafold_result: Dict[str, Any] = None,
-        blast_result: Dict[str, Any] = None,
-        conflicting_evidence: List[str] = None,
-        ai_consensus: List[Dict[str, Any]] = None,
+        clinvar_result: Optional[Dict[str, Any]] = None,
+        clingen_result: Optional[Dict[str, Any]] = None,
+        gnomad_result: Optional[Dict[str, Any]] = None,
+        dbsnp_result: Optional[Dict[str, Any]] = None,
+        alphamissense_result: Optional[Dict[str, Any]] = None,
+        mmsplice_result: Optional[Dict[str, Any]] = None,
+        dna_models_used: Optional[List[str]] = None,
+        rna_result: Optional[Dict[str, Any]] = None,
+        protein_result: Optional[Dict[str, Any]] = None,
+        uniprot_result: Optional[Dict[str, Any]] = None,
+        interpro_result: Optional[Dict[str, Any]] = None,
+        alphafold_result: Optional[Dict[str, Any]] = None,
+        blast_result: Optional[Dict[str, Any]] = None,
+        real_conflicts: Optional[List[Any]] = None,
+        ai_consensus: Optional[List[Dict[str, Any]]] = None,
     ) -> ConfidenceResult:
         cfg = CONFIG.confidence
 
@@ -142,7 +142,7 @@ class ConfidenceEngine:
         raw_sum = sum(c.contribution for c in categories)
         raw_score = 100.0 * (raw_sum / max_possible) if max_possible > 0 else 0.0
 
-        penalty, penalty_explanation = self._conflict_penalty(conflicting_evidence, ai_consensus, cfg)
+        penalty, penalty_explanation = self._conflict_penalty(real_conflicts, cfg)
         final_score = max(0.0, raw_score * (1.0 - penalty))
 
         label = self._label(final_score, cfg)
@@ -189,7 +189,9 @@ class ConfidenceEngine:
                 notes.append("ClinVar record has assertion criteria provided (single or unreviewed submitter set).")
             elif review_status:
                 quality_parts.append(0.3)
-                notes.append(f"ClinVar record present but review status ('{top.get('review_status')}') indicates limited curation.")
+                notes.append(
+                    f"ClinVar record present but review status ('{top.get('review_status')}') indicates limited curation."
+                )
             else:
                 quality_parts.append(0.2)
                 notes.append("ClinVar record present with no reported review status.")
@@ -201,7 +203,21 @@ class ConfidenceEngine:
         else:
             notes.append("No ClinVar record found for this variant.")
 
-        if clingen_result and not clingen_result.get("skipped") and not clingen_result.get("error") and clingen_result.get("found"):
+        if (
+            clingen_result
+            and not clingen_result.get("skipped")
+            # INERT (2026-08-31): truthiness here, not `is not None`, but
+            # `clingen_result.get("found")` two lines below already
+            # requires True, and a failed lookup always returns
+            # found=False alongside its error -- so this sub-condition
+            # never changes which branch fires; a genuinely failed
+            # lookup with error="" already fails the AND at `found`
+            # regardless of how `error` itself is read. Fixed to
+            # `is not None` anyway for consistency with the rest of this
+            # module, not because today's score or rationale changes.
+            and clingen_result.get("error") is None
+            and clingen_result.get("found")
+        ):
             sources.append("ClinGen")
             presence_parts.append(1.0)
             validity = clingen_result.get("clinical_validity_summary")
@@ -223,8 +239,13 @@ class ConfidenceEngine:
         presence = sum(presence_parts) / 2.0
         quality = (sum(quality_parts) / len(quality_parts)) if quality_parts else 0.0
         return CategoryScore(
-            "Clinical Evidence", weight, presence, quality, weight * presence * quality,
-            " ".join(notes), sources,
+            "Clinical Evidence",
+            weight,
+            presence,
+            quality,
+            weight * presence * quality,
+            " ".join(notes),
+            sources,
         )
 
     @staticmethod
@@ -234,14 +255,19 @@ class ConfidenceEngine:
         quality_parts: List[float] = []
         notes: List[str] = []
 
-        if gnomad_result and not gnomad_result.get("skipped") and not gnomad_result.get("error"):
+        # `error` by presence: this branch's own rationale asserts the
+        # lookup "queried successfully", so a falsy-but-present error
+        # string put a false statement into reader-facing text.
+        if gnomad_result and not gnomad_result.get("skipped") and gnomad_result.get("error") is None:
             sources.append("gnomAD")
             presence_parts.append(1.0)
             if gnomad_result.get("found"):
                 af = gnomad_result.get("global_af")
                 if af is not None:
                     quality_parts.append(1.0)
-                    notes.append(f"gnomAD returned an allele frequency (AF={af:.2e}), a decisive population-rarity signal.")
+                    notes.append(
+                        f"gnomAD returned an allele frequency (AF={af:.2e}), a decisive population-rarity signal."
+                    )
                 else:
                     quality_parts.append(0.5)
                     notes.append("gnomAD record found but no allele frequency reported.")
@@ -250,6 +276,13 @@ class ConfidenceEngine:
                 # drives PM2 in Phase 1) -- not treated as "no evidence".
                 quality_parts.append(0.8)
                 notes.append("gnomAD queried successfully; variant is absent, itself an informative rarity signal.")
+        elif gnomad_result and gnomad_result.get("skipped") and gnomad_result.get("reason"):
+            # Round 16: a deliberate skip (e.g. mtDNA compartment gate --
+            # gnomAD's mitochondrial callset is a separate resource this
+            # pipeline never queries) carries its own honest reason; that
+            # is a different statement from "unavailable" (an outage/
+            # timeout), which the fallback below still covers.
+            notes.append(f"gnomAD was not queried: {gnomad_result['reason']}")
         else:
             notes.append("gnomAD lookup was skipped or unavailable for this variant.")
 
@@ -259,15 +292,22 @@ class ConfidenceEngine:
             quality_parts.append(0.6)
             notes.append("Variant is catalogued in dbSNP.")
         elif dbsnp_result and dbsnp_result.get("match_status") == "position_only":
-            notes.append("Variant not catalogued in dbSNP under this exact allele (other rsIDs exist at this position).")
+            notes.append(
+                "Variant not catalogued in dbSNP under this exact allele (other rsIDs exist at this position)."
+            )
         else:
             notes.append("Variant not found in dbSNP (may be novel/private, or lookup was unavailable).")
 
         presence = sum(presence_parts) / 2.0
         quality = (sum(quality_parts) / len(quality_parts)) if quality_parts else 0.0
         return CategoryScore(
-            "Population Evidence", weight, presence, quality, weight * presence * quality,
-            " ".join(notes), sources,
+            "Population Evidence",
+            weight,
+            presence,
+            quality,
+            weight * presence * quality,
+            " ".join(notes),
+            sources,
         )
 
     @staticmethod
@@ -284,7 +324,9 @@ class ConfidenceEngine:
             quality_parts.append(1.0 if am_class in ("likely_pathogenic", "likely_benign") else 0.4)
             notes.append(f"AlphaMissense produced a prediction ('{am_class or 'unclassified'}').")
         else:
-            notes.append("AlphaMissense produced no prediction (not applicable, skipped, or unavailable for this variant).")
+            notes.append(
+                "AlphaMissense produced no prediction (not applicable, skipped, or unavailable for this variant)."
+            )
 
         if mmsplice_result and mmsplice_result.get("predicted"):
             sources.append("MMSplice")
@@ -301,7 +343,14 @@ class ConfidenceEngine:
             directions = set()
             for v in ai_consensus:
                 pred = (v.get("prediction") or "").lower()
-                if "pathogenic" in pred or pred in ("strong_donor_loss", "strong_acceptor_loss", "exon_skipping", "intron_retention", "strong", "moderate"):
+                if "pathogenic" in pred or pred in (
+                    "strong_donor_loss",
+                    "strong_acceptor_loss",
+                    "exon_skipping",
+                    "intron_retention",
+                    "strong",
+                    "moderate",
+                ):
                     directions.add("damaging")
                 elif "benign" in pred:
                     directions.add("benign")
@@ -315,8 +364,13 @@ class ConfidenceEngine:
         presence = (sum(presence_parts) / 2.0) if presence_parts else 0.0
         quality = (sum(quality_parts) / len(quality_parts)) if quality_parts else 0.0
         return CategoryScore(
-            "AI Evidence", weight, presence, quality, weight * presence * quality,
-            " ".join(notes), sources,
+            "AI Evidence",
+            weight,
+            presence,
+            quality,
+            weight * presence * quality,
+            " ".join(notes),
+            sources,
         )
 
     @staticmethod
@@ -326,15 +380,47 @@ class ConfidenceEngine:
         quality_parts: List[float] = []
         notes: List[str] = []
 
-        if uniprot_result and not uniprot_result.get("skipped") and not uniprot_result.get("error") and uniprot_result.get("found"):
+        if (
+            uniprot_result
+            and not uniprot_result.get("skipped")
+            # INERT (2026-08-31): truthiness here, not `is not None`, but
+            # `uniprot_result.get("found")` two lines below already
+            # requires True, and a failed lookup always returns
+            # found=False alongside its error -- so this sub-condition
+            # never changes which branch fires. Confirmed EXECUTED: a
+            # failure with error="" also lacks the "reason" key the elif
+            # below checks, so it falls to the same final `else` either
+            # way. Fixed to `is not None` for consistency, not because
+            # today's score or rationale changes.
+            and uniprot_result.get("error") is None
+            and uniprot_result.get("found")
+        ):
             sources.append("UniProt")
             presence_parts.append(1.0)
             quality_parts.append(1.0 if uniprot_result.get("reviewed") else 0.6)
             notes.append(f"UniProt entry found ({'reviewed' if uniprot_result.get('reviewed') else 'unreviewed'}).")
+        elif uniprot_result and uniprot_result.get("reason"):
+            # Round 16: an honest, stated cause (e.g. this gene's Ensembl
+            # biotype confirms no protein-coding transcript exists --
+            # `pipeline/acmg_rules.py::non_protein_coding_gene_reason`)
+            # is not the same claim as "we looked and couldn't find one".
+            notes.append(uniprot_result["reason"])
         else:
             notes.append("No UniProt entry resolved for this gene/protein.")
 
-        if interpro_result and not interpro_result.get("skipped") and not interpro_result.get("error") and interpro_result.get("found"):
+        if (
+            interpro_result
+            and not interpro_result.get("skipped")
+            # INERT (2026-08-31): same reasoning as UniProt above --
+            # `found` two lines below already gates this branch, and a
+            # failure's shape carries no "reason" key either, so it
+            # falls to the same shared final `else` regardless of how
+            # `error` is read. Confirmed EXECUTED alongside UniProt's
+            # case in the same probe. Fixed to `is not None` for
+            # consistency only.
+            and interpro_result.get("error") is None
+            and interpro_result.get("found")
+        ):
             sources.append("InterPro")
             presence_parts.append(1.0)
             # `affected_domains` is three-valued (see
@@ -351,31 +437,72 @@ class ConfidenceEngine:
             position = interpro_result.get("protein_position")
             if affected:
                 quality_parts.append(0.9)
-                notes.append(f"InterPro/Pfam annotates {len(affected)} domain(s) overlapping residue {position} (transcript-verified).")
+                notes.append(
+                    f"InterPro/Pfam annotates {len(affected)} domain(s) overlapping residue {position} (transcript-verified)."
+                )
             elif affected is None:
                 quality_parts.append(0.3)
-                notes.append("InterPro/Pfam annotation available for this protein, but this variant's residue position could not be "
-                              "determined from the transcript structure, so domain overlap could not be checked.")
+                notes.append(
+                    "InterPro/Pfam annotation available for this protein, but this variant's residue position could not be "
+                    "determined from the transcript structure, so domain overlap could not be checked."
+                )
             else:
                 quality_parts.append(0.6)
-                notes.append(f"InterPro/Pfam annotation available; no domain overlaps residue {position} (transcript-verified).")
+                notes.append(
+                    f"InterPro/Pfam annotation available; no domain overlaps residue {position} (transcript-verified)."
+                )
+        elif interpro_result and interpro_result.get("reason"):
+            notes.append(interpro_result["reason"])
         else:
             notes.append("No InterPro/Pfam annotation available for this protein.")
 
         presence = (sum(presence_parts) / 2.0) if presence_parts else 0.0
         quality = (sum(quality_parts) / len(quality_parts)) if quality_parts else 0.0
+        # Round 23: UniProt's and InterPro's `reason` both come from the
+        # same orchestrator-computed `skip_reason` (see
+        # `pipeline/orchestrator.py`'s `non_protein_coding_gene_reason`
+        # call, shared verbatim across uniprot_result/interpro_result/
+        # alphafold_result) whenever a gene has no protein-coding
+        # transcript at all -- so `notes` can carry the identical
+        # sentence twice. `dict.fromkeys` dedupes while preserving
+        # order, without touching the distinct-reason case (e.g. a real
+        # UniProt hit alongside an InterPro lookup failure), where every
+        # note differs and nothing is dropped.
+        deduped_notes = list(dict.fromkeys(notes))
         return CategoryScore(
-            "Protein Knowledge", weight, presence, quality, weight * presence * quality,
-            " ".join(notes), sources,
+            "Protein Knowledge",
+            weight,
+            presence,
+            quality,
+            weight * presence * quality,
+            " ".join(deduped_notes),
+            sources,
         )
 
     @staticmethod
     def _structural_quality(alphafold_result, weight: float) -> CategoryScore:
         sources = []
         notes: List[str] = []
-        if alphafold_result and not alphafold_result.get("skipped") and not alphafold_result.get("error") and alphafold_result.get("found"):
+        if (
+            alphafold_result
+            and not alphafold_result.get("skipped")
+            and alphafold_result.get("error") is None
+            and alphafold_result.get("found")
+        ):
             sources.append("AlphaFold DB")
-            band = (alphafold_result.get("affected_residue_band") or alphafold_result.get("mean_plddt_band") or "").lower()
+            # No fallback to `mean_plddt_band` (the whole-protein average)
+            # when `affected_residue_band` is absent -- same defect, same
+            # fix, as `conflict_resolution_engine.py::_structural_conflict`'s
+            # docstring already condemned in writing: treating the
+            # whole-protein average as this variant's own residue
+            # confidence fabricates a claim AlphaFold was never asked
+            # about. `raw_band is not None` (not truthiness) decides
+            # presence, so a genuinely-absent band stays `None` rather
+            # than collapsing to `""` -- an empty string here would put
+            # "present but empty" and "absent" back on one observable,
+            # one layer inside the fix meant to remove that ambiguity.
+            raw_band = alphafold_result.get("affected_residue_band")
+            band = raw_band.lower() if raw_band is not None else None
             # Bug fix (found during Phase 6 prep): AlphaFold DB's real
             # confidence_band() values are "very_high"/"confident"/"low"/
             # "very_low" (underscored -- see pipeline/alphafold/models.py),
@@ -385,9 +512,16 @@ class ConfidenceEngine:
             # cases. Fixed to match the actual provider output.
             quality_map = {"very_high": 1.0, "confident": 0.75, "low": 0.4, "very_low": 0.2}
             quality = quality_map.get(band, 0.5)
-            notes.append(f"AlphaFold DB structure available (confidence band: '{band or 'n/a'}').")
-            return CategoryScore("Structural Biology", weight, 1.0, quality, weight * 1.0 * quality, " ".join(notes), sources)
-        notes.append("No AlphaFold DB structure resolved for this protein.")
+            notes.append(
+                f"AlphaFold DB structure available (confidence band: '{band if band is not None else 'n/a'}')."
+            )
+            return CategoryScore(
+                "Structural Biology", weight, 1.0, quality, weight * 1.0 * quality, " ".join(notes), sources
+            )
+        if alphafold_result and alphafold_result.get("reason"):
+            notes.append(alphafold_result["reason"])
+        else:
+            notes.append("No AlphaFold DB structure resolved for this protein.")
         return CategoryScore("Structural Biology", weight, 0.0, 0.0, 0.0, " ".join(notes), sources)
 
     @staticmethod
@@ -403,7 +537,15 @@ class ConfidenceEngine:
         sources = list(dna_models_used or [])
         ran = len(sources)
         total_expected = 5  # HyenaDNA/Evo2 (routed, one runs) + RNA-FM + ESM2
-        if rna_result and not rna_result.get("skipped") and not rna_result.get("error"):
+        # INERT (2026-08-31): truthiness on `error`, not `is not None`,
+        # but `_run_rna_stage` (orchestrator.py) keeps `skipped: True`
+        # on every failure path -- `not rna_result.get("skipped")`
+        # already excludes a failed run regardless of how `error` is
+        # read. Fixed to `is not None` for consistency only; this
+        # mirrors the identical check duplicated in interpretation.py,
+        # interpretation_result.py, and prioritization_engine.py, all
+        # fixed alongside this one for the same reason.
+        if rna_result and not rna_result.get("skipped") and rna_result.get("error") is None:
             sources.append("RNA-FM")
             ran += 1
         if protein_result and protein_result.get("esm2"):
@@ -440,37 +582,50 @@ class ConfidenceEngine:
         # input without fabricating a number for it. Its actual
         # contribution is already reflected upstream (sequence context
         # + protein translation succeeding at all).
-        notes.append("Ensembl contributes indirectly via sequence-context retrieval and is not independently scorable here (no per-variant Ensembl evidence dict is passed to this engine).")
-        return CategoryScore("Additional Evidence", weight, presence, quality, weight * presence * quality, " ".join(notes), sources)
+        notes.append(
+            "Ensembl contributes indirectly via sequence-context retrieval and is not independently scorable here (no per-variant Ensembl evidence dict is passed to this engine)."
+        )
+        return CategoryScore(
+            "Additional Evidence", weight, presence, quality, weight * presence * quality, " ".join(notes), sources
+        )
 
     # ------------------------------------------------------------------
     # Conflict penalty + labeling
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _conflict_penalty(conflicting_evidence, ai_consensus, cfg) -> Tuple[float, str]:
-        conflict_units = 0
-        reasons: List[str] = []
+    def _conflict_penalty(real_conflicts, cfg) -> Tuple[float, str]:
+        """
+        HIGH-1: penalises the conflicts
+        `ConflictResolutionEngine._real_conflicts` recognises, not the
+        raw per-criterion `conflicting_evidence` list this used to
+        count. Two things changed and both are load-bearing:
 
-        n_conflicts = len(conflicting_evidence or [])
-        if n_conflicts:
-            conflict_units += n_conflicts
-            reasons.append(f"{n_conflicts} conflicting-evidence item(s) recorded across ACMG criteria.")
+        1. ACMG-criterion caveats no longer penalise. They are the
+           items D4 excluded from the Attention flag on the grounds
+           that they are "not a disagreement between two independent
+           sources"; penalising them here while refusing to flag them
+           there meant one document asserted a conflict and denied it
+           six fields apart.
+        2. The separate `ai_consensus` direction-disagreement branch is
+           GONE, deliberately. That disagreement now arrives as an
+           `AI`/`Moderate` ConflictItem inside `real_conflicts`
+           (`_ai_conflict`), so keeping the branch would have counted
+           the same discordance twice -- once per path -- for a penalty
+           of 0.30 where 0.15 is meant. Nothing in the five-variant run
+           exercised it, which is exactly why it is pinned by a test.
 
-        if ai_consensus and len(ai_consensus) >= 2:
-            directions = set()
-            for v in ai_consensus:
-                pred = (v.get("prediction") or "").lower()
-                if "pathogenic" in pred or pred in ("strong_donor_loss", "strong_acceptor_loss", "exon_skipping", "intron_retention", "strong", "moderate"):
-                    directions.add("damaging")
-                elif "benign" in pred:
-                    directions.add("benign")
-            if len(directions) > 1:
-                conflict_units += 1
-                reasons.append("AI classifiers (AlphaMissense/MMSplice) disagree in predicted direction.")
-
+        Flat count, not severity-weighted: one unit per real conflict,
+        whatever its tier. `ConflictResolutionEngine._score` keeps its
+        own severity weighting for the flag; this stays legible until
+        there is evidence for a particular weighting here.
+        """
+        conflict_units = len(real_conflicts or [])
         penalty = min(cfg.MAX_CONFLICT_PENALTY, conflict_units * cfg.CONFLICT_PENALTY_PER_CONFLICT)
-        explanation = " ".join(reasons) if reasons else "No conflicting evidence detected."
+        if not conflict_units:
+            return penalty, "No conflicting evidence detected."
+        detail = "; ".join(f"{c.conflict_type} ({c.severity})" for c in real_conflicts)
+        explanation = f"{conflict_units} conflict(s) detected between independent evidence sources: {detail}."
         return penalty, explanation
 
     @staticmethod

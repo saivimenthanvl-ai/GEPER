@@ -42,34 +42,87 @@ KNOWN LIMITATIONS:
     handled, but rare transcript-specific first-codon offsets may produce
     incorrect frame assignments for a small fraction of transcripts.
 """
+
 from __future__ import annotations
 
 import gzip
 import logging
 import os
 import subprocess
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
+from shared.process_control import spawn_tracked, kill_process_tree_now
+
+from pipeline.utils.genome_build import _CHR1_LENGTH_BY_BUILD
 
 logger = logging.getLogger("geper.pipeline.annotation.codon_provider")
 
 # ── Standard genetic code (codon → single-letter AA) ──────────────────────────
 _CODON_TABLE: Dict[str, str] = {
-    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
-    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
-    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
-    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
-    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
-    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
-    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
-    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
-    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
-    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
-    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
-    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
-    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
-    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
-    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
-    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+    "TTT": "F",
+    "TTC": "F",
+    "TTA": "L",
+    "TTG": "L",
+    "CTT": "L",
+    "CTC": "L",
+    "CTA": "L",
+    "CTG": "L",
+    "ATT": "I",
+    "ATC": "I",
+    "ATA": "I",
+    "ATG": "M",
+    "GTT": "V",
+    "GTC": "V",
+    "GTA": "V",
+    "GTG": "V",
+    "TCT": "S",
+    "TCC": "S",
+    "TCA": "S",
+    "TCG": "S",
+    "CCT": "P",
+    "CCC": "P",
+    "CCA": "P",
+    "CCG": "P",
+    "ACT": "T",
+    "ACC": "T",
+    "ACA": "T",
+    "ACG": "T",
+    "GCT": "A",
+    "GCC": "A",
+    "GCA": "A",
+    "GCG": "A",
+    "TAT": "Y",
+    "TAC": "Y",
+    "TAA": "*",
+    "TAG": "*",
+    "CAT": "H",
+    "CAC": "H",
+    "CAA": "Q",
+    "CAG": "Q",
+    "AAT": "N",
+    "AAC": "N",
+    "AAA": "K",
+    "AAG": "K",
+    "GAT": "D",
+    "GAC": "D",
+    "GAA": "E",
+    "GAG": "E",
+    "TGT": "C",
+    "TGC": "C",
+    "TGA": "*",
+    "TGG": "W",
+    "CGT": "R",
+    "CGC": "R",
+    "CGA": "R",
+    "CGG": "R",
+    "AGT": "S",
+    "AGC": "S",
+    "AGA": "R",
+    "AGG": "R",
+    "GGT": "G",
+    "GGC": "G",
+    "GGA": "G",
+    "GGG": "G",
 }
 
 _START_CODONS = frozenset({"ATG"})
@@ -87,8 +140,10 @@ def _reverse_complement(seq: str) -> str:
 
 # ── CDS record ────────────────────────────────────────────────────────────────
 
+
 class CdsRecord:
     """One CDS exon segment from a GFF3 CDS feature."""
+
     __slots__ = ("chrom", "start", "end", "strand", "phase", "transcript_id")
 
     def __init__(
@@ -101,14 +156,15 @@ class CdsRecord:
         transcript_id: str,
     ) -> None:
         self.chrom = chrom
-        self.start = start      # 1-based, inclusive
-        self.end = end          # 1-based, inclusive
+        self.start = start  # 1-based, inclusive
+        self.end = end  # 1-based, inclusive
         self.strand = strand
-        self.phase = phase      # GFF3 phase (0/1/2) — bases to skip at start
+        self.phase = phase  # GFF3 phase (0/1/2) — bases to skip at start
         self.transcript_id = transcript_id
 
 
 # ── FASTA reader ──────────────────────────────────────────────────────────────
+
 
 class _FastaReader:
     """Minimal FASTA sequence extractor.
@@ -132,12 +188,18 @@ class _FastaReader:
     @staticmethod
     def _check_samtools() -> bool:
         try:
-            result = subprocess.run(
+            proc = spawn_tracked(
                 ["samtools", "version"],
-                capture_output=True, text=True, timeout=5,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+            try:
+                proc.communicate(timeout=5)
+                return proc.returncode == 0
+            except subprocess.TimeoutExpired:
+                kill_process_tree_now(proc)
+                return False
+        except FileNotFoundError:
             return False
 
     @staticmethod
@@ -189,32 +251,111 @@ class _FastaReader:
             return seq[s:end].upper()
         return ""
 
+    def chrom_length(self, chrom: str) -> Optional[int]:
+        """Return the contig's length in bases, or None if it can't be
+        determined without extra I/O this reader doesn't already do.
+
+        Used only by FastaCodonContextProvider's genome-build
+        consistency check (FIX #8) -- never for sequence extraction
+        itself (that's `fetch`).
+        """
+        names = [chrom, chrom.lstrip("chr") if chrom.startswith("chr") else f"chr{chrom}"]
+        if self._in_memory is not None:
+            for name in names:
+                seq = self._in_memory.get(name)
+                if seq:
+                    return len(seq)
+            return None
+        # samtools path: read the .fai sidecar directly rather than
+        # shelling out again -- `samtools faidx <path>` with no region
+        # would just (re)create this same file, so reading it is
+        # cheaper and avoids a second subprocess spawn purely to
+        # answer a length question.
+        fai_path = f"{self._path}.fai"
+        if not os.path.isfile(fai_path):
+            return None
+        try:
+            with open(fai_path, "rt", encoding="ascii", errors="replace") as fh:
+                for line in fh:
+                    cols = line.rstrip("\n").split("\t")
+                    if len(cols) >= 2 and cols[0] in names:
+                        return int(cols[1])
+        except (OSError, ValueError):
+            return None
+        return None
+
     def _samtools_fetch(self, chrom: str, start: int, end: int) -> str:
         region = f"{chrom}:{start}-{end}"
         try:
+            # Deliberately NOT routed through spawn_tracked: samtools faidx is
+            # called thousands of times per run (once per codon lookup) and is
+            # a small, fast operation; wrapping each one in tracked machinery
+            # would add noticeable overhead. The version-check site (_check_samtools)
+            # is routed because it runs once per _FastaReader init and is a
+            # control-plane decision point, not a data-plane inner loop.
             result = subprocess.run(
                 ["samtools", "faidx", self._path, region],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             if result.returncode != 0:
                 # Try alternate chrom name
                 alt = chrom.lstrip("chr") if chrom.startswith("chr") else f"chr{chrom}"
                 region2 = f"{alt}:{start}-{end}"
+                # Deliberately NOT routed through spawn_tracked (same rationale as above).
                 result = subprocess.run(
                     ["samtools", "faidx", self._path, region2],
-                    capture_output=True, text=True, timeout=15,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
                 )
             if result.returncode != 0:
                 return ""
             lines = result.stdout.strip().splitlines()
-            seq = "".join(l for l in lines if not l.startswith(">"))
+            seq = "".join(line for line in lines if not line.startswith(">"))
             return seq.upper()
         except Exception as exc:
             logger.debug("[CodonProvider] samtools faidx failed for %s: %s", region, exc)
             return ""
 
 
+# ── GFF3 genome-build detection ────────────────────────────────────────────────
+
+
+def _detect_gff_chr1_length(gff_path: str, max_header_lines: int = 5000) -> Optional[int]:
+    """Scan a GFF3's ##sequence-region pragma lines (part of the GFF3
+    spec itself -- `##sequence-region seqid start end` -- not a vendor
+    convention) for chr1's declared length.
+
+    Same discriminator pipeline/utils/genome_build.py already uses for
+    a VCF's ##contig length= metadata, applied to GFF3's own equivalent
+    pragma. Returns None (not a guess) when the pragma is absent or
+    doesn't cover chr1 -- an older or minimal GFF3 may not carry it.
+    """
+    names = {"1", "chr1"}
+    open_fn = gzip.open if gff_path.endswith((".gz", ".bgz")) else open
+    try:
+        with open_fn(gff_path, "rt", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_header_lines:
+                    break
+                if not line.startswith("#"):
+                    break
+                if line.startswith("##sequence-region"):
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[1] in names:
+                        try:
+                            return int(parts[3])
+                        except ValueError:
+                            continue
+    except OSError:
+        return None
+    return None
+
+
 # ── GFF3 CDS loader ───────────────────────────────────────────────────────────
+
 
 def _load_cds_from_gff(gff_path: str) -> Dict[str, List[CdsRecord]]:
     """Parse CDS features from a GFF3 file.
@@ -255,15 +396,12 @@ def _load_cds_from_gff(gff_path: str) -> Dict[str, List[CdsRecord]]:
                         attrs[k.strip()] = v.strip().strip('"')
             else:
                 import re
+
                 for m in re.finditer(r'(\w+)\s+"([^"]*)"', attrs_str):
                     attrs[m.group(1)] = m.group(2)
 
             # GFF3 Parent = transcript; GTF transcript_id attr
-            parent = (
-                attrs.get("Parent")
-                or attrs.get("transcript_id")
-                or ""
-            )
+            parent = attrs.get("Parent") or attrs.get("transcript_id") or ""
             if not parent:
                 continue
 
@@ -287,6 +425,7 @@ def _load_cds_from_gff(gff_path: str) -> Dict[str, List[CdsRecord]]:
 
 # ── Main provider ─────────────────────────────────────────────────────────────
 
+
 class FastaCodonContextProvider:
     """Resolve codon-level consequence for exonic SNVs.
 
@@ -303,6 +442,10 @@ class FastaCodonContextProvider:
         self._cds_map: Optional[Dict[str, List[CdsRecord]]] = None
         self._fasta: Optional[_FastaReader] = None
         self._available = False
+        # FIX #8: populated by _check_genome_build_consistency(), None
+        # until then (or if the discriminating signal was unavailable).
+        self.detected_fasta_build: Optional[str] = None
+        self.detected_gff_build: Optional[str] = None
 
         if not os.path.isfile(gff_path):
             logger.warning("[CodonProvider] GFF3 not found: %s", gff_path)
@@ -315,12 +458,77 @@ class FastaCodonContextProvider:
             self._cds_map = _load_cds_from_gff(gff_path)
             self._fasta = _FastaReader(fasta_path)
             self._available = True
+            self._check_genome_build_consistency()
             logger.info(
                 "[CodonProvider] Ready: %d transcripts with CDS from %s",
-                len(self._cds_map), gff_path,
+                len(self._cds_map),
+                gff_path,
             )
         except Exception as exc:
             logger.error("[CodonProvider] Initialisation failed: %s", exc)
+
+    def _check_genome_build_consistency(self) -> None:
+        """FIX #8: warn -- never block, matching genome_build.py's own
+        fail-soft philosophy -- when the FASTA and GFF3 disagree about
+        which genome build (GRCh37 vs GRCh38) they're for.
+
+        Neither file declares its build explicitly to this provider;
+        chr1's length is the same reliable discriminator
+        pipeline/utils/genome_build.py already established for VCF
+        headers, applied here to the FASTA (via _FastaReader.chrom_length,
+        its .fai index or the in-memory-loaded sequence) and the GFF3
+        (via its ##sequence-region pragma). Either signal can be
+        legitimately absent -- this only downgrades confidence, never
+        fails the load, and "undetermined" is never read as "matches".
+
+        Does NOT check the VCF: this class never sees the VCF file at
+        all, only already-parsed (chrom, pos, ref, alt, transcript_id)
+        tuples from the orchestrator. A VCF-vs-FASTA/GFF3 cross-check
+        would need runner.py's already-detected build (see its
+        `checkpoint["detected_genome_build"]`, from
+        pipeline/utils/genome_build.py's `warn_if_unsupported_build`)
+        threaded into make_codon_provider_from_cfg -- out of this
+        file's scope.
+
+        THAT FOLLOW-UP IS NOW DONE, ELSEWHERE AND IN A DIFFERENT SHAPE
+        (2026-09-10): `utils/genome_build.py::check_vcf_gff3_build_consistency`
+        compares the VCF and the GFF3 directly and RAISES on a definite
+        disagreement, called from `runner.py` after the vcf_only early
+        return. It did not need threading through this constructor after
+        all. This method is unchanged and still WARNS about the
+        FASTA-vs-GFF3 pair, which remains its own question.
+        """
+        fasta_length = self._fasta.chrom_length("chr1") if self._fasta else None
+        gff_length = _detect_gff_chr1_length(self._gff_path)
+
+        self.detected_fasta_build = (
+            _CHR1_LENGTH_BY_BUILD.get(fasta_length) if fasta_length else None
+        )
+        self.detected_gff_build = _CHR1_LENGTH_BY_BUILD.get(gff_length) if gff_length else None
+
+        if self.detected_fasta_build and self.detected_gff_build:
+            if self.detected_fasta_build != self.detected_gff_build:
+                logger.warning(
+                    "[CodonProvider] Genome build mismatch: FASTA %s looks like %s "
+                    "(chr1 length=%d) but GFF3 %s looks like %s (chr1 length=%d). "
+                    "Codon-level consequences (missense/synonymous/stop_gained/etc.) "
+                    "will be silently wrong for any transcript whose coordinates "
+                    "shifted between builds. Use a matching-build FASTA and GFF3.",
+                    self._fasta_path,
+                    self.detected_fasta_build,
+                    fasta_length,
+                    self._gff_path,
+                    self.detected_gff_build,
+                    gff_length,
+                )
+        else:
+            logger.debug(
+                "[CodonProvider] Could not confirm FASTA/GFF3 genome-build "
+                "consistency (fasta_build=%s, gff_build=%s) -- chr1 length "
+                "signal unavailable from one or both files.",
+                self.detected_fasta_build,
+                self.detected_gff_build,
+            )
 
     # ── CodonContextProvider interface ────────────────────────────────────────
 
@@ -357,8 +565,7 @@ class FastaCodonContextProvider:
 
         if len(ref) != 1 or len(alt) != 1:
             raise NotImplementedError(
-                "FastaCodonContextProvider only handles SNVs; "
-                f"got ref={ref!r} alt={alt!r}"
+                f"FastaCodonContextProvider only handles SNVs; got ref={ref!r} alt={alt!r}"
             )
 
         if ref == alt:
@@ -369,7 +576,12 @@ class FastaCodonContextProvider:
         except Exception as exc:
             logger.debug(
                 "[CodonProvider] classify_snv failed for %s:%d %s>%s tx=%s: %s",
-                chrom, pos, ref, alt, transcript_id, exc,
+                chrom,
+                pos,
+                ref,
+                alt,
+                transcript_id,
+                exc,
             )
             return (None, None, None, None, None)
 
@@ -386,9 +598,7 @@ class FastaCodonContextProvider:
         """Core codon-change classification; returns (consequence, ref_codon, alt_codon, ref_aa, alt_aa)."""
         cds_chain = self._cds_map.get(transcript_id)  # type: ignore[union-attr]
         if not cds_chain:
-            logger.debug(
-                "[CodonProvider] No CDS for transcript %s", transcript_id
-            )
+            logger.debug("[CodonProvider] No CDS for transcript %s", transcript_id)
             return (None, None, None, None, None)
 
         # Normalise chrom for FASTA lookup
@@ -399,9 +609,7 @@ class FastaCodonContextProvider:
         # Minus-strand: descending genomic order (reversed) — this MUST match
         # the order used by _fetch_codon(), otherwise the offset is wrong and
         # multi-exon codons are assembled incorrectly.
-        transcript_ordered_chain = (
-            cds_chain if strand == "+" else list(reversed(cds_chain))
-        )
+        transcript_ordered_chain = cds_chain if strand == "+" else list(reversed(cds_chain))
 
         # FIX 4: Apply GFF3 phase of the first CDS exon.
         # phase=N means the first N bases of this exon belong to the tail of a
@@ -435,7 +643,9 @@ class FastaCodonContextProvider:
         if cds_exon is None:
             logger.debug(
                 "[CodonProvider] pos %s:%d not in any CDS exon of %s",
-                chrom, pos, transcript_id,
+                chrom,
+                pos,
+                transcript_id,
             )
             return (None, None, None, None, None)
 
@@ -456,21 +666,27 @@ class FastaCodonContextProvider:
 
         # Fetch reference codon from genomic FASTA
         ref_codon = self._fetch_codon(
-            chrom, transcript_id, cds_chain, strand, codon_cds_start
+            chrom, transcript_id, cds_chain, strand, codon_cds_start, _phase_offset
         )
         if not ref_codon or len(ref_codon) != 3:
             logger.debug(
                 "[CodonProvider] Could not fetch codon at CDS pos %d for %s",
-                codon_cds_start, transcript_id,
+                codon_cds_start,
+                transcript_id,
             )
             return (None, None, None, None, None)
 
         # Validate reference base matches FASTA
         actual_ref_base = ref_codon[codon_index]
         if actual_ref_base != ref:
-            logger.debug(
+            logger.warning(
                 "[CodonProvider] Ref mismatch at %s:%d: VCF=%s FASTA=%s (codon=%s idx=%d)",
-                chrom, pos, ref, actual_ref_base, ref_codon, codon_index,
+                chrom,
+                pos,
+                ref,
+                actual_ref_base,
+                ref_codon,
+                codon_index,
             )
 
         # Build mutant codon
@@ -487,7 +703,35 @@ class FastaCodonContextProvider:
         alt_aa = _translate(mut_codon_str)
 
         # Classify
-        if ref_aa == alt_aa:
+        # GUARD (2026-08-28, widened 2026-09-10): an undetermined amino acid
+        # ("?", from `_translate`'s codon-table fallback -- typically an "N"
+        # surviving into the reference FASTA at this codon) must never be
+        # read as a determined consequence of ANY kind, not just the
+        # equal-"?" "no change" misread the original guard covered (two
+        # unknowns are not evidence of sameness -- an "N" elsewhere in the
+        # same codon survives into BOTH ref_codon and mut_codon, so
+        # ref_aa == alt_aa == "?" used to satisfy the synonymous branch by
+        # plain string equality and fed BP7 benign evidence for a protein
+        # change nobody determined). A single-sided "?" is just as
+        # undetermined and was previously falling through this cascade's
+        # `else` to "missense" by elimination -- a confident consequence
+        # type manufactured from a codon that was never actually read, and
+        # exactly what routed it into the PS1/PM5 ClinVar lookup at
+        # orchestration/shared.py:352 (see clinvar/lookup.py's own "?" guard,
+        # which exists because this one didn't used to).
+        #
+        # "not_evaluated" is this provider's name for the honest-gap idiom
+        # the annotation layer already has for exactly this situation --
+        # `_map_consequence` (annotation/stage.py) maps any codon_change
+        # value it doesn't recognise (this one included) to
+        # CONSEQUENCE_NOT_DETERMINED for an SNV, which stage.py's own
+        # `var.consequence == "missense_variant"` gate (stage.py:1166) then
+        # keeps out of wildtype_aa/mutant_aa entirely, and which
+        # clinical_sections.py already renders as "Not determined" rather
+        # than a guessed classification.
+        if "?" in (ref_aa, alt_aa):
+            consequence = "not_evaluated"
+        elif ref_aa == alt_aa:
             consequence = "synonymous"
         elif alt_aa == "*":
             consequence = "stop_gained"
@@ -507,16 +751,44 @@ class FastaCodonContextProvider:
         cds_chain: List[CdsRecord],
         strand: str,
         codon_cds_start: int,
+        phase_offset: int = 0,
     ) -> Optional[str]:
         """Assemble three bases of the codon from the CDS chain.
 
         Args:
-            codon_cds_start: 0-based CDS coordinate of codon start.
+            codon_cds_start: codon start in PHASE-ADJUSTED CDS coordinates, as
+                produced by `_classify_snv_full` (`cds_pos = cds_offset +
+                pos_in_exon - _phase_offset`).
+            phase_offset: GFF3 phase of the first CDS exon -- the same value the
+                caller already subtracted.
 
         Returns:
             3-character reference codon string (sense strand), or None.
+
+        THE TWO COORDINATE SYSTEMS, AND WHY THIS ARGUMENT EXISTS.
+        The caller works in PHASE-ADJUSTED CDS coordinates: its position 0 is the
+        first base of the first COMPLETE codon. This method walks the exon chain
+        accumulating RAW exon lengths, so its `cds_cursor` counts from the first
+        base of the first CDS exon -- position 0 is the exon start, whatever the
+        phase. The two origins differ by exactly `phase`.
+
+        Before this argument existed, a phase-adjusted `codon_cds_start` was
+        consumed as though it were raw, so every codon of every transcript whose
+        first CDS exon has phase != 0 was read `phase` bases UPSTREAM of the true
+        codon. Confirmed by execution on both strands, phase 0 unaffected as a
+        control, and the second codon of the same exon wrong by the same
+        constant.
+
+        Translating once here, at the boundary between the two systems, is why
+        the fix is a single conversion rather than an adjustment inside each
+        strand branch: neither branch was wrong about anything except which
+        origin it was counting from. It is correct for multi-exon chains for the
+        same reason -- `cds_cursor` is raw throughout the walk.
         """
-        # Walk CDS chain collecting bases starting at codon_cds_start
+        # Convert to the RAW exon-offset coordinates this walk actually uses.
+        raw_cds_start = codon_cds_start + phase_offset
+
+        # Walk CDS chain collecting bases starting at raw_cds_start
         bases: List[str] = []
         cds_cursor = 0
 
@@ -526,14 +798,14 @@ class FastaCodonContextProvider:
             exon_len = exon.end - exon.start + 1
             exon_end_in_cds = cds_cursor + exon_len
 
-            if exon_end_in_cds <= codon_cds_start:
+            if exon_end_in_cds <= raw_cds_start:
                 cds_cursor += exon_len
                 continue
 
             # This exon contributes to our codon
             if strand == "+":
                 # Genomic start of needed bases
-                skip = max(0, codon_cds_start - cds_cursor)
+                skip = max(0, raw_cds_start - cds_cursor)
                 gstart = exon.start + skip
                 gend = min(exon.end, gstart + (3 - len(bases)))
                 if gend < gstart:
@@ -544,7 +816,7 @@ class FastaCodonContextProvider:
             else:
                 # Minus strand: exons in the chain are reversed above.
                 # Genomic coords: high end first.
-                skip = max(0, codon_cds_start - cds_cursor)
+                skip = max(0, raw_cds_start - cds_cursor)
                 gend = exon.end - skip
                 gstart = max(exon.start, gend - (3 - len(bases)) + 1)
                 if gstart > gend:
@@ -566,6 +838,7 @@ class FastaCodonContextProvider:
 
 # ── Factory function ──────────────────────────────────────────────────────────
 
+
 def make_codon_provider_from_cfg(cfg: Optional[dict]) -> "CodonContextProvider":  # noqa: F821
     """Create the best available CodonContextProvider from pipeline config.
 
@@ -579,11 +852,7 @@ def make_codon_provider_from_cfg(cfg: Optional[dict]) -> "CodonContextProvider":
     align_cfg = (cfg or {}).get("alignment", {}) or {}
 
     gff_path = ann_cfg.get("refseq_gff") or rna_cfg.get("refseq_gff") or ""
-    fasta_path = (
-        align_cfg.get("reference_fasta")
-        or (cfg or {}).get("reference_fasta")
-        or ""
-    )
+    fasta_path = align_cfg.get("reference_fasta") or (cfg or {}).get("reference_fasta") or ""
 
     if gff_path and fasta_path and os.path.isfile(gff_path) and os.path.isfile(fasta_path):
         try:

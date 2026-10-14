@@ -1,3 +1,25 @@
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: Performance benchmark for the gnomAD integration, run through the REAL
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 Performance benchmark for the gnomAD integration, run through the REAL
 `pipeline.gnomad.lookup.GnomadLookup` -> `CompositeGnomadProvider` ->
@@ -59,13 +81,17 @@ def _load_bench_variants() -> list:
                 continue
             fields = line.rstrip("\n").split("\t")
             chrom, pos, ref, alt = fields[0], int(fields[1]), fields[3], fields[4]
-            variants.append(Variant(chrom=chrom, pos=pos, variant_id=".", ref=ref, alt=alt, qual=None, filter_status=None))
+            variants.append(
+                Variant(chrom=chrom, pos=pos, variant_id=".", ref=ref, alt=alt, qual=None, filter_status=None)
+            )
     return variants
 
 
 def main() -> int:
     if not os.path.exists(_FIXTURE_PATH):
-        print(f"Benchmark fixture not found at {_FIXTURE_PATH}. Re-generate it (see this repo's test-data prep step) first.")
+        print(
+            f"Benchmark fixture not found at {_FIXTURE_PATH}. Re-generate it (see this repo's test-data prep step) first."
+        )
         return 1
 
     variants = _load_bench_variants()
@@ -105,7 +131,9 @@ def main() -> int:
     cache_hit_sources = sum(1 for r in results_d if r.get("source") == "cache")
 
     assert found_a == found_b == found_c, "All three cold-cache runs must agree on how many variants were found"
-    assert [r.get("found") for r in results_a] == [r.get("found") for r in results_d], "Cached results must match original"
+    assert [r.get("found") for r in results_a] == [r.get("found") for r in results_d], (
+        "Cached results must match original"
+    )
 
     print(f"Variants found in gnomAD fixture: {found_a} / {n}\n")
     print(f"{'Strategy':<32} {'Wall time':>12} {'Variants/sec':>14}")
@@ -117,11 +145,13 @@ def main() -> int:
         ("D: sequential, warm cache", elapsed_d),
     ):
         rate = n / elapsed if elapsed > 0 else float("inf")
-        print(f"{label:<32} {elapsed*1000:>10.1f}ms {rate:>12.1f}/s")
+        print(f"{label:<32} {elapsed * 1000:>10.1f}ms {rate:>12.1f}/s")
 
     print()
-    print(f"Cache: {cache_hit_sources}/{n} of run D's lookups served from cache "
-          f"(expect {n}/{n} -- every variant from run A should be warm).")
+    print(
+        f"Cache: {cache_hit_sources}/{n} of run D's lookups served from cache "
+        f"(expect {n}/{n} -- every variant from run A should be warm)."
+    )
     speedup_batch = elapsed_a / elapsed_b if elapsed_b > 0 else float("inf")
     speedup_cache = elapsed_a / elapsed_d if elapsed_d > 0 else float("inf")
     print(f"Batch (thread-pooled) vs sequential speedup: {speedup_batch:.1f}x")

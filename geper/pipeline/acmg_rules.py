@@ -21,9 +21,21 @@ Every triggered/not_triggered criterion carries: rationale, supporting
 evidence, conflicting evidence, evidence sources, and a qualitative
 confidence. Nothing here is invented -- every string is built from a field
 already present in an existing provider result dict (ClinVar, gnomAD,
-ClinGen, AlphaMissense, MMSplice, protein translation, InterPro, dbSNP).
+ClinGen, AlphaMissense, MMSplice, protein translation, InterPro).
 If the input evidence a rule needs is missing/skipped/errored, that rule
 reports "not_evaluated" rather than assuming a direction.
+
+dbSNP is NOT one of those sources, and never has been -- this line named
+it since the repository's initial commit (`cb79edc`) despite no criterion
+ever reading it; corrected 2026-09-10 (conv-providerlist) after the human
+asked for an authoritative provider list from the code and the mismatch
+surfaced. `dbsnp_result` IS a real, accepted parameter of `evaluate()`
+below, and IS read once -- but only as part of the infrastructure gate at
+`evidence_queries_completed` (this module's `_evidence_query_results`
+tuple, see `evaluate`'s own body), which decides `interpretation_outcome`
+(`pipeline/interpretation_outcome.py`), never a criterion's rationale
+string. That gate's inclusion of dbSNP is deliberate and under separate
+review, not part of this correction -- untouched here.
 
 This engine does NOT replace `InterpretationEngine.interpret()`'s existing
 `summary` / `confidence` / `significance_score` / `supporting_evidence`
@@ -33,12 +45,17 @@ touching any pre-existing key). This preserves backward compatibility for
 any caller that already consumes the older shape.
 """
 
+import enum
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from config import CONFIG
 from pipeline.gnomad.models import POPULATION_LABELS
+from pipeline.hgvs_utils import is_mitochondrial_chrom
+from pipeline.interpretation_outcome import determine_interpretation_outcome, determine_review_required_reasons
 from pipeline.ps1_pm5.decision import PS1PM5Evaluator, PS1PM5Thresholds
+from pipeline.ps1_pm5.models import PS1PM5Evaluation
+from pipeline.pvs1.models import TranscriptContext
 from pipeline.ps1_pm5.utils import matches_from_clinvar_codon_result
 from pipeline.pvs1.decision_tree import PVS1DecisionTree
 from pipeline.pvs1.models import (
@@ -51,10 +68,13 @@ from pipeline.pvs1.models import (
 )
 from pipeline.pvs1.utils import (
     PM4_IN_FRAME_INDEL,
+    alphamissense_evidence_sentence,
     build_pvs1_input,
     classify_pm4_variant,
+    CodingConsequenceDetail,
     coding_consequence_detail,
     lof_mechanism_from_clingen,
+    null_variant_term,
     population_af_from_gnomad,
     protein_effect_flags,
     protein_effect_undetermined_reason,
@@ -100,6 +120,509 @@ _STRENGTH = {
 _POINTS = {"stand_alone": 8, "very_strong": 8, "strong": 4, "moderate": 2, "supporting": 1}
 
 
+# ---------------------------------------------------------------------------
+# mtDNA compartment gate (round 14, B2)
+#
+# Round 8 rejected every chrM variant outright, before any evidence stage or
+# this engine ever ran, because the alternative was failing OPEN: a nuclear-
+# genome-calibrated criterion firing on evidence that is wrong for mtDNA (the
+# MT_TEST01 report's PM2 "absent from gnomAD" -- gnomAD's mitochondrial
+# callset was never queried at all -- and BP4 firing off MMSplice/Enformer/
+# Borzoi, all nuclear-splicing models scoring a genome with no spliceosome).
+# Round 14 replaces that whole-variant rejection with a compartment-aware
+# gate: a chrM variant now runs through `evaluate()` for real, but the 7
+# criteria below are pre-marked `not_evaluated`, with their own honest
+# reason, BEFORE their real methods ever run -- so none of them can fire on
+# a wrong-resource query. This extends the same "compute an applicability
+# reason before running a criterion's real logic" shape
+# `_pp3_bp4_inapplicability_reason` already established for a different
+# precondition (LOF/canonical-splice variants), rather than inventing a
+# second mechanism.
+#
+# Six more criteria (PS1, PM1, PM4, PM5, BP1, BP3) need a codon or protein-
+# length concept and are additionally gated -- but only for the 24
+# mitochondrial genes with no protein-coding transcript at all (22 tRNA + 2
+# rRNA genes), never for the 13 protein-coding ones. Gene class is derived
+# from the real Ensembl `biotype` `pipeline/pvs1/lookup.py::TranscriptLookup`
+# now surfaces on `transcript_result["gene_biotype"]` (round 14, B2) --
+# never a hardcoded gene-name list, so a future Ensembl annotation change or
+# gene-symbol alias can't silently go stale here.
+_MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS: Dict[str, str] = {
+    "PVS1": (
+        "PVS1's null-variant/loss-of-function framework assumes nuclear diploidy "
+        "(haploinsufficiency, nonsense-mediated decay) -- mtDNA is polyplasmic (hundreds to "
+        "thousands of copies per cell) and pathogenicity is heteroplasmy-threshold-driven, not "
+        "haploinsufficiency-driven. The ACMG/AMP mitochondrial DNA specification (McCormick et al. "
+        "2020) defines PVS1 differently per mitochondrial gene class (protein-coding/tRNA/rRNA); "
+        "GEPER does not implement that mtDNA-specific version, so PVS1 is not evaluated for this "
+        "compartment rather than applying the nuclear framework where it does not hold."
+    ),
+    "PM2": (
+        "pipeline/gnomad/provider.py's _DATASET_BY_BUILD only holds gnomAD's nuclear SNV/indel "
+        "datasets (gnomad_r4 / gnomad_r2_1) -- gnomAD's separate mitochondrial callset is never "
+        "queried. An 'absent from gnomAD' result for a mitochondrial variant is a query-target gap "
+        "(the wrong resource was asked), not a rarity signal, and must not be read as PM2 evidence."
+    ),
+    "BA1": (
+        "pipeline/gnomad/provider.py's _DATASET_BY_BUILD only holds gnomAD's nuclear SNV/indel "
+        "datasets (gnomad_r4 / gnomad_r2_1) -- gnomAD's separate mitochondrial callset is never "
+        "queried, so no real population-frequency evidence exists here for BA1's stand-alone-benign "
+        "threshold to compare against."
+    ),
+    "BS1": (
+        "pipeline/gnomad/provider.py's _DATASET_BY_BUILD only holds gnomAD's nuclear SNV/indel "
+        "datasets (gnomad_r4 / gnomad_r2_1) -- gnomAD's separate mitochondrial callset is never "
+        "queried, so no real population-frequency evidence exists here for BS1's threshold to "
+        "compare against."
+    ),
+    "PP3": (
+        "AlphaMissense's catalogue has no rows for mitochondrially-encoded genes, and MMSplice / "
+        "the Enformer-Borzoi ensemble are trained exclusively on nuclear pre-mRNA splicing -- mtDNA "
+        "transcripts are not spliced (no spliceosome, no introns), so neither predictor has any "
+        "meaning here."
+    ),
+    "BP4": (
+        "AlphaMissense's catalogue has no rows for mitochondrially-encoded genes, and MMSplice / "
+        "the Enformer-Borzoi ensemble are trained exclusively on nuclear pre-mRNA splicing -- mtDNA "
+        "transcripts are not spliced (no spliceosome, no introns), so neither predictor has any "
+        "meaning here, in the benign direction any more than the pathogenic one."
+    ),
+    "BP7": (
+        "BP7's synonymous-variant-has-no-splice-impact evidence is scored by the same MMSplice / "
+        "SpliceFormer / SpliceBERT models used for PP3/BP4 -- all nuclear-trained splice predictors "
+        "with no meaning for a genome that has no spliceosome."
+    ),
+}
+
+# The 6 criteria that need a codon/protein-length concept -- gated further,
+# but only for confirmed non-protein-coding mitochondrial genes (see the
+# section docstring above).
+_MTDNA_PROTEIN_DEPENDENT_CODES = ("PS1", "PM1", "PM4", "PM5", "BP1", "BP3")
+
+# Round 14, B3: fixes a factual error in round 14 B2's disclaimer, caught
+# on review. The original text said "of the remaining 12, only those with a
+# protein-coding transcript for this gene actually ran" -- false: only 6 of
+# those 12 (`_MTDNA_PROTEIN_DEPENDENT_CODES`) need a protein-coding
+# transcript. The other 6 (PS3, BS3, PP1, PP4, BS4, BP6) apply to ANY
+# mitochondrial gene class and ran on the MT-TL1 (tRNA) case exactly as they
+# ran on the MT-ATP6 (protein-coding) case -- the rendered per-criterion
+# table already proved this; the disclaimer's prose just didn't match it.
+# On a signed clinical document, understating what was actually evaluated
+# is the opposite of this round's purpose.
+#
+# Rendered on every mitochondrial finding (Markdown, full PDF, short PDF),
+# not report-level -- a clinical reviewer reads findings, not preambles.
+# Now a function of `transcript_result` (already available to every
+# renderer via `variant_result["transcript"]`, no new plumbing) rather than
+# a fixed string, so the wording states what actually happened for THIS
+# finding's gene class instead of describing both cases generically every
+# time. Counts are round 14 B1's own corrected numbers, restated verbatim:
+# 28 total ACMG/AMP criteria, 9 GEPER never evaluates for any variant (no
+# data source integrated), 19 remain "live", of which 7 are inapplicable to
+# the mitochondrial compartment specifically
+# (`_MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS`) and 12 can in principle run,
+# 6 of those unconditionally (`_MTDNA_UNGATED_APPLICABLE_CODES`) and 6 only
+# for a protein-coding gene (`_MTDNA_PROTEIN_DEPENDENT_CODES`).
+_MTDNA_UNGATED_APPLICABLE_CODES = ("PS3", "BS3", "PP1", "PP4", "BS4", "BP6")
+
+
+def _mtdna_gene_class(transcript_result: Optional[Dict[str, Any]]) -> Optional[str]:
+    """`"protein_coding"` / the real Ensembl biotype string / `None`
+    (undetermined) -- see `_mtdna_rna_gene_reason` for the same read of
+    `transcript_result`."""
+    transcript_result = transcript_result or {}
+    if transcript_result.get("found") and transcript_result.get("transcript"):
+        return "protein_coding"
+    return transcript_result.get("gene_biotype")
+
+
+_ALL_CRITERION_CODES = tuple(_STRENGTH.keys())  # the fixed 28, in this module's own declared order
+
+
+def _mtdna_disclaimer_middle_from_breakdown(gene_class: Optional[str], breakdown: Dict[str, List[str]]) -> str:
+    """
+    Builds the disclaimer's middle clause directly from
+    `not_evaluated_breakdown`'s actual per-finding category lists (round
+    16), not from a static assumption of which codes are gated. Codes
+    that are neither `NOT_INTEGRATED` nor gated for this finding's
+    compartment/gene-class are, by elimination against the fixed
+    28-criterion set, the ones that ran their real per-criterion logic
+    -- whether they ended up triggered, not_triggered, or genuinely
+    `DATA_UNAVAILABLE` for this specific variant's own evidence. This is
+    what keeps the "were evaluated for real" claim honest without
+    needing to also thread triggered/not_triggered counts through here:
+    "ran for real" and "produced a determinate triggered/not_triggered
+    result" are different claims, and this function only ever asserts
+    the former.
+    """
+
+    def _ordered(codes: List[str]) -> List[str]:
+        return sorted(set(codes), key=lambda c: _ALL_CRITERION_CODES.index(c) if c in _ALL_CRITERION_CODES else 999)
+
+    not_integrated = _ordered(breakdown[NotEvaluatedReason.NOT_INTEGRATED.value])
+    compartment = _ordered(breakdown[NotEvaluatedReason.COMPARTMENT_INAPPLICABLE.value])
+    gene_class_codes = _ordered(breakdown[NotEvaluatedReason.GENE_CLASS_INAPPLICABLE.value])
+    gated = set(not_integrated) | set(compartment) | set(gene_class_codes)
+    ran_for_real = _ordered([c for c in _ALL_CRITERION_CODES if c not in gated])
+
+    compartment_clause = (
+        f"a further {len(compartment)} are inapplicable specifically to the mitochondrial compartment "
+        f"({', '.join(compartment)} -- each marked not_evaluated below with its own stated reason)"
+    )
+    if gene_class_codes:
+        return (
+            f"{compartment_clause}, and {len(gene_class_codes)} more ({', '.join(gene_class_codes)}) are "
+            f"inapplicable for this specific gene because it has no protein-coding transcript (Ensembl biotype "
+            f"'{gene_class}' -- 22 of the 37 mitochondrial genes encode tRNAs, 2 encode rRNAs; this is "
+            f"mitochondrial gene biology, not a missing lookup). The remaining {len(ran_for_real)} "
+            f"({', '.join(ran_for_real)}) were still evaluated for real, since they apply to any mitochondrial "
+            "gene class."
+        )
+    if gene_class == "protein_coding":
+        return (
+            f"{compartment_clause}. The remaining {len(ran_for_real)} ({', '.join(ran_for_real)}) were "
+            "evaluated for real against this gene's protein-coding transcript."
+        )
+    return (
+        f"{compartment_clause}. Of the remaining {len(ran_for_real)}, these ({', '.join(ran_for_real)}) apply to "
+        "any mitochondrial gene class and were evaluated for real; whether a protein-coding transcript exists "
+        "for this specific gene could not be confirmed for this variant."
+    )
+
+
+# The exact ACMG/AMP codes GEPER structurally never integrates a data
+# source for, regardless of variant/gene/compartment -- NotEvaluatedReason
+# .NOT_INTEGRATED's own case, see that enum's docstring below. Named here,
+# rather than the literal digit `mtdna_interpretation_disclaimer` used to
+# print, because that function's OWN docstring already records this exact
+# partition diverging once before (round 16, between this disclaimer's
+# middle clause and a separate report surface) -- the middle clause was
+# fixed to read from `not_evaluated_breakdown()`, but the outer "9" stayed
+# a hand-typed literal. This tuple is cross-checked against a real
+# `ACMGRuleEngine().evaluate()` run's actual NOT_INTEGRATED set in
+# tests/test_round16_not_evaluated_categories.py::
+# test_never_integrated_constant_matches_the_real_rule_set, so a rule
+# implementation change that adds/removes a NOT_INTEGRATED code fails that
+# test before this disclaimer's count can go stale silently.
+_NEVER_INTEGRATED_ACMG_CODES = ("PS2", "PM3", "PM6", "PP2", "PP5", "BS2", "BP2", "BP5", "PS4")
+
+
+def mtdna_interpretation_disclaimer(
+    transcript_result: Optional[Dict[str, Any]] = None,
+    not_evaluated_rules: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    The full-length per-finding mtDNA disclaimer (Markdown, full PDF).
+    Adapts its middle clause to this finding's actual gene class -- see
+    this module's own comment above for why a fixed string was wrong.
+
+    Round 16: when `not_evaluated_rules` (this finding's actual
+    `CriterionResult.to_dict()` list, e.g. `ir["not_evaluated_rules"]`)
+    is supplied, the middle clause's counts and code lists are computed
+    from `not_evaluated_breakdown` of that real data -- the same
+    function `report/clinical_report_builder.py`'s accounting/
+    Limitations text now also reads, so the two surfaces cannot
+    re-diverge the way they did before this round (the disclaimer
+    correctly partitioned the 28 criteria; the accounting text described
+    all of `not_evaluated_rules` with one blanket "missing data
+    sources" phrase, false for the compartment/gene-class-inapplicable
+    ones). When `not_evaluated_rules` is omitted (older callers, or a
+    caller that only has `transcript_result`), this falls back to the
+    same gene-class-only inference round 14 B3 established -- produces
+    identical text to the data-driven path for the expected case, but
+    degrades honestly rather than crashing when the real per-criterion
+    breakdown isn't available.
+    """
+    gene_class = _mtdna_gene_class(transcript_result)
+    if not_evaluated_rules is not None:
+        middle = _mtdna_disclaimer_middle_from_breakdown(gene_class, not_evaluated_breakdown(not_evaluated_rules))
+    elif gene_class == "protein_coding":
+        middle = (
+            "a further 7 are inapplicable specifically to the mitochondrial compartment (PVS1, PM2, "
+            "BA1, BS1, PP3, BP4, BP7 -- each marked not_evaluated below with its own stated reason). "
+            "The remaining 12 (PS1, PM1, PM4, PM5, BP1, BP3, PS3, BS3, PP1, PP4, BS4, BP6) were "
+            "evaluated for real against this gene's protein-coding transcript."
+        )
+    elif gene_class:
+        middle = (
+            "a further 7 are inapplicable specifically to the mitochondrial compartment (PVS1, PM2, "
+            "BA1, BS1, PP3, BP4, BP7), and 6 more (PS1, PM1, PM4, PM5, BP1, BP3) are inapplicable for "
+            f"this specific gene because it has no protein-coding transcript (Ensembl biotype "
+            f"'{gene_class}' -- 22 of the 37 mitochondrial genes encode tRNAs, 2 encode rRNAs; this "
+            "is mitochondrial gene biology, not a missing lookup). The remaining 6 (PS3, BS3, PP1, "
+            "PP4, BS4, BP6) were still evaluated for real, since they apply to any mitochondrial gene "
+            "class."
+        )
+    else:
+        middle = (
+            "a further 7 are inapplicable specifically to the mitochondrial compartment (PVS1, PM2, "
+            "BA1, BS1, PP3, BP4, BP7). Of the remaining 12, 6 (PS3, BS3, PP1, PP4, BS4, BP6) apply to "
+            "any mitochondrial gene class and were evaluated for real; the other 6 (PS1, PM1, PM4, "
+            "PM5, BP1, BP3) additionally need a protein-coding transcript for this specific gene, "
+            "which could not be confirmed for this variant."
+        )
+    return (
+        "Mitochondrial (mtDNA) compartment notice: this variant is on the mitochondrial genome. Of "
+        f"the 28 standard ACMG/AMP criteria, GEPER never evaluates {len(_NEVER_INTEGRATED_ACMG_CODES)} "
+        f"for any variant (no data source integrated), and {middle} This evaluation does NOT incorporate "
+        "heteroplasmy level, maternal inheritance pattern, tissue distribution, or MITOMAP. ACMG/AMP has "
+        "a separate mitochondrial DNA variant interpretation specification (McCormick et al. 2020) that "
+        "this evaluation does not fully implement. The classification below reflects only the criteria "
+        "GEPER actually evaluated for this compartment -- it is not a complete, mtDNA-specification-"
+        "compliant interpretation."
+    )
+
+
+def mtdna_interpretation_disclaimer_short(
+    transcript_result: Optional[Dict[str, Any]] = None,
+    not_evaluated_rules: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Compact one-line form for the short PDF's tight per-variant space
+    budget -- same substance (heteroplasmy/inheritance/tissue/MITOMAP not
+    incorporated, separate mtDNA spec not fully implemented) plus a short,
+    still gene-class-accurate clause on what actually ran; no criterion
+    counts (the full PDF/Markdown carry those). `not_evaluated_rules` is
+    accepted for signature symmetry with `mtdna_interpretation_disclaimer`
+    and to keep both disclaimers reading from the same data when a caller
+    has it, even though this compact form doesn't print per-category
+    counts."""
+    gene_class = _mtdna_gene_class(transcript_result)
+    if gene_class == "protein_coding":
+        scope = "criteria needing a protein-coding transcript ran for this gene"
+    elif gene_class:
+        scope = f"only gene-class-independent criteria ran (biotype '{gene_class}', no protein-coding transcript)"
+    else:
+        scope = "gene-class-independent criteria ran; protein-dependent criteria could not be confirmed"
+    return (
+        f"Mitochondrial (mtDNA) finding: {scope}. Does not incorporate heteroplasmy level, maternal "
+        "inheritance, tissue distribution, or MITOMAP; ACMG/AMP's separate mtDNA specification "
+        "(McCormick et al. 2020) is not fully implemented. Not a complete mtDNA-specification-"
+        "compliant interpretation."
+    )
+
+
+_MTDNA_EVIDENCE_SKIP_REASON = (
+    "this variant is on the mitochondrial genome; this evidence source has no validity for mtDNA "
+    "(see pipeline/acmg_rules.py's mtDNA compartment gate) and was never queried."
+)
+
+_MTDNA_GNOMAD_SKIP_REASON = (
+    "this variant is on the mitochondrial genome; gnomAD's mitochondrial callset is a separate "
+    "resource from the nuclear dataset this pipeline queries "
+    "(pipeline/gnomad/provider.py::_DATASET_BY_BUILD), and was never queried."
+)
+
+
+def mtdna_gnomad_skip_result() -> Dict[str, Any]:
+    """`pipeline/orchestrator.py::_process_variant`'s replacement for a
+    real `_run_gnomad_stage` call on a mitochondrial variant -- gnomAD's
+    nuclear-only dataset is never queried at all, not merely ignored once
+    a (wrong-resource) result comes back. A small, standalone,
+    lightweight function (rather than inline in `_process_variant`) so it
+    can be unit-tested without importing `pipeline.orchestrator`, whose
+    module-level imports pull in a multi-minute TensorFlow/absl chain."""
+    return {"found": False, "skipped": True, "reason": _MTDNA_GNOMAD_SKIP_REASON}
+
+
+def mtdna_alphamissense_skip_result() -> Dict[str, Any]:
+    """As `mtdna_gnomad_skip_result`, for `_run_alphamissense_stage`."""
+    return {"skipped": True, "reason": _MTDNA_EVIDENCE_SKIP_REASON}
+
+
+def mtdna_mmsplice_skip_result() -> Dict[str, Any]:
+    """As `mtdna_gnomad_skip_result`, for `_run_mmsplice_stage`."""
+    return {
+        "supported": False,
+        "predicted": False,
+        "skip_reason": _MTDNA_EVIDENCE_SKIP_REASON,
+        "interpretation": _MTDNA_EVIDENCE_SKIP_REASON,
+    }
+
+
+def mtdna_ensemble_skip_result() -> Dict[str, Any]:
+    """As `mtdna_gnomad_skip_result`, for `_run_ensemble_stage`
+    (Enformer/Borzoi)."""
+    return {
+        "models_used": [],
+        "individual_scores": {},
+        "consensus_score": None,
+        "confidence": None,
+        "agreement_percentage": None,
+        "classification": None,
+        "basis": "mitochondrial_compartment",
+        "reasoning": _MTDNA_EVIDENCE_SKIP_REASON,
+    }
+
+
+def mtdna_splice_plugin_skip_result() -> Dict[str, Any]:
+    """As `mtdna_gnomad_skip_result`, for
+    `_run_standalone_splice_plugin_stage` (SpliceFormer/SpliceBERT)."""
+    return {"available": False, "classification": None, "skip_reason": _MTDNA_EVIDENCE_SKIP_REASON}
+
+
+def non_protein_coding_gene_biotype(transcript_result: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Returns Ensembl's own confirmed non-`protein_coding` biotype string
+    for this variant's gene (e.g. `"Mt_tRNA"`, `"lncRNA"`), or `None`
+    when a real protein-coding transcript resolved, or when gene class
+    genuinely could not be determined (unknown is not the same claim as
+    "confirmed non-coding" -- a caller must not treat this `None` as
+    "assume protein-coding").
+
+    Round 16: pulled out of `_mtdna_rna_gene_reason` (which used to
+    inline this exact check) so `pipeline/orchestrator.py` can gate
+    UniProt/InterPro/AlphaFold queries the same honest way for ANY
+    gene with no protein product -- not just mitochondrial tRNA/rRNA
+    genes. A nuclear ncRNA gene has exactly the same "no protein
+    exists, this is not a failed lookup" property McCormick-style mtDNA
+    reasoning already established for the ACMG engine.
+    """
+    transcript_result = transcript_result or {}
+    if transcript_result.get("found") and transcript_result.get("transcript"):
+        return None  # a real protein-coding transcript resolved -- let it run
+    biotype = transcript_result.get("gene_biotype")
+    if not biotype or biotype == "protein_coding":
+        return None  # unknown, or (contradictorily) protein_coding with no transcript -- don't overclaim
+    return cast(str, biotype)
+
+
+def non_protein_coding_gene_reason(transcript_result: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Honest, biotype-backed reason that a gene has no protein product for
+    UniProt/InterPro/AlphaFold to resolve, or `None` when this cannot be
+    confirmed (see `non_protein_coding_gene_biotype`). Not mtDNA-specific
+    -- see that function's docstring.
+    """
+    biotype = non_protein_coding_gene_biotype(transcript_result)
+    if biotype is None:
+        return None
+    gene_symbol = (transcript_result or {}).get("gene_symbol") or "this gene"
+    return (
+        f"{gene_symbol} is annotated by Ensembl as biotype '{biotype}', not protein_coding -- this gene has "
+        "no protein product, so there is no UniProt entry, InterPro/Pfam domain annotation, or AlphaFold DB "
+        "structure to resolve. This is gene biology, not a failed lookup."
+    )
+
+
+def _mtdna_rna_gene_reason(code: str, transcript_result: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Returns an honest, biotype-backed reason to gate `code` (one of
+    `_MTDNA_PROTEIN_DEPENDENT_CODES`) for this mitochondrial variant's gene,
+    or `None` when the criterion should run its real logic (a real
+    protein-coding transcript was resolved) or when gene class genuinely
+    could not be determined (in which case each criterion's own existing
+    "protein consequence could not be determined" fallback already applies
+    -- honest on its own, and not overclaiming a biology fact this function
+    cannot confirm).
+    """
+    biotype = non_protein_coding_gene_biotype(transcript_result)
+    if biotype is None:
+        return None
+    gene_symbol = (transcript_result or {}).get("gene_symbol") or "this gene"
+    return (
+        f"{gene_symbol} is annotated by Ensembl as biotype '{biotype}', not protein_coding -- {code} "
+        "requires a codon / amino-acid-change or protein-length concept that does not exist for this "
+        "gene. This is mitochondrial gene biology (22 of the 37 mitochondrial genes encode tRNAs and "
+        "2 encode rRNAs, with no coding sequence at all), not a missing lookup."
+    )
+
+
+class NotEvaluatedReason(str, enum.Enum):
+    """
+    Round 16: why a criterion's `status` is `"not_evaluated"` is not one
+    fact -- it was already a distinct free-text `rationale` per call site
+    (round 14 B2's mtDNA gate reasons vs. the 9 GEPER-wide "not
+    integrated" reasons vs. a genuine per-variant lookup gap), but that
+    distinction lived only in prose, discarded by every renderer that
+    grouped `not_evaluated_rules` into one bucket and described it with a
+    single fixed phrase ("could not be evaluated due to missing data
+    sources") -- which is true for some of these and flatly false for
+    others (a criterion this pipeline structurally never applies to a
+    compartment/gene-class was never "missing data", it was never
+    applicable). Same shape as `pipeline/stage_schemas.py::StageStatus`/
+    `pipeline/provenance.py::VersionStatus`: encode the distinction in
+    the type system so a renderer cannot re-collapse it by omission.
+
+    Five, not four -- each maps to a genuinely different sentence a
+    report can honestly print:
+      - NOT_INTEGRATED: GEPER has never integrated the data source this
+        criterion needs, for any variant (e.g. PS2's trio-sequencing
+        data, PS4's case-frequency cohort). Not variant-specific.
+      - COMPARTMENT_INAPPLICABLE: structurally inapplicable to this
+        variant's genomic compartment (currently: the 7 mtDNA-gated
+        criteria in `_MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS`). GEPER
+        *could* integrate the right resource for another compartment;
+        it is simply the wrong resource for this one.
+      - GENE_CLASS_INAPPLICABLE: structurally inapplicable to this
+        gene's biotype/class (currently: the 6 protein-dependent mtDNA
+        criteria, gated on a confirmed non-protein-coding Ensembl
+        biotype). Not mtDNA-specific in principle -- any gene with no
+        protein-coding transcript has the same property -- but this is
+        the only gate that currently exists.
+      - CONSEQUENCE_INAPPLICABLE: structurally inapplicable given this
+        variant's own already-determined protein consequence (round 29;
+        currently: `_pp3_bp4_inapplicability_reason`'s gate -- a
+        frameshift, nonsense, or canonical +-1/+-2 splice-site variant's
+        loss-of-function consequence is fixed by the transcript reading
+        frame itself, so PP3/BP4's missense/conservation/splicing
+        computational predictors are moot regardless of what they'd
+        say). Distinct from `DATA_UNAVAILABLE`: even a fully successful,
+        high-confidence predictor query would not change the outcome
+        here -- the criterion is inapplicable by construction, not by a
+        data gap. Distinct from `COMPARTMENT_INAPPLICABLE`/
+        `GENE_CLASS_INAPPLICABLE`: those turn on the variant's
+        compartment or the gene's biotype; this turns on the variant's
+        own coding consequence within an otherwise-eligible
+        protein-coding, nuclear gene.
+      - DATA_UNAVAILABLE: GEPER has this evidence source integrated and
+        queried it for this specific variant, but the query returned
+        nothing usable (skipped/errored/no match). The one category
+        that is honestly described as "a data source gap for this
+        variant" -- the default, since most `_not_evaluated` call sites
+        are exactly this.
+    """
+
+    NOT_INTEGRATED = "not_integrated"
+    COMPARTMENT_INAPPLICABLE = "compartment_inapplicable"
+    GENE_CLASS_INAPPLICABLE = "gene_class_inapplicable"
+    CONSEQUENCE_INAPPLICABLE = "consequence_inapplicable"
+    DATA_UNAVAILABLE = "data_unavailable"
+
+
+def not_evaluated_breakdown(not_evaluated_rules: Optional[List[Dict[str, Any]]]) -> Dict[str, List[str]]:
+    """
+    Groups a criteria evaluation's `not_evaluated_rules`/
+    `not_evaluated_criteria` list (`CriterionResult.to_dict()` output --
+    see `pipeline/interpretation_result.py`) by `NotEvaluatedReason`
+    category, keyed by category value with every category present (even
+    if empty) so callers never need a `.get(..., [])` default.
+
+    This is the single source both the per-finding mtDNA disclaimer
+    (`mtdna_interpretation_disclaimer`) and the report's own accounting
+    (`report/clinical_report_builder.py`'s executive-summary sentence and
+    Limitations paragraph) read from -- round 16's fix for the two
+    surfaces contradicting each other (the disclaimer honestly
+    partitioned the 28 criteria; the accounting/Limitations text
+    described all `not_evaluated` criteria with one blanket "missing
+    data sources" phrase, which is true for `DATA_UNAVAILABLE` and
+    flatly false for the other four categories). Both surfaces calling
+    this same function on the same list is what makes them structurally
+    unable to diverge again, rather than two independent descriptions of
+    the same underlying evaluation that happen to agree today.
+
+    A rule with no `category` key (a `CriterionResult` built without
+    going through `_not_evaluated`, or an older cached result predating
+    round 16) falls into `DATA_UNAVAILABLE` -- the same default
+    `_not_evaluated` itself applies, never a fabricated guess at which
+    of the other three it might have been.
+    """
+    breakdown: Dict[str, List[str]] = {reason.value: [] for reason in NotEvaluatedReason}
+    for rule in not_evaluated_rules or []:
+        category = rule.get("category") or NotEvaluatedReason.DATA_UNAVAILABLE.value
+        breakdown.setdefault(category, []).append(rule.get("code", "?"))
+    return breakdown
+
+
 @dataclass
 class CriterionResult:
     code: str
@@ -111,6 +634,11 @@ class CriterionResult:
     conflicting_evidence: List[str] = field(default_factory=list)
     evidence_sources: List[str] = field(default_factory=list)
     confidence: Optional[str] = None  # "High" | "Moderate" | "Low"
+    # Only meaningful when status == "not_evaluated" -- see
+    # `NotEvaluatedReason`'s own docstring. `None` for triggered/
+    # not_triggered criteria (the distinction this field draws doesn't
+    # apply to them).
+    category: Optional[str] = None
     # Optional per-criterion detail block for rules whose reasoning is a
     # multi-step decision tree rather than a single threshold test (so
     # far: PVS1, which carries its full ClinGen SVI decision path and
@@ -138,6 +666,8 @@ class CriterionResult:
         }
         if self.details is not None:
             payload["details"] = self.details
+        if self.category is not None:
+            payload["category"] = self.category
         return payload
 
 
@@ -226,7 +756,15 @@ def _at_codon(codon_number: Optional[int]) -> str:
     return f" at codon {codon_number}" if codon_number is not None else ""
 
 
-def _not_evaluated(code: str, reason: str) -> CriterionResult:
+def _not_evaluated(
+    code: str, reason: str, category: NotEvaluatedReason = NotEvaluatedReason.DATA_UNAVAILABLE
+) -> CriterionResult:
+    """`category` defaults to `DATA_UNAVAILABLE` -- accurate for the
+    large majority of call sites (a real, integrated evidence source was
+    queried for this specific variant and came back empty/skipped/
+    errored). Call sites for GEPER-wide unintegrated criteria or the
+    mtDNA compartment/gene-class gates pass an explicit category instead
+    -- see `NotEvaluatedReason`'s own docstring."""
     direction, strength = _STRENGTH[code]
     return CriterionResult(
         code=code,
@@ -234,15 +772,27 @@ def _not_evaluated(code: str, reason: str) -> CriterionResult:
         strength=strength,
         status="not_evaluated",
         rationale=f"Not evaluated: {reason}",
+        category=category.value,
     )
 
 
 class ACMGRuleEngine:
     """
-    Evaluates every ACMG/AMP 2015 criterion independently from the same
+    Evaluates each ACMG/AMP 2015 criterion independently from the same
     provider-result dicts the orchestrator already collects, and combines
-    the triggered ones into a classification via the standard Richards et
-    al. point-based combining rules.
+    the triggered ones into a classification via Tavtigian et al. 2018's
+    Bayesian-calibrated point system -- see `_combine`.
+
+    The combining rules are NOT Richards et al. 2015's. This module's own
+    comment above `_STRENGTH` and `_combine`'s comment both name Tavtigian
+    2018 (PMID 29300386) and say explicitly that it is not a threshold
+    approximation of Richards, whose 2015 scheme is a categorical lookup
+    table and not a point system at all -- the two do not always agree,
+    and GEPER follows Tavtigian.
+
+    Note also that not every criterion is reachable: the nine codes in
+    `_NEVER_INTEGRATED_ACMG_CODES` have no integrated data source and
+    always return "not_evaluated".
     """
 
     def evaluate(
@@ -283,7 +833,34 @@ class ACMGRuleEngine:
             None if protein_flags.determined else protein_effect_undetermined_reason(variant_dict, transcript_result)
         )
 
-        criteria["PVS1"] = self._pvs1(
+        # mtDNA compartment gate (round 14, B2) -- see this module's
+        # `_MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS`/`_mtdna_rna_gene_reason`
+        # docstrings above for the full rationale. Computed once, from the
+        # same `variant_dict` every other criterion below already receives.
+        is_mtdna = is_mitochondrial_chrom((variant_dict or {}).get("chrom"))
+
+        def _mtdna_gate(code: str) -> Optional[CriterionResult]:
+            """`_not_evaluated(code, ...)` when `code` is structurally
+            inapplicable to this mtDNA variant, else `None` (run the real
+            method)."""
+            if is_mtdna and code in _MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS:
+                return _not_evaluated(
+                    code,
+                    _MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS[code],
+                    category=NotEvaluatedReason.COMPARTMENT_INAPPLICABLE,
+                )
+            return None
+
+        def _mtdna_protein_dependent_gate(code: str) -> Optional[CriterionResult]:
+            """As `_mtdna_gate`, for the 6 criteria that additionally need
+            gating on non-protein-coding mitochondrial genes specifically
+            (see `_mtdna_rna_gene_reason`)."""
+            if not is_mtdna:
+                return None
+            reason = _mtdna_rna_gene_reason(code, transcript_result)
+            return _not_evaluated(code, reason, category=NotEvaluatedReason.GENE_CLASS_INAPPLICABLE) if reason else None
+
+        criteria["PVS1"] = _mtdna_gate("PVS1") or self._pvs1(
             variant_dict=variant_dict,
             protein_result=protein_result,
             clingen_result=clingen_result,
@@ -292,36 +869,46 @@ class ACMGRuleEngine:
             transcript_result=transcript_result,
             mmsplice_result=mmsplice_result,
         )
-        criteria["PS1"] = self._ps1(
+        criteria["PS1"] = _mtdna_protein_dependent_gate("PS1") or self._ps1(
             variant_dict=variant_dict,
             transcript_result=transcript_result,
             clinvar_codon_result=clinvar_codon_result,
         )
-        criteria["PM5"] = self._pm5(
+        criteria["PM5"] = _mtdna_protein_dependent_gate("PM5") or self._pm5(
             variant_dict=variant_dict,
             transcript_result=transcript_result,
             clinvar_codon_result=clinvar_codon_result,
         )
-        criteria["PM1"] = self._pm1(interpro_result, is_synonymous=is_synonymous)
-        criteria["PM2"] = self._pm2(gnomad_result)
-        criteria["PM4"] = self._pm4(
+        criteria["PM1"] = _mtdna_protein_dependent_gate("PM1") or self._pm1(
+            interpro_result, is_synonymous=is_synonymous
+        )
+        criteria["PM2"] = _mtdna_gate("PM2") or self._pm2(gnomad_result)
+        criteria["PM4"] = _mtdna_protein_dependent_gate("PM4") or self._pm4(
             variant_dict=variant_dict,
             transcript_result=transcript_result,
             uniprot_result=uniprot_result,
         )
         criteria["PS4"] = self._ps4(gnomad_result)
         pvs1_null_variant_type = (criteria["PVS1"].details or {}).get("null_variant_type")
-        criteria["PP3"], criteria["BP4"] = self._pp3_bp4(
-            alphamissense_result,
-            mmsplice_result,
-            ensemble_result,
-            conservation_result,
-            protein_flags=protein_flags,
-            null_variant_type=pvs1_null_variant_type,
-            variant_dict=variant_dict,
-        )
-        criteria["BA1"], criteria["BS1"] = self._ba1_bs1(gnomad_result)
-        criteria["BP7"] = self._bp7(
+        pp3, bp4 = _mtdna_gate("PP3"), _mtdna_gate("BP4")
+        if pp3 is not None and bp4 is not None:
+            criteria["PP3"], criteria["BP4"] = pp3, bp4
+        else:
+            criteria["PP3"], criteria["BP4"] = self._pp3_bp4(
+                alphamissense_result,
+                mmsplice_result,
+                ensemble_result,
+                conservation_result,
+                protein_flags=protein_flags,
+                null_variant_type=pvs1_null_variant_type,
+                variant_dict=variant_dict,
+            )
+        ba1, bs1 = _mtdna_gate("BA1"), _mtdna_gate("BS1")
+        if ba1 is not None and bs1 is not None:
+            criteria["BA1"], criteria["BS1"] = ba1, bs1
+        else:
+            criteria["BA1"], criteria["BS1"] = self._ba1_bs1(gnomad_result)
+        criteria["BP7"] = _mtdna_gate("BP7") or self._bp7(
             is_synonymous,
             mmsplice_result,
             spliceformer_result,
@@ -332,15 +919,21 @@ class ACMGRuleEngine:
         criteria["BS4"] = self._bs4(clingen_result)
         criteria["PS3"] = self._ps3(functional_evidence_result)
         criteria["BS3"] = self._bs3(functional_evidence_result)
-        criteria["BP1"] = self._bp1(
+        criteria["BP1"] = _mtdna_protein_dependent_gate("BP1") or self._bp1(
             is_missense,
             clingen_result,
             undetermined_reason=protein_undetermined_reason,
-            alphamissense_result=alphamissense_result,
+            # AlphaMissense is gated at this same compartment check (not
+            # inside models/alphamissense.py, which has no ACMG-criterion
+            # awareness) -- its catalogue has no mitochondrial rows at all
+            # (see _MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS["PP3"]), so a
+            # real but empty `not_found` result must not silently become
+            # BP1 evidence here either.
+            alphamissense_result=None if is_mtdna else alphamissense_result,
             pm1_result=criteria["PM1"],
             bs3_result=criteria["BS3"],
         )
-        criteria["BP3"] = self._bp3(
+        criteria["BP3"] = _mtdna_protein_dependent_gate("BP3") or self._bp3(
             variant_dict=variant_dict,
             transcript_result=transcript_result,
             uniprot_result=uniprot_result,
@@ -354,22 +947,43 @@ class ACMGRuleEngine:
         # "never fabricate evidence" requirement -- each of these would
         # require a data source this pipeline does not yet integrate.
         criteria["PS2"] = _not_evaluated(
-            "PS2", "requires confirmed de novo trio (parental) sequencing data; not integrated."
+            "PS2",
+            "requires confirmed de novo trio (parental) sequencing data; not integrated.",
+            category=NotEvaluatedReason.NOT_INTEGRATED,
         )
-        criteria["PM3"] = _not_evaluated("PM3", "requires trans-phase data for a recessive disorder; not integrated.")
+        criteria["PM3"] = _not_evaluated(
+            "PM3",
+            "requires trans-phase data for a recessive disorder; not integrated.",
+            category=NotEvaluatedReason.NOT_INTEGRATED,
+        )
         criteria["PM6"] = _not_evaluated(
-            "PM6", "requires confirmed (non-parentally-tested) de novo status; not integrated."
+            "PM6",
+            "requires confirmed (non-parentally-tested) de novo status; not integrated.",
+            category=NotEvaluatedReason.NOT_INTEGRATED,
         )
         criteria["PP2"] = _not_evaluated(
-            "PP2", "requires a gene-level missense-constraint metric (e.g. gnomAD missense Z-score); not integrated."
+            "PP2",
+            "requires a gene-level missense-constraint metric (e.g. gnomAD missense Z-score); not integrated.",
+            category=NotEvaluatedReason.NOT_INTEGRATED,
         )
-        criteria["PP5"] = _not_evaluated("PP5", "deprecated in the 2015 ACMG/AMP guideline update; not applied.")
+        criteria["PP5"] = _not_evaluated(
+            "PP5",
+            "recommended against by ClinGen's SVI Working Group (Biesecker & Harrison 2018) as "
+            "circular with respect to an independent ACMG/AMP evaluation; not applied.",
+            category=NotEvaluatedReason.NOT_INTEGRATED,
+        )
         criteria["BS2"] = _not_evaluated(
-            "BS2", "requires observation in unaffected individuals at the expected penetrance age; not integrated."
+            "BS2",
+            "requires observation in unaffected individuals at the expected penetrance age; not integrated.",
+            category=NotEvaluatedReason.NOT_INTEGRATED,
         )
-        criteria["BP2"] = _not_evaluated("BP2", "requires trans/cis phase data; not integrated.")
+        criteria["BP2"] = _not_evaluated(
+            "BP2", "requires trans/cis phase data; not integrated.", category=NotEvaluatedReason.NOT_INTEGRATED
+        )
         criteria["BP5"] = _not_evaluated(
-            "BP5", "requires case-level data on an alternate molecular cause; not integrated."
+            "BP5",
+            "requires case-level data on an alternate molecular cause; not integrated.",
+            category=NotEvaluatedReason.NOT_INTEGRATED,
         )
 
         # Attach ClinVar as descriptive cross-reference (never used to
@@ -385,6 +999,58 @@ class ACMGRuleEngine:
         triggered = [c.to_dict() for c in criteria.values() if c.status == "triggered"]
         not_triggered = [c.to_dict() for c in criteria.values() if c.status == "not_triggered"]
         not_evaluated = [c.to_dict() for c in criteria.values() if c.status == "not_evaluated"]
+
+        # Interpretation-outcome state (human ruling, 2026-09-09/10) --
+        # a DIFFERENT axis from the criteria above, computed here because
+        # this is the one place every evidence-query result this variant
+        # received is already in scope. `gene_resolved` reads ClinGen's
+        # own resolution verdict, never re-derived; `evidence_queries_completed`
+        # is False the moment ANY evidence-query result this variant
+        # actually attempted carries a genuine `error` key -- a `found:
+        # False` or a structural skip (e.g. the mtDNA compartment gate's
+        # pre-built skip dicts, which never set `error`) is not a
+        # failure and does not count. See
+        # `pipeline/interpretation_outcome.py`'s own docstring for why
+        # this gate exists and must not be loosened.
+        gene_resolved = (clingen_result or {}).get("gene_resolution_status") == "resolved"
+        _evidence_query_results = (
+            clinvar_result,
+            dbsnp_result,
+            protein_result,
+            alphamissense_result,
+            mmsplice_result,
+            gnomad_result,
+            conservation_result,
+            interpro_result,
+            ensemble_result,
+            transcript_result,
+            clinvar_codon_result,
+            uniprot_result,
+            spliceformer_result,
+            splicebert_result,
+            hpo_result,
+            phenotype_result,
+            functional_evidence_result,
+        )
+        evidence_queries_completed = all(
+            result is None or result.get("error") is None for result in _evidence_query_results
+        )
+        interpretation_outcome = determine_interpretation_outcome(
+            gene_resolved=gene_resolved,
+            evidence_queries_completed=evidence_queries_completed,
+            pathogenic_points=combine_result.pathogenic_points,
+            benign_points=combine_result.benign_points,
+            classification=combine_result.classification,
+        )
+        # Human ruling, 2026-09-09/10 (round 2): the answer to "if both
+        # [review_required triggers] need to be visible, say so" -- see
+        # `pipeline/interpretation_outcome.py`'s own docstring. Always a
+        # list, never omitted, even when empty.
+        review_required_reasons = determine_review_required_reasons(
+            pathogenic_points=combine_result.pathogenic_points,
+            benign_points=combine_result.benign_points,
+            classification=combine_result.classification,
+        )
 
         return {
             "classification": combine_result.classification,
@@ -405,6 +1071,12 @@ class ACMGRuleEngine:
             "not_triggered_criteria": not_triggered,
             "not_evaluated_criteria": not_evaluated,
             "all_criteria": {code: c.to_dict() for code, c in criteria.items()},
+            # Human ruling, 2026-09-09/10: carried ALONGSIDE
+            # `classification` above, never replacing it, never derived
+            # from `pipeline/stage_schemas.py::StageStatus`. See
+            # `pipeline/interpretation_outcome.py`.
+            "interpretation_outcome": interpretation_outcome.value,
+            "review_required_reasons": review_required_reasons,
         }
 
     # ------------------------------------------------------------------
@@ -492,7 +1164,7 @@ class ACMGRuleEngine:
     @staticmethod
     def _ps1_pm5_query_context(
         variant_dict: Optional[Dict[str, Any]], transcript_result: Optional[Dict[str, Any]]
-    ) -> "tuple":
+    ) -> Tuple[Optional[TranscriptContext], Optional[int], str, str, Optional[CodingConsequenceDetail]]:
         """
         Shared setup for `_ps1`/`_pm5`: the transcript, the query
         variant's own genomic coordinates, and its amino-acid
@@ -514,7 +1186,7 @@ class ACMGRuleEngine:
         return transcript, (int(pos) if pos is not None else None), ref, alt, query
 
     @staticmethod
-    def _ps1_pm5_result(evaluation, direction: str, nominal_strength: str) -> CriterionResult:
+    def _ps1_pm5_result(evaluation: PS1PM5Evaluation, direction: str, nominal_strength: str) -> CriterionResult:
         """
         Adapt a `pipeline/ps1_pm5/models.py::PS1PM5Evaluation` into this
         module's `CriterionResult`, matching `_pvs1`'s status-mapping
@@ -693,7 +1365,7 @@ class ACMGRuleEngine:
         if (
             not interpro_result
             or interpro_result.get("skipped")
-            or interpro_result.get("error")
+            or interpro_result.get("error") is not None
             or not interpro_result.get("found")
         ):
             return _not_evaluated("PM1", "InterPro domain annotation was unavailable for this gene/residue.")
@@ -793,7 +1465,14 @@ class ACMGRuleEngine:
     @staticmethod
     def _pm2(gnomad_result: Optional[Dict[str, Any]]) -> CriterionResult:
         direction, strength = _STRENGTH["PM2"]
-        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error"):
+        # `error` read by PRESENCE, not truthiness: `not_found()` and
+        # `from_error()` both set found=False, so `error` is the only
+        # field separating "checked, genuinely absent" (PM2 evidence)
+        # from "never actually checked". An exception raised without a
+        # message reaches here as error="" -- falsy, present, and under
+        # the old truthiness check it awarded PM2 outright. See
+        # tests/test_gnomad_lookup_failure_not_absent.py.
+        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error") is not None:
             return _not_evaluated("PM2", "gnomAD lookup was skipped or errored for this variant.")
         cfg = CONFIG.gnomad
         if not gnomad_result.get("found"):
@@ -915,15 +1594,19 @@ class ACMGRuleEngine:
             "case-control study) is integrated, so the case-control comparison PS4 requires cannot be "
             "computed, and this criterion can never be triggered by this pipeline as currently built."
         )
-        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error"):
+        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error") is not None:
             return _not_evaluated(
-                "PS4", base_reason + " gnomAD control-population data was also unavailable for this variant."
+                "PS4",
+                base_reason + " gnomAD control-population data was also unavailable for this variant.",
+                category=NotEvaluatedReason.NOT_INTEGRATED,
             )
 
         af, af_label = population_af_from_gnomad(gnomad_result)
         if af is None:
             return _not_evaluated(
-                "PS4", base_reason + " No usable gnomAD allele frequency was returned for this variant either."
+                "PS4",
+                base_reason + " No usable gnomAD allele frequency was returned for this variant either.",
+                category=NotEvaluatedReason.NOT_INTEGRATED,
             )
 
         cfg = CONFIG.gnomad
@@ -957,6 +1640,7 @@ class ACMGRuleEngine:
                 "gnomad_allele_frequency_label": af_label,
                 "case_frequency_source": None,
             },
+            category=NotEvaluatedReason.NOT_INTEGRATED.value,
         )
 
     # UniProt's own controlled-vocabulary feature-type strings (verified
@@ -999,7 +1683,7 @@ class ACMGRuleEngine:
         if (
             not uniprot_result
             or uniprot_result.get("skipped")
-            or uniprot_result.get("error")
+            or uniprot_result.get("error") is not None
             or not uniprot_result.get("found")
         ):
             return None, None
@@ -1160,7 +1844,7 @@ class ACMGRuleEngine:
         score_key: str,
         conserved_threshold: float,
         not_conserved_threshold: float,
-    ):
+    ) -> Tuple[Optional[str], Optional[float]]:
         """
         Classifies one conservation score type from a
         `pipeline.conservation.lookup.ConservationLookup` result into
@@ -1177,7 +1861,7 @@ class ACMGRuleEngine:
         if (
             not conservation_result
             or conservation_result.get("skipped")
-            or conservation_result.get("error")
+            or conservation_result.get("error") is not None
             or not conservation_result.get("found")
         ):
             return None, None
@@ -1247,7 +1931,10 @@ class ACMGRuleEngine:
         if protein_flags is not None and protein_flags.determined and protein_flags.is_lof:
             ref = (variant_dict.get("ref") or "") if variant_dict else ""
             alt = (variant_dict.get("alt") or "") if variant_dict else ""
-            kind = "a frameshift" if len(ref) != len(alt) else "a nonsense (stop-gained)"
+            # HIGH 3 / T3-F3 (2026-08-28, ruled): term sourced from the
+            # shared `null_variant_term` -- unchanged wording here, now
+            # from one source instead of three independent copies.
+            kind = "a " + null_variant_term(len(ref) != len(alt))
             return (
                 f"this is {kind} variant with a transcript-CDS-frame-determined null consequence; "
                 "missense/regulatory computational predictors are not applicable evidence for a "
@@ -1333,31 +2020,44 @@ class ACMGRuleEngine:
             protein_flags, null_variant_type, variant_dict
         )
         if inapplicable_reason is not None:
-            na = _not_evaluated("PP3", f"PP3 does not apply -- {inapplicable_reason}.")
-            nb = _not_evaluated("BP4", f"BP4 does not apply -- {inapplicable_reason}.")
+            na = _not_evaluated(
+                "PP3",
+                f"PP3 does not apply -- {inapplicable_reason}.",
+                category=NotEvaluatedReason.CONSEQUENCE_INAPPLICABLE,
+            )
+            nb = _not_evaluated(
+                "BP4",
+                f"BP4 does not apply -- {inapplicable_reason}.",
+                category=NotEvaluatedReason.CONSEQUENCE_INAPPLICABLE,
+            )
             return na, nb
 
         sources: List[str] = []
-        damaging: List[tuple] = []  # (source_label, evidence_text)
-        benign: List[tuple] = []
+        damaging: List[Tuple[str, str]] = []  # (source_label, evidence_text)
+        benign: List[Tuple[str, str]] = []
 
         if alphamissense_result and not alphamissense_result.get("skipped") and alphamissense_result.get("found"):
             am_class = (alphamissense_result.get("am_class") or "").strip().lower()
             sources.append("AlphaMissense")
-            if am_class == "likely_pathogenic":
-                damaging.append(
-                    (
-                        "AlphaMissense",
-                        f"AlphaMissense predicts 'likely_pathogenic' (am_pathogenicity={alphamissense_result.get('am_pathogenicity')}).",
-                    )
-                )
-            elif am_class == "likely_benign":
-                benign.append(
-                    (
-                        "AlphaMissense",
-                        f"AlphaMissense predicts 'likely_benign' (am_pathogenicity={alphamissense_result.get('am_pathogenicity')}).",
-                    )
-                )
+            # HIGH 3 / AM-07 (2026-08-28, ruled): text sourced from the
+            # shared `alphamissense_evidence_sentence` (pvs1/utils.py) --
+            # this used to independently rebuild the same caveated
+            # sentence `InterpretationEngine.interpret()`'s legacy
+            # evidence line also builds, differing only in surface
+            # formatting (no `protein_variant` clause, and
+            # `am_pathogenicity` printed with no format spec or None
+            # fallback -- a latent formatting defect the shared function
+            # now fixes on this side, not a style choice being made).
+            # Gating (only likely_pathogenic/likely_benign produce a
+            # sentence here, routed to `damaging`/`benign` respectively)
+            # is unchanged -- that routing is this function's own
+            # concern, not something the shared sentence decides.
+            am_sentence = alphamissense_evidence_sentence(alphamissense_result)
+            if am_sentence is not None:
+                if am_class == "likely_pathogenic":
+                    damaging.append(("AlphaMissense", am_sentence))
+                elif am_class == "likely_benign":
+                    benign.append(("AlphaMissense", am_sentence))
 
         # Report review round 4, I5: MMSplice previously participated
         # in the agree/disagree vote for every variant regardless of
@@ -1453,6 +2153,25 @@ class ACMGRuleEngine:
             label = f"AI-ensemble({'+'.join(models_used)})"
             sources.append(label)
             score_str = f"{consensus_score:.3f}" if consensus_score is not None else "n/a"
+            # Calibration disclosure -- same read-and-disclose pattern _bp7
+            # already applies to SpliceFormer/SpliceBERT (see :2570-2579
+            # below): read each fired model's own
+            # individual_scores[key]["details"]["calibration_status"]
+            # (the same field status.py::_ensemble_model_status already
+            # reads for the same models), disclose it per model rather
+            # than once for the whole ensemble label (Enformer and Borzoi
+            # are not guaranteed to share a calibration status), fall back
+            # to an honest "not reported" rather than inventing one, and
+            # attach the same plain-language caveat _bp7 attaches -- a
+            # reader must see this next to the score, not several sections
+            # further down.
+            individual_scores = ensemble_result.get("individual_scores") or {}
+            calibration_note = "; ".join(
+                f"{model_key} "
+                f"({(individual_scores.get(model_key) or {}).get('details', {}).get('calibration_status') or 'calibration status not reported by this model'})"
+                for model_key in models_used
+            )
+            calibration_caveat = f" [{calibration_note}] This is a raw model score, not a validated clinical measure."
             if classification in ("large_effect", "moderate_effect"):
                 damaging.append(
                     (
@@ -1460,6 +2179,7 @@ class ACMGRuleEngine:
                         (
                             f"Splicing/regulatory AI ensemble ({basis_label}) predicts a "
                             f"'{classification}' effect (score={score_str}). {ensemble_result.get('reasoning', '')}"
+                            f"{calibration_caveat}"
                         ),
                     )
                 )
@@ -1470,6 +2190,7 @@ class ACMGRuleEngine:
                         (
                             f"Splicing/regulatory AI ensemble ({basis_label}) predicts "
                             f"'no_significant_effect' (score={score_str}). {ensemble_result.get('reasoning', '')}"
+                            f"{calibration_caveat}"
                         ),
                     )
                 )
@@ -1645,13 +2366,13 @@ class ACMGRuleEngine:
         return pp3, bp4
 
     @staticmethod
-    def _ba1_bs1(gnomad_result: Optional[Dict[str, Any]]):
+    def _ba1_bs1(gnomad_result: Optional[Dict[str, Any]]) -> Tuple[CriterionResult, CriterionResult]:
         ba1_dir, ba1_strength = _STRENGTH["BA1"]
         bs1_dir, bs1_strength = _STRENGTH["BS1"]
         if (
             not gnomad_result
             or gnomad_result.get("skipped")
-            or gnomad_result.get("error")
+            or gnomad_result.get("error") is not None
             or not gnomad_result.get("found")
         ):
             reason = (
@@ -1808,23 +2529,9 @@ class ACMGRuleEngine:
         general regulatory-effect model pair already dedicated to
         PP3/BP4, not the dedicated splice predictors requested here.
 
-        INTEGRATION GAP, stated honestly rather than implied away:
-        GEPER's orchestrator does not currently run a per-variant
-        SpliceFormer/SpliceBERT inference stage feeding into this
-        engine -- both plugins are registered in the model registry and
-        directly callable (`ModelManager.predict("spliceformer"/
-        "splicebert", ref_seq, alt_seq)`, exercised in
-        `tests/test_spliceformer_integration.py` and
-        `benchmark_spliceformer.py`) and SpliceFormer specifically is
-        gated behind `CONFIG.splicing.ENABLE_SPLICEFORMER` (default
-        off), but no orchestrator stage yet reshapes either plugin's
-        output into a value it passes through
-        `InterpretationEngine.interpret()` to `evaluate()`. These two
-        parameters exist now so that gap is a plumbing task, not a rule
-        rewrite, once such a stage exists -- exactly how `ensemble_result`
-        itself was added as an accept-if-given, None-otherwise parameter
-        before any caller supplied it. Until then, BP7 in production
-        keeps operating on MMSplice alone, same as before this change.
+        SpliceFormer and SpliceBERT are run as standalone stages
+        (orchestrator.py:1457-1458); scores feed into BP7. Both are
+        uncalibrated (see pipeline/models/).
         """
         direction, strength = _STRENGTH["BP7"]
         if is_synonymous is None:
@@ -1871,11 +2578,46 @@ class ACMGRuleEngine:
             classification = plugin_result.get("classification")
             score = plugin_result.get("score")
             score_str = f"{score:.3f}" if isinstance(score, (int, float)) else "n/a"
+            # Disclosed inline, attached to the score it qualifies, rather
+            # than deferred to the report's Limitations section: both plugins
+            # already report `details.calibration_status == "uncalibrated --
+            # ..."` about themselves (see each plugin's `predict()`), and a
+            # reader deciding on this variant has to see that caveat next to
+            # the number, not several sections further down. Applied to the
+            # benign-direction branch too, not just the damaging one -- an
+            # uncalibrated "no disruption" call is what lets BP7 actually
+            # trigger, so it carries at least as much clinical weight.
+            # The caveat is bound to the model's name, ahead of its score,
+            # rather than trailing the sentence: a reader skimming the
+            # evidence list sees the calibration status before they see the
+            # number it qualifies. It also keeps the phrase near the start
+            # of the rendered line, so PDF line-wrapping cannot split it
+            # across a break the way a trailing clause does.
+            # READ, not restated: this used to hand-type "(uncalibrated; not
+            # clinically validated)" here despite this very comment already
+            # naming `details.calibration_status` as the source of truth --
+            # one copy the plugin writes, a second copy a human maintained
+            # by hand next to it, free to drift the moment either changed.
+            # Reading it here means one source, one consumer, nothing to
+            # keep in sync by memory.
+            calibration_status = (plugin_result.get("details") or {}).get("calibration_status")
+            if not calibration_status:
+                # Honest absence, not a guess: a plugin whose result carries
+                # no calibration_status at all gets told apart from one that
+                # reports itself uncalibrated -- inventing "(uncalibrated;
+                # not clinically validated)" here for a missing key would
+                # silently rebuild the exact defect this fix removes, one
+                # level down.
+                calibration_status = "calibration status not reported by this model"
+            qualified = f"{label} ({calibration_status})"
+            caveat = " This is a raw model score, not a validated clinical splice-impact measure."
             if classification in ("large_effect", "moderate_effect"):
                 plugin_damaging = True
-                conflicting.append(f"{label} predicts a '{classification}' effect (score={score_str}).")
+                conflicting.append(f"{qualified} predicts a '{classification}' effect (score={score_str})." + caveat)
             else:
-                supporting.append(f"{label}: no significant splice disruption predicted (score={score_str}).")
+                supporting.append(
+                    f"{qualified}: no significant splice disruption predicted (score={score_str})." + caveat
+                )
 
         if not sources:
             return CriterionResult(
@@ -1928,6 +2670,26 @@ class ACMGRuleEngine:
     # ClinGen SVI classification tiers (see
     # `pipeline/clingen/models.py::CLINICAL_VALIDITY_CLASSIFICATIONS`);
     # only these three definitively rule the prerequisite out.
+    #
+    # HIGH 3 / T3-F2b (2026-08-28, ruled): `clinical_validity_summary`
+    # also has two OTHER independent readers -- `InterpretationEngine.
+    # _clingen_acmg_evidence` (legacy, `pipeline/interpretation.py`)
+    # scores the classification itself, 5-way, as its own supporting/
+    # conflicting/neutral evidence toward pathogenicity; `pipeline/pvs1/
+    # utils.py::lof_mechanism_from_clingen` discloses it as one
+    # unconditional, unscored sentence. This is DELIBERATELY NOT
+    # unified with either of them, and that is the finding, not an
+    # omission: PP1/BS4's read of this field answers "does a
+    # gene-disease relationship exist at all, so a segregation
+    # prerequisite can be satisfied" (a 3-item failure set); legacy's
+    # read answers "is this classification itself evidence toward or
+    # against pathogenicity" (a different, 2-directional split, e.g. a
+    # "Limited"/"Moderate" classification is a PP1 non-failure here but
+    # legacy's own neutral bucket there). Forcing these through one
+    # shared verdict would create a false common concept and invite the
+    # next reader to helpfully collapse three genuinely different
+    # questions that only coincidentally read the same field. Do not
+    # unify it.
     _VALIDITY_PREREQUISITE_FAILURES = ("Refuted", "Disputed", "No Known Disease Relationship")
 
     @staticmethod
@@ -1959,7 +2721,7 @@ class ACMGRuleEngine:
         if (
             not clingen_result
             or clingen_result.get("skipped")
-            or clingen_result.get("error")
+            or clingen_result.get("error") is not None
             or not clingen_result.get("found")
         ):
             return _not_evaluated(
@@ -2017,7 +2779,7 @@ class ACMGRuleEngine:
         if (
             not clingen_result
             or clingen_result.get("skipped")
-            or clingen_result.get("error")
+            or clingen_result.get("error") is not None
             or not clingen_result.get("found")
         ):
             return _not_evaluated(
@@ -2059,7 +2821,7 @@ class ACMGRuleEngine:
         alphamissense_result: Optional[Dict[str, Any]],
         pm1_result: Optional[CriterionResult],
         bs3_result: Optional[CriterionResult] = None,
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, bool]]:
         """
         Gate for BP1's blanket "gene where LOF is established => this
         missense is benign evidence" inference, mirroring `_pp3_bp4`'s
@@ -2103,19 +2865,32 @@ class ACMGRuleEngine:
         for the same variant -- and continues to block BP1 as before
         when nothing contradicts it.
 
-        Returns the opposing-evidence text, or `None` when BP1's
-        default gene-level inference is not contradicted by anything
-        GEPER has for this specific variant (including the case where
-        PM1's opposition is outweighed by benign evidence).
+        Returns `(opposing-evidence text, whether InterPro was the
+        source that produced it)`, or `None` when BP1's default
+        gene-level inference is not contradicted by anything GEPER has
+        for this specific variant (including the case where PM1's
+        opposition is outweighed by benign evidence). The boolean lets
+        the caller build an `evidence_sources` list that names only the
+        source(s) THIS specific branch actually used -- the
+        AlphaMissense-pathogenic branch never consults `pm1_result` at
+        all (it returns before that check), so it must not claim
+        InterPro was read; the PM1-triggered branch's own text embeds
+        PM1's rationale verbatim, which does name InterPro/Pfam.
         """
         am_pathogenic_reason = None
         am_benign_present = False
         if alphamissense_result and not alphamissense_result.get("skipped") and alphamissense_result.get("found"):
             am_class = (alphamissense_result.get("am_class") or "").strip().lower()
             if am_class == "likely_pathogenic":
+                # Same caveat wording _pp3_bp4 established above (report
+                # review round: two differently-worded AlphaMissense
+                # sentences reaching the same reader without it is a
+                # visible contradiction, not just a missing disclosure).
                 am_pathogenic_reason = (
-                    "AlphaMissense predicts 'likely_pathogenic' "
-                    f"(am_pathogenicity={alphamissense_result.get('am_pathogenicity')}) for this substitution."
+                    "AlphaMissense (not clinically validated; not approved for clinical use) predicts "
+                    "'likely_pathogenic' (am_pathogenicity="
+                    f"{alphamissense_result.get('am_pathogenicity')}) for this substitution. This is a raw "
+                    "model score, not a validated clinical pathogenicity measure."
                 )
             elif am_class == "likely_benign":
                 am_benign_present = True
@@ -2124,7 +2899,7 @@ class ACMGRuleEngine:
         # -- it is variant-specific evidence, not a generic heuristic,
         # so it is never weighed against countervailing evidence here.
         if am_pathogenic_reason is not None:
-            return am_pathogenic_reason
+            return am_pathogenic_reason, False
 
         if pm1_result is None or pm1_result.status != "triggered":
             return None
@@ -2134,7 +2909,7 @@ class ACMGRuleEngine:
             # PM1 alone (bare domain overlap) does not outvote direct
             # variant-specific benign evidence on the same variant.
             return None
-        return f"PM1 (conserved functional domain) independently triggered: {pm1_result.rationale}"
+        return f"PM1 (conserved functional domain) independently triggered: {pm1_result.rationale}", True
 
     @staticmethod
     def _bp1(
@@ -2208,6 +2983,19 @@ class ACMGRuleEngine:
         if mechanism in (LOF_ESTABLISHED, LOF_ESTABLISHED_RECESSIVE):
             opposing = ACMGRuleEngine._bp1_opposing_missense_evidence(alphamissense_result, pm1_result, bs3_result)
             if opposing is not None:
+                opposing_text, opposing_used_interpro = opposing
+                # CORRECTED 2026-09-10 (rationale-string scan, conv-rationale):
+                # this evidence_sources list used to be a fixed
+                # ["ClinGen", "transcript_cds", "AlphaMissense", "InterPro"]
+                # regardless of which branch of
+                # `_bp1_opposing_missense_evidence` produced `opposing_text`.
+                # The AlphaMissense-pathogenic branch returns before
+                # `pm1_result` is even consulted, so it never actually reads
+                # InterPro -- only the PM1-triggered branch does (its own
+                # text embeds PM1's rationale, which names InterPro/Pfam).
+                bp1_evidence_sources = ["ClinGen", "transcript_cds", "AlphaMissense"]
+                if opposing_used_interpro:
+                    bp1_evidence_sources.append("InterPro")
                 return CriterionResult(
                     "BP1",
                     direction,
@@ -2217,10 +3005,10 @@ class ACMGRuleEngine:
                     "truncating variants are an established disease mechanism, but BP1 does not apply "
                     "here: a strong, variant-specific signal argues against treating this particular "
                     "missense substitution as benign, despite the gene's overall LOF curation.",
-                    conflicting_evidence=[opposing],
-                    evidence_sources=["ClinGen", "transcript_cds", "AlphaMissense", "InterPro"],
+                    conflicting_evidence=[opposing_text],
+                    evidence_sources=bp1_evidence_sources,
                     confidence="Low",
-                    details={"lof_mechanism": mechanism, "opposing_missense_evidence": opposing},
+                    details={"lof_mechanism": mechanism, "opposing_missense_evidence": opposing_text},
                 )
             return CriterionResult(
                 "BP1",
@@ -2366,6 +3154,32 @@ class ACMGRuleEngine:
     )
 
     @staticmethod
+    def _submitter_note(submitters: Optional[List[Dict[str, Any]]]) -> str:
+        """
+        Format ` (submitted by X, Y)` for evidence-trail strings that
+        cite a ClinVar accession, or `""` when submitter identity
+        wasn't captured (`submitters` is `None` -- the lookup failed or
+        hasn't run) or ClinVar genuinely has none on file (`[]`).
+        Round 30 (retrospective-study leakage control): naming the
+        submitter here, not filtering on it -- see
+        `database/clinvar_client.py::ClinVarClient._fetch_submitters`
+        and this repo's `ROUND_CANDIDATES.md` Round 30 entry for why a
+        partner lab's own submission being visible in the evidence
+        trail matters for a retrospective concordance study, and why
+        GEPER itself does not decide which submitters to exclude.
+        """
+        if not submitters:
+            return ""
+        names: List[str] = []
+        for s in submitters:
+            name = s.get("name") if isinstance(s, dict) else None
+            if isinstance(name, str) and name:
+                names.append(name)
+        if not names:
+            return ""
+        return f" (submitted by {', '.join(dict.fromkeys(names))})"
+
+    @staticmethod
     def _clinvar_not_found_reason(clinvar_result: Optional[Dict[str, Any]]) -> str:
         """
         Honest "why is there no ClinVar evidence for this variant" text,
@@ -2423,6 +3237,8 @@ class ACMGRuleEngine:
         review_status = (raw_review_status or "").strip().lower()
         accession = top.get("accession") or "this record"
         caveat = ACMGRuleEngine._BP6_DEPRECATION_CAVEAT
+        submitters = top.get("submitters")
+        submitter_note = ACMGRuleEngine._submitter_note(submitters)
 
         if review_status in ACMGRuleEngine._BP6_UNRELIABLE_REVIEW_STATUS:
             return CriterionResult(
@@ -2433,10 +3249,16 @@ class ACMGRuleEngine:
                 f"ClinVar record {accession} reports '{raw_significance}', but its review status "
                 f"('{raw_review_status}') carries no assertion criteria, too weak a source to treat as "
                 f"'reputable' even under BP6's own wording. {caveat}",
-                conflicting_evidence=[f"ClinVar {accession}: {raw_significance} ({raw_review_status})."],
+                conflicting_evidence=[
+                    f"ClinVar {accession}: {raw_significance} ({raw_review_status}){submitter_note}."
+                ],
                 evidence_sources=["ClinVar"],
                 confidence="Low",
-                details={"clinvar_significance": raw_significance, "clinvar_review_status": raw_review_status},
+                details={
+                    "clinvar_significance": raw_significance,
+                    "clinvar_review_status": raw_review_status,
+                    "clinvar_submitters": submitters,
+                },
             )
 
         if significance in ACMGRuleEngine._BP6_ACCEPTABLE_SIGNIFICANCE:
@@ -2447,10 +3269,14 @@ class ACMGRuleEngine:
                 "triggered",
                 f"ClinVar record {accession} reports '{raw_significance}' (review status: "
                 f"{raw_review_status}). {caveat}",
-                supporting_evidence=[f"ClinVar {accession}: {raw_significance} ({raw_review_status})."],
+                supporting_evidence=[f"ClinVar {accession}: {raw_significance} ({raw_review_status}){submitter_note}."],
                 evidence_sources=["ClinVar"],
                 confidence="Low",
-                details={"clinvar_significance": raw_significance, "clinvar_review_status": raw_review_status},
+                details={
+                    "clinvar_significance": raw_significance,
+                    "clinvar_review_status": raw_review_status,
+                    "clinvar_submitters": submitters,
+                },
             )
 
         return CriterionResult(
@@ -2461,7 +3287,11 @@ class ACMGRuleEngine:
             f"ClinVar record {accession} reports '{raw_significance}', not Benign/Likely benign. {caveat}",
             evidence_sources=["ClinVar"],
             confidence="Low",
-            details={"clinvar_significance": raw_significance, "clinvar_review_status": raw_review_status},
+            details={
+                "clinvar_significance": raw_significance,
+                "clinvar_review_status": raw_review_status,
+                "clinvar_submitters": submitters,
+            },
         )
 
     @staticmethod
@@ -2517,7 +3347,12 @@ class ACMGRuleEngine:
                 "and this logic runs automatically once phenotype terms are provided.",
             )
 
-        if not hpo_result or hpo_result.get("skipped") or hpo_result.get("error") or not hpo_result.get("found"):
+        if (
+            not hpo_result
+            or hpo_result.get("skipped")
+            or hpo_result.get("error") is not None
+            or not hpo_result.get("found")
+        ):
             return _not_evaluated(
                 "PP4",
                 "patient phenotype data was provided, but this variant's gene has no HPO gene-phenotype "
@@ -2528,7 +3363,56 @@ class ACMGRuleEngine:
         gene_terms = {t["hpo_id"] for t in (hpo_result.get("distinct_phenotype_terms") or [])}
         overlap = patient_terms & gene_terms
         overlap_ratio = len(overlap) / len(patient_terms)
-        distinct_diseases = hpo_result.get("distinct_disease_ids") or []
+        # Presence, not truthiness. `or []` made a MISSING disease list
+        # indistinguishable from an empty one, and because the test below
+        # is `len(...) <= threshold`, "we do not know how many diseases
+        # this gene is curated against" satisfied the single-etiology half
+        # of PP4 outright -- resolving absent data into the affirmative
+        # condition a pathogenic-supporting rule needs.
+        #
+        # An empty list that is actually PRESENT keeps its current meaning
+        # (HPO was consulted; this gene has no curated disease entries).
+        # Whether that should count as "a single genetic etiology" is a
+        # question about the rule rather than about this idiom, and it is
+        # deliberately left alone here.
+        #
+        # Note the sibling line above uses the same `or []` and fails SAFE:
+        # no phenotype terms drives overlap_ratio to 0 and PP4 cannot
+        # fire. Same idiom, one line apart, opposite failure directions --
+        # which is why this one needed changing and that one did not.
+        raw_disease_ids = hpo_result.get("distinct_disease_ids")
+        if raw_disease_ids is None:
+            return _not_evaluated(
+                "PP4",
+                f"HPO gene-phenotype annotation for {gene} carried no curated disease list, so "
+                "whether this gene has a single genetic etiology could not be determined; PP4 "
+                "requires that judgement and is not awarded on an unknown.",
+            )
+        if len(raw_disease_ids) == 0:
+            # RULED 2026-08-28. `[]` is a MEASUREMENT, not an unknown --
+            # HPO was consulted and curates this gene against zero
+            # disease entries -- which is why it is handled here rather
+            # than folded into the `is None` guard above. But a gene with
+            # no curated diseases has not answered "is this phenotype
+            # specific to a disease with a single genetic etiology?"
+            # either way, so it cannot SATISFY that condition. Before
+            # this guard `len([]) <= threshold` was True and the empty
+            # list resolved into the affirmative -- the empty-means-
+            # satisfied collapse, in the direction of AWARDING a
+            # pathogenic-supporting criterion.
+            #
+            # not_evaluated rather than not_triggered: not_triggered
+            # would claim we made the single-etiology judgement and it
+            # failed. We did not make it; there was nothing to make it
+            # from. Same reason the `is None` branch above is
+            # not_evaluated, reached from the opposite starting point.
+            return _not_evaluated(
+                "PP4",
+                f"HPO curates {gene} against zero disease entries, so whether this gene has a single "
+                "genetic etiology has not been established either way; PP4 requires that judgement "
+                "and is not awarded on a gene with no curated disease to be specific to.",
+            )
+        distinct_diseases = raw_disease_ids
 
         cfg = CONFIG.hpo
         specific_enough = overlap_ratio >= cfg.PP4_OVERLAP_THRESHOLD
@@ -2625,7 +3509,7 @@ class ACMGRuleEngine:
         if (
             not functional_evidence_result
             or functional_evidence_result.get("skipped")
-            or functional_evidence_result.get("error")
+            or functional_evidence_result.get("error") is not None
             or not functional_evidence_result.get("found")
         ):
             return _not_evaluated("PS3", _functional_evidence_not_evaluated_reason(functional_evidence_result))
@@ -2673,7 +3557,7 @@ class ACMGRuleEngine:
         if (
             not functional_evidence_result
             or functional_evidence_result.get("skipped")
-            or functional_evidence_result.get("error")
+            or functional_evidence_result.get("error") is not None
             or not functional_evidence_result.get("found")
         ):
             return _not_evaluated("BS3", _functional_evidence_not_evaluated_reason(functional_evidence_result))

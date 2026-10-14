@@ -48,11 +48,14 @@ and so the constraint below is enforced in code, not just documented):
 from typing import Any, Dict
 
 import torch
+from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
+
+from pipeline.provenance import capture_hf_cache_artifact
 
 from config import CONFIG
 from pipeline.models.base import ModelMetadata, PluginModel
 from pipeline.models.cache import WeightCache
-from utils.auto_install import ensure_pip_package_available
+from utils.auto_install import PackageCheckStatus, check_pip_package_availability, ensure_pip_package_available
 
 # Borzoi's official fixed input length: 524,288 bp ("524kb input
 # sequences" -- github.com/calico/borzoi's own README). Not guessed.
@@ -63,9 +66,47 @@ BORZOI_SEQUENCE_LENGTH = 524_288
 # Calico's original GCS `.h5` checkpoints are never referenced here.
 _ALLOWED_BORZOI_HF_NAMESPACE = "johahi/"
 
+# Pinned HuggingFace revision (commit SHA) for CONFIG.splicing.BORZOI_HF_REPO,
+# verified live via `git ls-remote https://huggingface.co/johahi/
+# borzoi-replicate-0 HEAD`, 2026-09-02. Same pattern and rationale as
+# `models/esm2.py::_ESM2_REVISION` and this plugin's Enformer
+# counterpart -- see `pipeline/models/enformer_plugin.py::
+# _ENFORMER_REVISION` for why pinning the repo id alone leaves the
+# weights unpinned.
+#
+# Independent of, and no substitute for, the namespace guard above:
+# that guard is a LICENSE control (which weights may be loaded at
+# all), this pin is a PROVENANCE control (which revision of the
+# permitted weights was loaded). Neither implies the other.
+_BORZOI_REVISION = "521db103372769581b8d1d616e6a3b496da490c5"
+
 _BASE_TO_INDEX = {"A": 0, "C": 1, "G": 2, "T": 3}
 
-_NETWORK_ERROR_TYPES = (OSError, ConnectionError, TimeoutError)
+# `borzoi_pytorch.Borzoi.from_pretrained` is transformers'
+# `PreTrainedModel.from_pretrained`, which resolves weights through
+# `huggingface_hub`: a genuine connectivity/HTTP failure surfaces as
+# `huggingface_hub.errors.HfHubHTTPError` (also covers
+# RepositoryNotFoundError/RevisionNotFoundError/GatedRepoError, its
+# subclasses) or `EntryNotFoundError` (also covers
+# LocalEntryNotFoundError, the offline-with-no-cache case); builtin
+# `ConnectionError` also covers huggingface_hub's own
+# `OfflineModeIsEnabled`. NOT bare OSError, removed 2026-08-21: it is
+# the same class Windows raises for local resource exhaustion during
+# the tensor materialization that follows a successful download --
+# confirmed reproducible on this project's own dev box, loading ESM2:
+# `OSError: The paging file is too small for this operation to
+# complete. (os error 1455)`. Catching that here and relabeling it
+# "Borzoi model unavailable" would report a wrong diagnosis. A genuine
+# local OSError (or, e.g., transformers' own bare `OSError` for "not a
+# valid model identifier") now simply isn't caught in this block -- it
+# propagates through PluginModel.load()/ModelManager.get() (pipeline/
+# models/base.py, manager.py), both of which already fold `str(exc)`
+# into their own raised message and log it at `error`, so the real
+# cause stays visible rather than being relabeled a second time -- and
+# in that specific "not a valid model identifier" case, the propagated
+# message is more informative than the old generic label ever was, not
+# less honest.
+_NETWORK_ERROR_TYPES = (ConnectionError, TimeoutError, HfHubHTTPError, EntryNotFoundError)
 
 
 class BorzoiLicenseGuardError(RuntimeError):
@@ -76,11 +117,10 @@ class BorzoiLicenseGuardError(RuntimeError):
 
 
 class BorzoiPlugin(PluginModel):
-    """Real Borzoi integration. Disabled by default
-    (`CONFIG.splicing.ENABLE_BORZOI`); once enabled, this loads ONLY
-    the CC-BY-4.0-licensed `johahi` HuggingFace weight mirror via the
-    Apache-2.0-licensed `borzoi-pytorch` package -- never Calico's
-    original `.h5` files."""
+    """Real Borzoi integration, gated by `CONFIG.splicing.ENABLE_BORZOI`
+    (defaults to enabled); loads ONLY the CC-BY-4.0-licensed `johahi`
+    HuggingFace weight mirror via the Apache-2.0-licensed
+    `borzoi-pytorch` package -- never Calico's original `.h5` files."""
 
     @classmethod
     def metadata(cls) -> ModelMetadata:
@@ -127,7 +167,10 @@ class BorzoiPlugin(PluginModel):
     def unavailability_reason(cls) -> str:
         if not CONFIG.splicing.ENABLE_BORZOI:
             return "disabled via CONFIG.splicing.ENABLE_BORZOI (set GEPER_ENABLE_BORZOI=true to enable)"
-        return "the 'borzoi-pytorch' package is not installed and automatic installation has not been attempted yet"
+        status = check_pip_package_availability("borzoi-pytorch", import_name="borzoi_pytorch")
+        if status is PackageCheckStatus.NOT_CHECKED:
+            return "'borzoi-pytorch' availability was not checked (auto-install is disabled under pytest)"
+        return "the 'borzoi-pytorch' package could not be installed automatically"
 
     def __init__(self):
         super().__init__()
@@ -144,25 +187,130 @@ class BorzoiPlugin(PluginModel):
                 "load anything else. See this module's docstring."
             )
 
-        if not ensure_pip_package_available("borzoi-pytorch", import_name="borzoi_pytorch"):
+        # UPDATE 2026-09-11: requirements.txt now pins `transformers==4.56.2`
+        # (what the shipped image runs -- human ruling), not the
+        # `>=5.12.1,<6.0.0` described below. The conclusion is unchanged:
+        # borzoi-pytorch 0.5.1's `>=4.57.6,<5.0.0` still has zero overlap
+        # with the pin, so the constrained auto-install is still refused.
+        #
+        # MANUAL INSTALL REQUIRED IN A CORRECTLY-PINNED ENVIRONMENT -- BY
+        # DESIGN, NOT A BUG. Same class of conflict as enformer_plugin.py's
+        # identical note -- confirmed independently for this package, not
+        # assumed symmetric: `borzoi-pytorch` cannot be acquired through
+        # the auto-install call below in any environment holding GEPER's
+        # own enforced core pin (`transformers>=5.12.1,<6.0.0`,
+        # requirements.txt). The current release, 0.5.1, requires
+        # `transformers<5.0.0,>=4.57.6` in its own metadata (verified
+        # directly against the installed wheel's METADATA, not assumed) --
+        # a range with zero overlap against GEPER's pin.
+        # `utils/auto_install.py`'s `pip --constraint requirements.txt`
+        # therefore makes pip correctly refuse with `ResolutionImpossible`
+        # rather than silently downgrading the environment's transformers
+        # to satisfy it. THAT REFUSAL IS THE FIX WORKING, not a regression
+        # to route around: before this constraint, the same install would
+        # have silently downgraded transformers 5.x mid-run, disabling
+        # HyenaDNA and ESM2 later in the same run.
+        #
+        # A fresh environment built from requirements.txt will ALSO not
+        # have this package -- borzoi-pytorch is intentionally not a
+        # pinned top-level requirement there (see that file's header
+        # comment); it is an optional, config-gated auto-install extra,
+        # same as enformer-pytorch above.
+        #
+        # To use Borzoi, install it manually, once, before running GEPER:
+        #     pip install --no-deps borzoi-pytorch
+        # `--no-deps` is required and deliberate: a plain `pip install
+        # borzoi-pytorch` would satisfy the package's own metadata by
+        # downgrading transformers, reopening the exact corruption vector
+        # the constraint fix exists to close. GEPER already pins every
+        # real runtime dependency this package needs (torch) via
+        # requirements.txt; the shim below covers the one genuine gap
+        # between older builds and transformers>=5.
+        #
+        # DO NOT "fix" this by scoping `--no-deps` into
+        # `ensure_pip_package_available` itself -- that was considered and
+        # rejected: the helper is shared with rna-fm, whose real
+        # dependencies are not declared in requirements.txt, and a broad
+        # `--no-deps` there would relocate the missing-vs-broken problem
+        # rather than close it (installed but import-broken,
+        # `is_available()` returning a false True).
+        #
+        # A missing Borzoi is disclosed, not silent: `pipeline/models/
+        # status.py::_ensemble_model_status` reports it with a stated
+        # reason, and `report_generator.py`'s "AI Models" table renders
+        # unconditionally.
+        borzoi_pytorch_status = check_pip_package_availability("borzoi-pytorch", import_name="borzoi_pytorch")
+        if borzoi_pytorch_status is PackageCheckStatus.NOT_CHECKED:
+            raise RuntimeError(
+                "'borzoi-pytorch' availability was not checked in this environment "
+                "(auto-install is disabled under pytest) -- it is not confirmed "
+                "missing, it was never looked for. Install it yourself, or run "
+                "outside the test harness, to find out."
+            )
+        if borzoi_pytorch_status is PackageCheckStatus.ABSENT:
             raise RuntimeError(
                 "Automatic installation of 'borzoi-pytorch' did not succeed "
                 "in this environment (check network access to pypi.org, or "
-                "install it yourself with `pip install borzoi-pytorch`)."
+                "install it yourself with `pip install --no-deps borzoi-pytorch` "
+                "-- the --no-deps is required in a correctly-pinned environment; "
+                "see the comment above this call)."
             )
 
         import borzoi_pytorch
 
+        # Compatibility shim for OLD borzoi-pytorch builds on transformers>=5.
+        # Mechanism, stated precisely (commit c1e0949's message described this
+        # correctly for the version installed at the time, but it is now stale --
+        # see below): transformers>=5's PreTrainedModel.post_init() sets
+        # `all_tied_weights_keys` unconditionally, and from_pretrained's
+        # _finalize_model_loading -> _move_missing_keys_from_meta_to_device then
+        # reads `self.all_tied_weights_keys.keys()`. The AttributeError this
+        # guards against is therefore reachable ONLY when post_init() was never
+        # called. borzoi-pytorch <=0.4.4 never calls it; 0.5.0 (2026-06-10,
+        # upstream commits 09a5950c/77c2ab42) added the call, so on any
+        # borzoi-pytorch >=0.5.0 this shim is a deliberate no-op.
+        # It is kept because `utils/auto_install.py::ensure_pip_package_available`
+        # installs only when the import is missing and NEVER upgrades: an
+        # environment that picked up <=0.4.4 keeps it indefinitely, which is
+        # exactly what the live 2026-08-17 Colab run hit. Borzoi ties no
+        # embedding/head weights, so {} is the same value post_init() would have
+        # produced -- no architecture, weight, or computed-output change.
+        Borzoi = borzoi_pytorch.Borzoi
+        if not hasattr(Borzoi, "all_tied_weights_keys"):
+            Borzoi.all_tied_weights_keys = getattr(Borzoi, "_tied_weights_keys", None) or {}
+
         cache_dir = self._weight_cache.ensure_dir("borzoi")
 
         try:
-            model = borzoi_pytorch.Borzoi.from_pretrained(repo_id, cache_dir=str(cache_dir))
+            model = borzoi_pytorch.Borzoi.from_pretrained(repo_id, cache_dir=str(cache_dir), revision=_BORZOI_REVISION)
         except _NETWORK_ERROR_TYPES as exc:
-            self.logger.debug(
+            # Promoted from `debug` to `warning` 2026-08-21: this line is
+            # the only place the real exception class/message survives --
+            # the raised RuntimeError below deliberately drops it so a raw
+            # request URL never reaches the clinical report (same
+            # rationale as splicebert_plugin.py's own network-error
+            # branch). At `debug` it was invisible in a normal run's logs.
+            self.logger.warning(
                 f"Borzoi weight fetch for '{repo_id}' failed ({exc.__class__.__name__}): {exc}",
                 exc_info=True,
             )
             raise RuntimeError("Borzoi model unavailable") from exc
+
+        # See EnformerPlugin._load_impl: recorded only after a successful load.
+        capture_hf_cache_artifact("borzoi", repo_id, _BORZOI_REVISION, str(cache_dir))
+
+        # Defensive hardening, not a fix for observed behavior: the shim
+        # above must set a CLASS attribute (from_pretrained reads it
+        # before any instance exists to assign to -- see that comment),
+        # but transformers>=5's own post_init() sets an INSTANCE
+        # attribute, and later code (_move_missing_keys_from_meta_to_device)
+        # pops keys out of it. Borzoi ties nothing, so that pop path
+        # never fires today and a class-level dict is harmless in
+        # practice -- but it is still state shared across every Borzoi
+        # instance in this process. Give the now-loaded model its own
+        # instance copy so nothing downstream can ever mutate the shared
+        # class dict, even if a future code path starts popping from it.
+        model.all_tied_weights_keys = dict(Borzoi.all_tied_weights_keys)
 
         model.to(self.device)
         model.eval()

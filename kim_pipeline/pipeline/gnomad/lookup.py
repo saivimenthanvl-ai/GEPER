@@ -12,10 +12,18 @@ Usage::
     from pipeline.gnomad.lookup import GnomadLookup
 
     gn = GnomadLookup(cfg={"gnomad": {"dataset": "gnomad_r3"}})
-    hit = gn.lookup("17", 43057051, "A", "T")
-    if hit:
-        print(hit.af, hit.af_popmax)
+    result = gn.lookup("17", 43057051, "A", "T")
+    if isinstance(result, GnomadHit):
+        print(result.af, result.af_popmax)   # either may be None -- see GnomadHit
+
+`isinstance`, not `if result:`. `lookup()` returns `GnomadHit |
+GnomadLookupOutcome`, and BOTH are always truthy -- a dataclass with no
+`__len__` and an Enum member -- so the `if result:` this example used to
+show was unconditionally True and would have read UNAVAILABLE as a hit.
+`GnomadLookupOutcome.__bool__` now raises rather than letting that pass
+silently.
 """
+
 from __future__ import annotations
 
 import logging
@@ -64,16 +72,53 @@ class GnomadLookupOutcome(Enum):
     UNAVAILABLE — the database/API could not be reached (network error, tabix
               missing, corrupted file).  PM2 must NOT be awarded.
     """
+
     ABSENT = "absent"
     PRESENT = "present"
     UNAVAILABLE = "unavailable"
 
+    def __bool__(self):
+        raise TypeError(
+            "GnomadLookupOutcome has no truth value -- every enum member is truthy, so "
+            "`if outcome:`/`if not outcome:` is the SAME answer for ABSENT, PRESENT and "
+            "UNAVAILABLE, collapsing exactly the three states this type exists to keep "
+            "apart. ABSENT awards PM2 and UNAVAILABLE must not, so reading them as one "
+            "answer awards a pathogenic-supporting criterion on a lookup that never "
+            "succeeded. Compare explicitly, e.g. `outcome is "
+            "GnomadLookupOutcome.ABSENT`, or `isinstance(result, GnomadHit)` when "
+            "narrowing the Union that `lookup()` returns."
+        )
+
 
 @dataclass
 class GnomadHit:
-    """Population frequency data for one variant from gnomAD."""
-    af: float
-    af_popmax: float
+    """Population frequency data for one variant from gnomAD.
+
+    `af`/`af_popmax` are Optional and the distinction is load-bearing:
+
+        None  -- gnomAD was consulted, the variant IS present, but the
+                 source supplied no frequency for this field.
+        0.0   -- gnomAD reported a frequency of zero. A real measurement.
+
+    Collapsing those two is not cosmetic. `acmg/classifier.py::_pm2`
+    branches on `gnomad_af is None and gnomad_af_popmax is None` to take
+    its "Unknown / Insufficient Data" path; a fabricated 0.0 skips that
+    branch and is then compared against the PM2 threshold, so an
+    unmeasured field becomes the most rarity-favourable value the field
+    can hold and awards a pathogenic-supporting criterion. `_pm2` also
+    PREFERS af_popmax over af (classifier.py:595), so an invented popmax
+    outranks a genuinely measured af.
+
+    This is the fourth state `GnomadLookupOutcome` does not model --
+    ABSENT/PRESENT/UNAVAILABLE describe whether we got an ANSWER, not
+    whether the answer carried a number. Optional[float] carries it
+    without a new enum member, which is deliberate: GnomadLookupOutcome
+    has no `__bool__` guard, so every member is truthy and a future
+    `if outcome:` would silently take the truthy branch for all of them.
+    """
+
+    af: Optional[float]
+    af_popmax: Optional[float]
     ac: int
     an: int
     backend_used: str
@@ -143,9 +188,9 @@ class GnomadLookup:
         else:
             self._backend = "api"
             logger.info(
-                "[gnomAD] Backend: GraphQL API (dataset=%s, max_concurrent=%d, "
-                "disk_cache=%s)",
-                self._dataset, self._max_concurrent,
+                "[gnomAD] Backend: GraphQL API (dataset=%s, max_concurrent=%d, disk_cache=%s)",
+                self._dataset,
+                self._max_concurrent,
                 self._disk_cache.path if self._disk_cache.available else "unavailable",
             )
 
@@ -183,23 +228,32 @@ class GnomadLookup:
     def _disk_entry_to_result(self, entry: dict) -> Union[GnomadHit, GnomadLookupOutcome]:
         if entry["outcome"] == "absent":
             return GnomadLookupOutcome.ABSENT
+        # The af columns are nullable REALs and `cache.put` already takes
+        # Optional[float], so NULL survives the round trip -- read it back
+        # as None rather than collapsing it into a measured zero here.
         return GnomadHit(
-            af=entry["af"] or 0.0,
-            af_popmax=entry["af_popmax"] or 0.0,
+            af=entry["af"],
+            af_popmax=entry["af_popmax"],
             ac=entry["ac"] or 0,
             an=entry["an"] or 0,
             backend_used=entry.get("backend") or "disk_cache",
             outcome=GnomadLookupOutcome.PRESENT,
         )
 
-    def _persist_result(self, cache_key: str, result: Union[GnomadHit, GnomadLookupOutcome]) -> None:
+    def _persist_result(
+        self, cache_key: str, result: Union[GnomadHit, GnomadLookupOutcome]
+    ) -> None:
         """Write PRESENT/ABSENT to the disk cache. UNAVAILABLE is
         intentionally never persisted — see cache.py's module docstring."""
         if isinstance(result, GnomadHit):
             self._disk_cache.put(
-                cache_key, "present",
-                af=result.af, af_popmax=result.af_popmax,
-                ac=result.ac, an=result.an, backend=result.backend_used,
+                cache_key,
+                "present",
+                af=result.af,
+                af_popmax=result.af_popmax,
+                ac=result.ac,
+                an=result.an,
+                backend=result.backend_used,
             )
         elif result == GnomadLookupOutcome.ABSENT:
             self._disk_cache.put(cache_key, "absent")
@@ -227,7 +281,10 @@ class GnomadLookup:
         if not self._enabled:
             logger.debug(
                 "[gnomAD] Skipped lookup for %s:%d %s>%s — gnomad.enabled is false",
-                chrom, pos, ref, alt,
+                chrom,
+                pos,
+                ref,
+                alt,
             )
             return GnomadLookupOutcome.UNAVAILABLE
 
@@ -323,9 +380,11 @@ class GnomadLookup:
             return results
 
         logger.info(
-            "[gnomAD] Batch prefetch: %d cached, %d to fetch via %s backend "
-            "(max_concurrent=%d)",
-            len(results), len(to_fetch), self._backend, workers,
+            "[gnomAD] Batch prefetch: %d cached, %d to fetch via %s backend (max_concurrent=%d)",
+            len(results),
+            len(to_fetch),
+            self._backend,
+            workers,
         )
 
         def _fetch_one(cache_key: str, variant: Tuple[str, int, str, str]):
@@ -337,7 +396,11 @@ class GnomadLookup:
             except Exception as exc:
                 logger.warning(
                     "[gnomAD] batch lookup failed for %s:%d %s>%s: %s",
-                    chrom, pos, ref, alt, exc,
+                    chrom,
+                    pos,
+                    ref,
+                    alt,
+                    exc,
                 )
                 return cache_key, GnomadLookupOutcome.UNAVAILABLE
 
@@ -372,7 +435,11 @@ class GnomadLookup:
         except FastqPipelineError as exc:
             logger.warning(
                 "[gnomAD] tabix not found — cannot perform local lookup for %s:%d %s>%s (%s)",
-                chrom, pos, ref, alt, exc,
+                chrom,
+                pos,
+                ref,
+                alt,
+                exc,
             )
             return GnomadLookupOutcome.UNAVAILABLE
 
@@ -398,7 +465,12 @@ class GnomadLookup:
             vcf_pos = int(parts[1])
             vcf_ref = parts[3].upper()
             vcf_alt = parts[4].upper()
-            if vcf_chrom != norm or vcf_pos != pos or vcf_ref != ref.upper() or vcf_alt != alt.upper():
+            if (
+                vcf_chrom != norm
+                or vcf_pos != pos
+                or vcf_ref != ref.upper()
+                or vcf_alt != alt.upper()
+            ):
                 continue
 
             info = parts[7]
@@ -406,11 +478,14 @@ class GnomadLookup:
             af_popmax = self._parse_info_float(info, "AF_popmax")
             ac = int(self._parse_info_float(info, "AC") or 0)
             an = int(self._parse_info_float(info, "AN") or 0)
-            if af_popmax is None:
-                af_popmax = af or 0.0
-
+            # No back-filling af_popmax from af: they are different
+            # measurements, and _pm2 prefers popmax, so a substituted
+            # value would outrank the one the file actually reported.
+            # An absent AF= (or an unparseable one, e.g. the VCF spec's
+            # own `AF=.`) stays None: the record matched, so the variant
+            # is PRESENT, but its frequency is unknown.
             return GnomadHit(
-                af=af or 0.0,
+                af=af,
                 af_popmax=af_popmax,
                 ac=ac,
                 an=an,
@@ -450,6 +525,7 @@ class GnomadLookup:
             try:
                 from email.utils import parsedate_to_datetime
                 from datetime import datetime, timezone
+
                 target = parsedate_to_datetime(retry_after)
                 if target.tzinfo is None:
                     target = target.replace(tzinfo=timezone.utc)
@@ -490,7 +566,10 @@ class GnomadLookup:
                     sleep_for = self._retry_delay(resp, delay, max_sleep)
                     logger.warning(
                         "[gnomAD API] HTTP %d on attempt %d/%d — retrying in %.1fs",
-                        resp.status_code, attempt, max_retries, sleep_for,
+                        resp.status_code,
+                        attempt,
+                        max_retries,
+                        sleep_for,
                     )
                     time.sleep(sleep_for)
                     delay = min(delay * 2, max_sleep)
@@ -503,7 +582,11 @@ class GnomadLookup:
                     sleep_for = min(delay, max_sleep) + random.uniform(0, delay * 0.25)
                     logger.warning(
                         "[gnomAD API] %s on attempt %d/%d — retrying in %.1fs: %s",
-                        type(exc).__name__, attempt, max_retries, sleep_for, exc,
+                        type(exc).__name__,
+                        attempt,
+                        max_retries,
+                        sleep_for,
+                        exc,
                     )
                     time.sleep(sleep_for)
                     delay = min(delay * 2, max_sleep)
@@ -530,10 +613,18 @@ class GnomadLookup:
             # variant key present but no genome data → genuinely absent from gnomAD
             return GnomadLookupOutcome.ABSENT
 
-        af = float(genome.get("af") or 0.0)
+        raw_af = genome.get("af")
+        # `af` is nullable in the schema this module queries: a variant can
+        # be PRESENT in the dataset with no genome-level frequency.
+        af: Optional[float] = float(raw_af) if raw_af is not None else None
         populations: List[Dict] = genome.get("populations") or []
 
-        af_popmax = 0.0
+        # Seeded to None, not 0.0. Seeded to 0.0 it can only ever be RAISED
+        # by the loop below, so an empty or absent `populations` array left
+        # a fabricated popmax of zero behind -- which _pm2 then preferred
+        # over a real af (classifier.py:595), awarding PM2 to a variant the
+        # API had just reported as common.
+        af_popmax: Optional[float] = None
         total_ac = 0
         total_an = 0
         for pop in populations:
@@ -541,8 +632,13 @@ class GnomadLookup:
             an = int(pop.get("an") or 0)
             total_ac += ac
             total_an += an
-            pop_af = ac / an if an > 0 else 0.0
-            if pop_af > af_popmax:
+            if an <= 0:
+                # No alleles called in this population: its frequency is
+                # undefined, not zero. Contributing 0.0 would make an
+                # uncovered population read as a measured absence.
+                continue
+            pop_af = ac / an
+            if af_popmax is None or pop_af > af_popmax:
                 af_popmax = pop_af
 
         return GnomadHit(

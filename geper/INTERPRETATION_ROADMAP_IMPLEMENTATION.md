@@ -1,7 +1,8 @@
 # GEPER Interpretation Roadmap -- Implementation & Validation Report
 
-This document covers the seven-phase clinical interpretation upgrade
-built on top of GEPER's existing biological evidence layer (DNA/RNA/
+This document covers the seven-phase upgrade to GEPER's
+clinician-assisting interpretation support, built on top of GEPER's
+existing biological evidence layer (DNA/RNA/
 protein models, ClinVar/dbSNP/BLAST/Ensembl/gnomAD, ClinGen, UniProt/
 InterPro/Pfam, AlphaFold DB). It does **not** re-document those
 pre-existing integrations -- see `VALIDATION_REPORT.md`,
@@ -14,11 +15,19 @@ Seven engines, wired together in `pipeline/interpretation.py`'s
 `InterpretationEngine.interpret()`, in this order:
 
 1. **`pipeline/acmg_rules.py` -- `ACMGRuleEngine`** (Phase 1): evaluates
-   all 28 ACMG/AMP 2015 criteria individually from existing provider
-   evidence. Each criterion reports `triggered` / `not_triggered` /
+   each of the 28 ACMG/AMP 2015 criteria individually from existing
+   provider evidence -- but nine of them are never evaluated for any
+   variant: the codes in `_NEVER_INTEGRATED_ACMG_CODES`
+   (`acmg_rules.py:291` -- PS2, PM3, PM6, PP2, PP5, BS2, BP2, BP5, PS4)
+   have no integrated data source and always report `not_evaluated`.
+   Each criterion reports `triggered` / `not_triggered` /
    `not_evaluated`, with rationale, supporting/conflicting evidence,
-   sources, and confidence. Combines into a classification via the
-   standard Richards et al. point-based rules.
+   sources, and confidence. Combines into a candidate ACMG
+   classification via Tavtigian et al. 2018's Bayesian-calibrated point
+   system -- NOT Richards et al. 2015, which is a categorical lookup
+   table and has no point system to attribute (see `_combine` and the
+   comment above `_STRENGTH`) -- for a qualified human reviewer to
+   confirm; GEPER does not finalize the classification.
 2. **`pipeline/interpretation_result.py` -- `InterpretationResult` /
    `build_interpretation_result()`** (Phase 2): the single canonical
    object every downstream engine and report builder consumes. Carries

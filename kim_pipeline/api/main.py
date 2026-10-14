@@ -1,7 +1,7 @@
 """
 api/main.py
 ────────────
-GEPER production FastAPI application.
+Bij AI sequencing-analysis component (Kim) production FastAPI application.
 
 Endpoints
 ---------
@@ -23,24 +23,25 @@ Configuration via environment variables:
   GEPER_CONFIG_PATH     Path to YAML config (default: config/default.yaml)
   GEPER_OUTPUT_DIR      Root directory for pipeline outputs (default: /tmp/geper_runs)
   GEPER_UPLOAD_DIR      Directory for uploaded files (default: /tmp/geper_uploads)
+  GEPER_DB_PATH         Path to SQLite run database (default: {GEPER_OUTPUT_DIR}/../geper_runs.db)
+                        MUST be on persistent storage for run history to survive restarts.
   GEPER_MAX_UPLOAD_MB   Max upload size in MB (default: 2048)
   GEPER_LOG_LEVEL       Logging level (default: INFO)
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import shutil
-import signal
+import subprocess
 import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import yaml
 from fastapi import (
@@ -65,6 +66,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from pipeline.orchestration.runner import PipelineRunner
+from pipeline.reporting.component_identity import COMPONENT_NAME, VERSION
+from shared.process_control import request_termination_async
 from api.run_store import RunStore
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -106,10 +109,16 @@ _RUN_STORE = RunStore()
 _RUNS: Dict[str, Dict[str, Any]] = {}
 _EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="geper_worker")
 
-# GAP 4: process group registry for cancellation
-_PROCESS_GROUPS: Dict[str, int] = {}  # run_id → pgid
+# GAP 4 / Windows process killing (2026-09-02): registry of the currently
+# live subprocess.Popen for each run, so DELETE can find and terminate it.
+# Stores the raw Popen object (not a POSIX pgid) -- see
+# pipeline/utils/process_control.py for why: process-group semantics don't
+# exist on Windows, and the kill logic below is fully cross-platform via
+# that module instead of doing platform-specific work here.
+_ACTIVE_PROCESSES: Dict[str, subprocess.Popen] = {}  # run_id → live Popen
 
 # ─── API key authentication (GAP 2) ──────────────────────────────────────────
+
 
 def _load_api_keys() -> Optional[Set[str]]:
     """Load valid API keys from GEPER_API_KEYS env var.
@@ -124,12 +133,46 @@ def _load_api_keys() -> Optional[Set[str]]:
 
 
 _API_KEYS: Optional[Set[str]] = _load_api_keys()
+_CORS_ORIGINS_ENV: Optional[str] = os.getenv(
+    "GEPER_CORS_ORIGINS"
+)  # None if unset; "*" applied later
+_DEV_INSECURE: bool = os.getenv("GEPER_DEV_INSECURE", "") == "1"
 
 if _API_KEYS is None:
     logger.warning(
         "GEPER_API_KEYS is not set — running in dev mode with no authentication. "
         "Set GEPER_API_KEYS=key1,key2 before deploying to production."
     )
+
+
+def _refuse_insecure_defaults_unless_opted_in() -> None:
+    """FIX #3: a startup warning is not a control -- it arrives after the
+    decision to run without auth/CORS restriction has already been made.
+    Refuse to start with the insecure defaults (no auth, CORS "*") unless
+    GEPER_DEV_INSECURE=1 is set explicitly, so a deployer who simply
+    forgets GEPER_API_KEYS/GEPER_CORS_ORIGINS gets a hard failure instead
+    of a log line that's easy to miss on a deploy console.
+    """
+    if _DEV_INSECURE:
+        return
+    missing = [
+        name
+        for name, value in (
+            ("GEPER_API_KEYS", _API_KEYS),
+            ("GEPER_CORS_ORIGINS", _CORS_ORIGINS_ENV),
+        )
+        if value is None
+    ]
+    if missing:
+        sys.stderr.write(
+            "ERROR: refusing to start with insecure defaults -- "
+            f"{' and '.join(missing)} not set. Set them before a real deployment, "
+            "or set GEPER_DEV_INSECURE=1 to run insecurely on purpose (dev/test only).\n"
+        )
+        sys.exit(1)
+
+
+_refuse_insecure_defaults_unless_opted_in()
 
 
 async def _require_api_key(x_api_key: str = Header(default="")) -> None:
@@ -149,18 +192,25 @@ async def _require_api_key(x_api_key: str = Header(default="")) -> None:
         )
 
 
-
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="GEPER Genomics Pipeline API",
+    # Scoped 2026-09-11: this app imports only Kim's PipelineRunner and
+    # serves only FASTQ/FASTA upload and Kim pipeline runs. The DISCLAIMER
+    # sentence below names the PRODUCT (ratified intended-use text) and is
+    # deliberately left as it is.
+    title=f"{COMPONENT_NAME} API",
     description=(
-        "Production API for the GEPER clinical genomics pipeline. "
+        f"Production API for the {COMPONENT_NAME} (Kim). "
         "Accepts FASTQ inputs and returns annotated variant reports. "
-        "DISCLAIMER: For research use only. Not a clinical diagnostic tool."
+        "DISCLAIMER: Bij AI assists qualified clinicians and pathologists; it produces a draft "
+        "classification requiring qualified human review and final sign-off before any clinical "
+        "use, and does not independently provide final clinical interpretation."
     ),
-    version="8.0.0",
-    contact={"name": "GEPER Team"},
+    # Kim's single version source (component_identity.VERSION); also what
+    # /health returns via app.version.
+    version=VERSION,
+    contact={"name": "Geper Team"},
     license_info={"name": "Proprietary"},
     openapi_tags=[
         {"name": "health", "description": "Liveness and readiness probes"},
@@ -171,7 +221,7 @@ app = FastAPI(
 )
 
 # CORS — restrict origins in production via GEPER_CORS_ORIGINS env var
-_cors_origins = os.getenv("GEPER_CORS_ORIGINS", "*").split(",")
+_cors_origins = (_CORS_ORIGINS_ENV or "*").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -181,22 +231,88 @@ app.add_middleware(
 )
 
 
+# ─── Divergence 1: Startup reconciliation ───────────────────────────────────────
+
+
+@app.on_event("startup")
+async def _reconcile_runs_on_startup():
+    """
+    Reconcile _RUNS dict with SQLite store on startup.
+
+    Two tasks:
+    1. Load all SQLite runs into _RUNS (Divergence 5: list_runs horizon)
+    2. Mark any "running" runs as "interrupted" (Divergence 1: stale restart)
+
+    A crash while a run is executing leaves it marked status='running' in SQLite.
+    When the process restarts, the worker thread that was updating it is gone.
+    This handler marks any run still 'running' after startup as 'interrupted'
+    to indicate the process died (distinct from 'failed', which means the
+    pipeline ran and hit an error). This allows the operator to clean up
+    and re-submit without being stuck in an unrecoverable state.
+
+    SAFETY NOTE: This handler is only safe at startup because on_event("startup")
+    runs before any worker thread can exist. If moved to any other location,
+    it would incorrectly mark live, actively-running jobs as interrupted.
+    Moving this handler elsewhere breaks the assumption that status="running"
+    at this point is always a stale artifact of a prior crash, not a real
+    active run.
+    """
+    # Divergence 5 fix: Load all SQLite runs into _RUNS so list_runs sees them.
+    # This ensures runs created in a prior process instance are visible.
+    all_rows = _RUN_STORE.list_all(limit=10000)
+    for row in all_rows:
+        run_id = row.get("run_id")
+        if run_id and run_id not in _RUNS:
+            _RUNS[run_id] = row
+
+    # Divergence 1 fix: Mark stale running rows as interrupted
+    stale_runs = []
+    for row in all_rows:
+        run_id = row.get("run_id")
+        if row.get("status") == "running":
+            stale_runs.append((run_id, row.get("sample_id")))
+
+    if stale_runs:
+        for run_id, sample_id in stale_runs:
+            reason = (
+                "Process restart detected: run was marked 'running' at shutdown. "
+                "No active worker found. Marked interrupted to allow cleanup and re-submission."
+            )
+            _RUN_STORE.update(run_id, status="interrupted", error=reason)
+            if run_id in _RUNS:
+                _RUNS[run_id]["status"] = "interrupted"
+                _RUNS[run_id]["error"] = reason
+            logger.warning(
+                f"Reconciled stale run {run_id} (sample_id={sample_id}): "
+                f"marked interrupted due to process restart"
+            )
+
+
 # ─── Exception handlers ───────────────────────────────────────────────────────
+
 
 @app.exception_handler(Exception)
 async def _generic_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled exception on %s %s", request.method, request.url)
+    error_id = str(uuid.uuid4())
+    logger.exception(
+        "Unhandled exception [%s] on %s %s: %s",
+        error_id,
+        request.method,
+        request.url,
+        str(exc),
+    )
     return JSONResponse(
         status_code=500,
         content={
             "error": "InternalServerError",
-            "detail": str(exc),
-            "path": str(request.url),
+            "error_id": error_id,
+            "detail": "An internal error occurred. Contact support with error ID if the problem persists.",
         },
     )
 
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
+
 
 class PipelineStartRequest(BaseModel):
     """Request body for POST /api/v1/pipeline/start."""
@@ -250,6 +366,7 @@ _STAGE_PROGRESS = {
 
 # ─── Background worker ───────────────────────────────────────────────────────
 
+
 def _run_pipeline_sync(run_id: str, req: PipelineStartRequest) -> None:
     """Synchronous pipeline execution — runs in thread pool."""
     run = _RUNS[run_id]
@@ -267,13 +384,16 @@ def _run_pipeline_sync(run_id: str, req: PipelineStartRequest) -> None:
 
         runner = PipelineRunner(cfg=cfg)
 
-        # GAP 4: register kill callback so DELETE can send SIGTERM/SIGKILL
+        # GAP 4 / Windows process killing: register a callback so DELETE can
+        # find and terminate whatever subprocess is currently running for
+        # this run_id. Fired once per subprocess spawned anywhere during
+        # runner.run() (each stage's external tool call, in sequence) -- the
+        # registry always holds the CURRENTLY live one; overwriting a
+        # finished stage's entry with the next stage's is intentional and
+        # harmless (killing an already-exited process is a safe no-op, see
+        # pipeline/utils/process_control.py).
         def _kill_cb(popen_obj):
-            try:
-                pgid = os.getpgid(popen_obj.pid)
-                _PROCESS_GROUPS[run_id] = pgid
-            except Exception:
-                pass
+            _ACTIVE_PROCESSES[run_id] = popen_obj
 
         runner.register_kill_callback(_kill_cb)
 
@@ -318,7 +438,12 @@ def _run_pipeline_sync(run_id: str, req: PipelineStartRequest) -> None:
         run["status"] = "failed"
         run["error"] = str(exc)
         run["stages_failed"].append(run.get("stage", "unknown"))
-        _RUN_STORE.update(run_id, status="failed", error=str(exc))
+        _RUN_STORE.update(
+            run_id,
+            status="failed",
+            error=str(exc),
+            stages_failed=run["stages_failed"],
+        )
     finally:
         run["finished_at"] = datetime.now(timezone.utc).isoformat()
         run["elapsed_seconds"] = round(time.time() - t0, 2)
@@ -327,11 +452,11 @@ def _run_pipeline_sync(run_id: str, req: PipelineStartRequest) -> None:
             finished_at=run["finished_at"],
             elapsed_seconds=run["elapsed_seconds"],
         )
-        _PROCESS_GROUPS.pop(run_id, None)
-
+        _ACTIVE_PROCESSES.pop(run_id, None)
 
 
 # ─── Health endpoints ─────────────────────────────────────────────────────────
+
 
 @app.get("/health", tags=["health"], summary="Liveness probe")
 async def health() -> Dict:
@@ -355,30 +480,155 @@ async def ready() -> Dict:
 
 # ─── Config endpoint ──────────────────────────────────────────────────────────
 
+
+# History: this redaction was originally a name-based DENYLIST (redact keys
+# containing "key"/"token"/"secret"/"password"), first applied one dict-level
+# deep only, then made recursive. Both versions were default-ALLOW: an
+# unrecognised field name leaked by default. Confirmed leaking under the
+# denylist: auth_credential, oauth_bearer, private_cert -- none matched the
+# keyword list. That's an unbounded failure mode (anything not yet thought of
+# leaks), so the model is inverted here to an explicit, per-field ALLOWLIST
+# (default-DENY): only fields named in _CONFIG_ALLOWLIST are ever returned;
+# everything else is "***REDACTED***", including fields added to
+# config/default.yaml in the future that nobody remembers to allowlist.
+#
+# The allowlist is deliberately per-FIELD, not per-section: a section-level
+# allow would silently expose any field later added under that section,
+# reinstating the exact defect this inversion exists to remove.
+#
+# Filesystem paths (tsv_gz_path, vcf_path, cache_dir, refseq_gff, index_dir,
+# db_path, vep.cache_dir/dir_plugins/cadd_data/revel_data/alphamissense_data/
+# fasta, reporting.output_dir, api.host, ...) are deliberately NOT allowlisted
+# even though they aren't secrets: they reveal server deployment structure,
+# the same leak class the original 500-handler information-disclosure fix
+# addressed (str(request.url)). config_path/output_dir/upload_dir below (the
+# three fields returned alongside "config", not inside it) are the same
+# category and are redacted for the same reason -- see hive dispatch
+# 2026-09-02 "PART 1 APPROVED: Allowlist rulings" for the bucket-by-bucket
+# policy decision this list encodes.
+_CONFIG_ALLOWLIST: Dict[str, Any] = {
+    "clinvar": {"enabled": True},
+    "gnomad": {
+        "enabled": True,
+        "graphql_dataset": True,
+        "timeout": True,
+        "max_retries": True,
+        "retry_backoff_secs": True,
+        "max_concurrent": True,
+        "cache_ttl_hours": True,
+    },
+    "rna_analysis": {"enabled": True, "auto_fetch_mt_gff3": True},
+    "acmg_thresholds": {
+        "ba1_af": True,
+        "bs1_af": True,
+        "pm2_af_max": True,
+        "pp3_cadd_phred": True,
+        "pp3_revel": True,
+        "pp3_alphamissense": True,
+        "bp4_cadd_phred": True,
+        "bp4_revel": True,
+        # pp3_spliceai / bp4_spliceai removed 2026-09-11: dead thresholds,
+        # see config/default.yaml.
+    },
+    "evidence_engine": {
+        "weight_acmg": True,
+        "weight_clinvar": True,
+        "weight_computational": True,
+        "weight_ai": True,
+    },
+    "reporting": {"generate_pdf": True},
+    "api": {"log_level": True, "cors_origins": True, "port": True},
+    "dnabert2": {"model_name": True, "device": True, "batch_size": True},
+    "esm2": {"model_name": True, "device": True, "batch_size": True},
+    "alignment": {"aligner": True, "threads": True, "preset": True},
+    "variant_calling": {
+        "threads": True,
+        "min_base_quality": True,
+        "min_mapping_quality": True,
+        "min_alternate_fraction": True,
+        "min_alternate_count": True,
+        "filter_min_qual": True,
+        "filter_min_depth": True,
+    },
+    "qc": {
+        "stop_on_failure": True,
+        "max_dup_sample": True,
+        "thresholds": {
+            "min_mean_quality": True,
+            "max_n_fraction": True,
+            "min_gc_fraction": True,
+            "max_gc_fraction": True,
+            "max_adapter_fraction": True,
+            "max_duplicate_fraction": True,
+            "min_total_reads": True,
+            "min_read_length": True,
+        },
+    },
+    "blast": {
+        "enabled": True,
+        "evalue": True,
+        "max_target_seqs": True,
+        "word_size": True,
+        "timeout": True,
+        "output_format": True,
+        "threads": True,
+    },
+    "gnomad_constraint": {"loeuf_threshold": True, "pli_threshold": True},
+    "clingen": {
+        "enabled": True,
+        "api_enabled": True,
+        "api_endpoint": True,
+        "timeout": True,
+        "max_retries": True,
+    },
+    "hotspot": {"enabled": True, "min_stars": True},
+    "vep": {"enabled": True, "timeout": True},
+}
+
+
+def _apply_config_allowlist(cfg: Dict, allowed: Dict) -> Dict:
+    """Recursively redact everything not explicitly named in `allowed`.
+
+    `allowed[k] is True` exposes a scalar leaf as-is. `allowed[k]` being a
+    dict descends into `cfg[k]` (also a dict) under that nested allowlist.
+    Anything else -- a key absent from `allowed`, or a shape mismatch
+    between `cfg` and `allowed` at that key -- redacts to "***REDACTED***".
+    Default-deny: an unrecognised field, including one added to the config
+    file after this list was written, is never exposed.
+    """
+    result: Dict = {}
+    for k, v in cfg.items():
+        spec = allowed.get(k)
+        if isinstance(v, dict):
+            result[k] = (
+                _apply_config_allowlist(v, spec) if isinstance(spec, dict) else "***REDACTED***"
+            )
+        else:
+            result[k] = v if spec is True else "***REDACTED***"
+    return result
+
+
 @app.get("/api/v1/config", tags=["config"], summary="Return active configuration")
 async def get_config(_auth: None = Depends(_require_api_key)) -> Dict:
-    """Return the active pipeline configuration with sensitive keys redacted."""
-    safe_cfg = {}
-    for k, v in _PIPELINE_CONFIG.items():
-        if isinstance(v, dict):
-            # Redact keys that look like secrets
-            safe_cfg[k] = {
-                sk: "***REDACTED***" if any(
-                    word in sk.lower() for word in ("key", "token", "secret", "password")
-                ) else sv
-                for sk, sv in v.items()
-            }
-        else:
-            safe_cfg[k] = v
+    """Return the active pipeline configuration, allowlisted field-by-field.
+
+    Only fields named in _CONFIG_ALLOWLIST are returned as-is; everything
+    else -- secrets, filesystem paths, and any future/unrecognised field --
+    is redacted. config_path/output_dir/upload_dir are themselves
+    filesystem paths (deployment structure) and are redacted for the same
+    reason, not exposed just because they sit outside the "config" dict.
+    """
+    safe_cfg = _apply_config_allowlist(_PIPELINE_CONFIG, _CONFIG_ALLOWLIST)
     return {
         "config": safe_cfg,
-        "config_path": _CONFIG_PATH,
-        "output_dir": str(_OUTPUT_DIR),
-        "upload_dir": str(_UPLOAD_DIR),
+        "config_path": "***REDACTED***",
+        "output_dir": "***REDACTED***",
+        "upload_dir": "***REDACTED***",
     }
 
 
 # ─── Upload endpoints ─────────────────────────────────────────────────────────
+
 
 async def _save_upload(file: UploadFile, allowed_suffixes: tuple) -> str:
     """Save an uploaded file to _UPLOAD_DIR and return its path."""
@@ -414,7 +664,7 @@ async def _save_upload(file: UploadFile, allowed_suffixes: tuple) -> str:
                 )
             out.write(chunk)
 
-    logger.info("Uploaded file: %s → %s (%d bytes)", file.filename, dest.name, written)
+    logger.info("Uploaded file: %s -> %s (%d bytes)", file.filename, dest.name, written)
     return str(dest)
 
 
@@ -456,6 +706,7 @@ async def upload_fasta(
 
 # ─── Pipeline control endpoints ───────────────────────────────────────────────
 
+
 @app.post(
     "/api/v1/pipeline/start",
     tags=["pipeline"],
@@ -481,10 +732,16 @@ async def start_pipeline(
     _validate_path_in_roots(req.reference_fasta_path, _UPLOAD_DIR, _OUTPUT_DIR)
 
     # FIX 8 — validate config_overrides against explicit allowlist
-    _ALLOWED_OVERRIDE_SECTIONS = frozenset({
-        "qc", "acmg_thresholds", "evidence_engine", "evidence_thresholds",
-        "blast", "pgx", "ancestry",
-    })
+    _ALLOWED_OVERRIDE_SECTIONS = frozenset(
+        {
+            "qc",
+            "acmg_thresholds",
+            "evidence_engine",
+            "evidence_thresholds",
+            "blast",
+            "ancestry",
+        }
+    )
     if req.config_overrides:
         rejected = [k for k in req.config_overrides if k not in _ALLOWED_OVERRIDE_SECTIONS]
         if rejected:
@@ -549,6 +806,7 @@ async def start_pipeline(
             if exc and run_id in _RUNS:
                 _RUNS[run_id]["status"] = "failed"
                 _RUNS[run_id]["error"] = str(exc)
+                _RUN_STORE.update(run_id, status="failed", error=str(exc))
         except Exception:
             pass
 
@@ -614,12 +872,31 @@ def _get_run(run_id: str) -> Dict:
     return run
 
 
+def _snapshot_run(run: Dict) -> Dict:
+    """Shallow-copy `run` -- the shared `_RUNS[run_id]` object also written by
+    `_run_pipeline_sync` (a background thread) and `_on_done` (its
+    done-callback) with zero locking. `dict(run)` is a single call that never
+    releases the GIL back to another Python-level thread mid-copy, so the
+    result is a self-consistent view of every key as of one instant, even
+    though nothing here prevents a writer from continuing to mutate `run`
+    itself afterward. Ruled 2026-09-11: "a lock around three unsynchronised
+    contexts invites a fourth that forgets it. Snapshot makes the read atomic
+    by construction rather than by everyone's discipline." A caller must
+    build its response from THIS return value, never from `run` again --
+    reading `run` after taking the snapshot reintroduces the exact torn read
+    this exists to close.
+    """
+    return dict(run)
+
+
 @app.get(
     "/api/v1/pipeline/{run_id}/status",
     tags=["pipeline"],
     summary="Get full pipeline run status",
 )
-async def pipeline_status(run_id: str, _auth: None = Depends(_require_api_key)) -> RunStatusResponse:
+async def pipeline_status(
+    run_id: str, _auth: None = Depends(_require_api_key)
+) -> RunStatusResponse:
     """Return detailed status for a pipeline run."""
     run = _get_run(run_id)
 
@@ -627,7 +904,10 @@ async def pipeline_status(run_id: str, _auth: None = Depends(_require_api_key)) 
     if run["status"] == "running":
         _refresh_progress_from_checkpoint(run_id, run)
 
-    return RunStatusResponse(**{k: run[k] for k in RunStatusResponse.model_fields if k in run})
+    snapshot = _snapshot_run(run)
+    return RunStatusResponse(
+        **{k: snapshot[k] for k in RunStatusResponse.model_fields if k in snapshot}
+    )
 
 
 @app.get(
@@ -640,11 +920,12 @@ async def pipeline_progress(run_id: str, _auth: None = Depends(_require_api_key)
     run = _get_run(run_id)
     if run["status"] == "running":
         _refresh_progress_from_checkpoint(run_id, run)
+    snapshot = _snapshot_run(run)
     return {
         "run_id": run_id,
-        "status": run["status"],
-        "stage": run.get("stage"),
-        "progress_pct": run["progress_pct"],
+        "status": snapshot["status"],
+        "stage": snapshot.get("stage"),
+        "progress_pct": snapshot["progress_pct"],
     }
 
 
@@ -703,6 +984,40 @@ async def download_log(run_id: str, _auth: None = Depends(_require_api_key)) -> 
     return {"run_id": run_id, "log": "", "message": "No log file found"}
 
 
+def _other_runs_sharing_sample_id(sample_id: str, exclude_run_id: str) -> list:
+    """Return run_ids (other than exclude_run_id) that still reference
+    sample_id, across both the in-memory cache and the persistent store.
+
+    ARCHITECTURAL BOUNDARY: PipelineRunner keys its work_dir by sample_id
+    alone (pipeline/orchestration/runner.py) -- deliberately, so that
+    re-running the same sample_id resumes from its checkpoint.json instead
+    of starting over. That design choice, made purely for resumability,
+    means distinct runs (distinct run_ids) can legitimately share one
+    on-disk directory whenever they share a sample_id -- which happens by
+    default, since sample_id defaults to the literal "SAMPLE" for any
+    caller that doesn't set it.
+
+    DELETE's contract, however, is per-run_id ({run_id} in the route, "Cancel
+    or delete a run" in its summary). Nothing in the runner's checkpoint/
+    resume design anticipated that contract, and nothing here should ever
+    change the runner's directory layout -- this function exists solely to
+    keep DELETE from acting past its own boundary. Before rmtree-ing a
+    sample_id's work_dir, we must confirm no other run_id still depends on
+    it; if one does, the run_id being deleted loses its registry entry but
+    the shared directory is left alone for the survivor.
+    """
+    others = {
+        rid for rid, r in _RUNS.items() if rid != exclude_run_id and r.get("sample_id") == sample_id
+    }
+    # Divergence 6 fix: scan ALL rows in SQLite, not just first 1000.
+    # The old limit=1000 could miss runs beyond 1000 rows, allowing unsafe deletion.
+    for r in _RUN_STORE.list_all():
+        rid = r.get("run_id")
+        if rid and rid != exclude_run_id and r.get("sample_id") == sample_id:
+            others.add(rid)
+    return sorted(others)
+
+
 @app.delete(
     "/api/v1/pipeline/{run_id}",
     tags=["pipeline"],
@@ -712,38 +1027,42 @@ async def download_log(run_id: str, _auth: None = Depends(_require_api_key)) -> 
 async def delete_run(run_id: str, _auth: None = Depends(_require_api_key)) -> Dict:
     """Cancel a pending/running run or delete artefacts of a finished run.
 
-    For running runs, sends SIGTERM to the pipeline process group,
-    waits 5 seconds, then SIGKILL if still alive.
+    For running runs, sends a graceful stop to the currently-active
+    subprocess (and its descendants) now, escalating to a hard kill a few
+    seconds later if it's still alive -- cross-platform, see
+    pipeline/utils/process_control.py. Does not block waiting for the
+    process to actually exit; the escalation runs on a background thread.
     """
     run = _get_run(run_id)
 
     if run["status"] in ("pending", "running"):
-        # GAP 4: kill the subprocess group
-        pgid = _PROCESS_GROUPS.get(run_id)
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-                # Brief wait, then SIGKILL if still alive
-                import threading as _threading
-                def _sigkill_after():
-                    time.sleep(5)
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                _threading.Thread(target=_sigkill_after, daemon=True).start()
-            except ProcessLookupError:
-                pass
-            _PROCESS_GROUPS.pop(run_id, None)
+        # GAP 4 / Windows process killing: terminate whatever subprocess is
+        # currently running for this run_id.
+        proc = _ACTIVE_PROCESSES.get(run_id)
+        if proc is not None:
+            request_termination_async(proc)
+            _ACTIVE_PROCESSES.pop(run_id, None)
 
         run["status"] = "cancelled"
         run["finished_at"] = datetime.now(timezone.utc).isoformat()
         _RUN_STORE.update(run_id, status="cancelled", finished_at=run["finished_at"])
 
-    # Remove output artefacts
-    work_dir = _OUTPUT_DIR / run["sample_id"]
-    if work_dir.exists():
-        shutil.rmtree(work_dir, ignore_errors=True)
+    # Remove output artefacts -- but only if no other live run still shares
+    # this sample_id's work_dir (see _other_runs_sharing_sample_id).
+    sample_id = run["sample_id"]
+    survivors = _other_runs_sharing_sample_id(sample_id, run_id)
+    if survivors:
+        logger.warning(
+            "Run %s deleted, but work_dir for sample_id=%s preserved: "
+            "still referenced by run(s) %s",
+            run_id,
+            sample_id,
+            ", ".join(survivors),
+        )
+    else:
+        work_dir = _OUTPUT_DIR / sample_id
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     _RUN_STORE.delete(run_id)
     _RUNS.pop(run_id, None)
@@ -776,11 +1095,27 @@ async def list_runs(_auth: None = Depends(_require_api_key)) -> Dict:
 
 # ─── Checkpoint-based progress refresh ───────────────────────────────────────
 
+
 def _refresh_progress_from_checkpoint(run_id: str, run: Dict) -> None:
-    """Read checkpoint.json to update stage and progress_pct in the run record."""
+    """Read checkpoint.json to update stage and progress_pct in the run record.
+
+    NOTE: PipelineRunner uses sample_id (not run_id) as the work directory key,
+    to support resumability. When multiple distinct runs share a sample_id,
+    they share a checkpoint.json file. To minimize cross-contamination, we first
+    check for a run-specific checkpoint path (for future compatibility if the
+    PipelineRunner is updated to support run_id directories), then fall back
+    to the sample_id path.
+    """
     import json as _json
+
     sample_id = run["sample_id"]
-    cp_path = _OUTPUT_DIR / sample_id / "checkpoint.json"
+
+    # Divergence 4: Try run-specific checkpoint first (future: if PipelineRunner
+    # creates run_id directories), then fall back to sample_id for current behavior.
+    cp_path = _OUTPUT_DIR / run_id / "checkpoint.json"
+    if not cp_path.exists():
+        cp_path = _OUTPUT_DIR / sample_id / "checkpoint.json"
+
     if not cp_path.exists():
         return
     try:

@@ -45,6 +45,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,11 +56,28 @@ from pipeline.fastq.errors import FastqPipelineError
 from pipeline.fastq.validator import FastqValidator
 from pipeline.qc.stage import QCStage, QCThresholdError
 from pipeline.reporting.stage import ReportingStage
+from shared.process_control import _CURRENT_KILL_CALLBACK
 from pipeline.utils.reference_cache import ReferenceCacheError, resolve_reference
 from pipeline.variant_calling.stage import VariantCallingStage
 from pipeline.vep.stage import VEPAnnotationStage
 
 logger = logging.getLogger("geper.pipeline.orchestration.runner")
+
+
+def NO_KILL_TRACKING(popen_obj) -> None:  # noqa: N802 (reads as a named constant, not a verb)
+    """Pass to register_kill_callback() to explicitly opt a run out of
+    cancellation tracking (standalone CLI/script use with no DELETE
+    endpoint in the picture -- see main()/run_pipeline.py below).
+
+    A real no-op function object, not None, on purpose: run() below treats
+    an *unregistered* callback (self._kill_callback is None) as a bug --
+    silently proceeding with no cancellation path is exactly the failure
+    mode this whole mechanism exists to prevent. Passing this constant is
+    how a caller says "I've considered it and killability genuinely
+    doesn't apply here," which is different from never having considered
+    it at all.
+    """
+    return None
 
 
 # ─── Checkpoint helpers ───────────────────────────────────────────────────────
@@ -71,6 +89,17 @@ _STAGES_IN_ORDER = [
     "annotation",
     "reporting",
 ]
+
+# FIX 12: this exists as a constant, not an inline literal, so that
+# test_defect_regression.py can IMPORT it rather than retype it. Both
+# blast_summary tests used to hardcode this string themselves and assert
+# against their own copy -- a tautology that stayed green even after this
+# text was deleted from here. Importing this constant is what makes those
+# tests fail when the disclaimer changes; inlining it back "as a tidy-up"
+# would silently restore that exact defect. Do not inline it.
+BLAST_SUMMARY_NOTE = (
+    "BLAST results are supporting information only and do not override ACMG evidence."
+)
 
 
 def _checkpoint_path(work_dir: Path) -> Path:
@@ -89,6 +118,19 @@ def _load_checkpoint(work_dir: Path) -> dict[str, Any]:
 
 def _save_checkpoint(work_dir: Path, data: dict[str, Any]) -> None:
     _checkpoint_path(work_dir).write_text(json.dumps(data, indent=2))
+
+
+def _ensure_analysis_started_at(checkpoint: dict[str, Any]) -> str:
+    """Set `checkpoint["analysis_started_at"]` once, on the FIRST run of
+    this sample, and return it. A resume must keep the ORIGINAL start
+    time from the loaded checkpoint, not overwrite it with the resume
+    moment -- the reporting stage's "Generated" field reads this value,
+    and stamping resume time there answers a question nobody asked
+    (DEFECT-kim-reporting-stage-658).
+    """
+    if "analysis_started_at" not in checkpoint:
+        checkpoint["analysis_started_at"] = datetime.now(timezone.utc).isoformat()
+    return checkpoint["analysis_started_at"]
 
 
 def _collect_reference_versions(cfg: dict, reference_fasta: str) -> dict[str, str]:
@@ -208,6 +250,17 @@ class PipelineRunner:
 
         The API layer uses this to store popen objects keyed by run_id so
         it can kill the subprocess group on DELETE.
+
+        run() below REQUIRES this to have been called (with a real callback
+        or an explicit no-op -- see the module-level NO_KILL_TRACKING
+        comment) before it will execute at all. This is deliberate: the
+        original defect here (2026-09-02 "Windows process killing" dispatch)
+        was a callback that was silently never invoked, so a run had no
+        working cancellation path and nothing said so. Making the absence
+        of a registered callback a loud failure at run() entry, instead of
+        a silent one discovered only when someone tries DELETE, is the fix
+        for that specific shape of bug, not just for this one instance of
+        it -- ruled 2026-09-02, "silence must fail, not pass silently."
         """
         self._kill_callback = callback
 
@@ -243,7 +296,7 @@ class PipelineRunner:
                               ``"vcf_only"`` to stop immediately after
                               Variant Calling and return the filtered VCF
                               without running Kim's own annotation/ACMG/
-                              PGx/ancestry/reporting stages — this is the
+                              ancestry/reporting stages — this is the
                               mode used when Kim is acting purely as the
                               FASTQ-to-VCF engine in front of another
                               interpretation pipeline (e.g. GEPER).
@@ -267,6 +320,42 @@ class PipelineRunner:
             )
         if mode == "vcf_only":
             stop_after = stop_after or "variant_calling"
+
+        # "Silence must fail, not pass silently" (ruled 2026-09-02): the
+        # original Windows-process-killing defect was a callback that
+        # simply never fired, with nothing to say so -- a run with no
+        # working cancellation path looked identical to one with a working
+        # one, right up until someone tried DELETE. Refuse to proceed if
+        # register_kill_callback() was never called, instead of silently
+        # running an unkillable pipeline. A caller that has deliberately
+        # decided killability doesn't apply (standalone CLI/script use, no
+        # DELETE endpoint in the picture) must say so explicitly via
+        # register_kill_callback(NO_KILL_TRACKING) -- see that constant's
+        # docstring.
+        if self._kill_callback is None:
+            raise RuntimeError(
+                "PipelineRunner.run() called without register_kill_callback() "
+                "having been called first. A run with no registered kill "
+                "callback cannot be cancelled via DELETE, and that must be a "
+                "loud failure here, not a silent gap discovered later. Call "
+                "register_kill_callback(<callback>) before run(), or "
+                "register_kill_callback(NO_KILL_TRACKING) if this run "
+                "genuinely doesn't need to be cancellable (e.g. a "
+                "standalone CLI/script run with no API/DELETE involved)."
+            )
+
+        # Make self._kill_callback reachable from every subprocess spawned
+        # anywhere below in this call -- pipeline/fastq/errors.py::_run()
+        # and pipeline/utils/reference_cache.py's index-build helper read
+        # this contextvar via spawn_tracked() without needing a callback
+        # parameter threaded through either of their own many call sites.
+        # Not reset in a finally: this run() call executes entirely inside
+        # one dedicated thread-pool worker thread (api/main.py's
+        # ThreadPoolExecutor), and every run() call sets this again at its
+        # own entry, so a stale value between runs on a reused thread is
+        # never read by anything (nothing spawns a subprocess outside an
+        # active run() call in that thread).
+        _CURRENT_KILL_CALLBACK.set(self._kill_callback)
 
         t_total = time.time()
         work_dir = Path(output_dir) / sample_id
@@ -318,6 +407,12 @@ class PipelineRunner:
 
         checkpoint = _load_checkpoint(work_dir) if self._resume else {}
         completed_stages = set(checkpoint.get("completed_stages", []))
+
+        # Saved immediately (not deferred to the next stage's own
+        # _save_checkpoint call) so a crash before stage 1 completes
+        # doesn't lose it -- see _ensure_analysis_started_at's docstring.
+        _ensure_analysis_started_at(checkpoint)
+        _save_checkpoint(work_dir, checkpoint)
 
         logger.info(
             "=== PipelineRunner START [%s] resume=%s completed=%s ===",
@@ -541,7 +636,7 @@ class PipelineRunner:
             # ── Early stop (mode="vcf_only" / stop_after="variant_calling") ──
             # Kim acting purely as the FASTQ-to-VCF engine: QC, Alignment, and
             # Variant Calling have already completed above. Do NOT continue
-            # into Kim's own VEP/annotation/ACMG/PGx/ancestry/reporting
+            # into Kim's own VEP/annotation/ACMG/ancestry/reporting
             # stages — those modules are left fully intact and still run
             # normally for standalone ("full") Kim runs, they are simply
             # skipped here so that filtered_variants.vcf can be handed off
@@ -556,6 +651,29 @@ class PipelineRunner:
                 result.stopped_after = "variant_calling"
                 result.success = True
                 return result
+
+            # ── Preflight: VCF vs GFF3 genome build ───────────────────────
+            # Deliberately placed AFTER the vcf_only early return above,
+            # not with the VCF build detection before it. In vcf_only
+            # mode kim never loads the GFF3 -- annotation and reporting
+            # do not run -- so a build disagreement between the VCF and a
+            # configured-but-unused GFF3 is not a defect of that run, and
+            # blocking it here would refuse bridge runs for a file they
+            # never open. From this point on the GFF3's transcript model
+            # IS used, to build every HGVS c. position.
+            #
+            # Raises ConfigValidationError on a definite disagreement;
+            # deliberately NOT wrapped in a try/except, unlike the
+            # detection above -- that block swallows failures to keep an
+            # advisory warning advisory, and swallowing this one would
+            # reinstate exactly the silence this check exists to end.
+            _gff_for_build_check = (self._cfg.get("annotation", {}) or {}).get("refseq_gff") or (
+                self._cfg.get("rna_analysis", {}) or {}
+            ).get("refseq_gff")
+            if _gff_for_build_check:
+                from pipeline.utils.genome_build import check_vcf_gff3_build_consistency
+
+                check_vcf_gff3_build_consistency(filtered_vcf, _gff_for_build_check)
 
             # ── Stage 2b: VEP Annotation ──────────────────────────────────
             vep_out = str(work_dir / "vep_annotation")
@@ -754,7 +872,7 @@ class PipelineRunner:
                     result.annotation["blast_summary"] = {
                         "total_hits": blast_result_data.get("hit_count", 0),
                         "blast_db": blast_result_data.get("database", ""),
-                        "note": "BLAST results are supporting information only and do not override ACMG evidence.",
+                        "note": BLAST_SUMMARY_NOTE,
                     }
                     logger.info(
                         "[%s] BLAST results integrated into annotation: %d hits",
@@ -869,46 +987,6 @@ class PipelineRunner:
                 result.acmg_results = result.acmg_results or []
                 acmg_results = result.acmg_results
 
-            # ── Stage 4c: Pharmacogenomics (PGx) ─────────────────────────
-            pgx_result = None
-            pgx_out = str(work_dir / "pgx")
-            if "pgx" not in completed_stages:
-                _stage_t0_pgx = time.monotonic()
-                logger.info("[%s] Stage 4c: Pharmacogenomics (PGx)", sample_id)
-                try:
-                    from pipeline.pgx.stage import PGxStage
-
-                    vcf_for_pgx = (
-                        result.variant_calling.get("filtered_vcf_path", "")
-                        if result.variant_calling
-                        else ""
-                    )
-                    pgx_stage = PGxStage(cfg=self._cfg)
-                    pgx_result = pgx_stage.run(
-                        vcf_path=vcf_for_pgx,
-                        output_dir=pgx_out,
-                        sample_id=sample_id,
-                    )
-                    completed_stages.add("pgx")
-                    checkpoint["completed_stages"] = list(completed_stages)
-                    checkpoint["pgx_json_path"] = pgx_result.report_json_path
-                    _save_checkpoint(work_dir, checkpoint)
-                    result.stages_completed.append("pgx")
-                    logger.info(
-                        "[TIMING] stage=%s elapsed=%.2fs", "pgx", time.monotonic() - _stage_t0_pgx
-                    )
-                    logger.info(
-                        "[%s] Stage 4c complete: PGx annotated %d genes",
-                        sample_id,
-                        len(pgx_result.annotations),
-                    )
-                except Exception as exc:
-                    logger.warning("[%s] Stage 4c PGx failed (non-fatal): %s", sample_id, exc)
-                    result.stages_skipped.append("pgx")
-            else:
-                logger.info("[%s] Stage 4c: PGx — SKIPPED (checkpoint)", sample_id)
-                result.stages_skipped.append("pgx")
-
             # ── Stage 4d: Ancestry Inference ─────────────────────────────
             ancestry_result = None
             ancestry_out = str(work_dir / "ancestry")
@@ -966,9 +1044,9 @@ class PipelineRunner:
                     variant_stats=result.variant_calling,
                     annotation_result=result.annotation,
                     acmg_results=acmg_results,
-                    pgx_result=pgx_result,
                     ancestry_result=ancestry_result,
                     reference_versions=result.reference_versions,  # FIX 14
+                    analysis_started_at=checkpoint.get("analysis_started_at"),
                 )
                 result.report = report_result.to_dict()
                 completed_stages.add("reporting")
@@ -1026,9 +1104,13 @@ class PipelineRunner:
 def _build_cli_parser():
     import argparse
 
+    from pipeline.reporting.component_identity import PIPELINE_VERSION
+
+    # ASCII "->", not U+2192: this help must print on a default Windows
+    # (cp1252) console, which cannot encode the arrow (human ruling 2026-09-11).
     p = argparse.ArgumentParser(
-        description="GEPER genomic pipeline: FASTQ → QC → Alignment → Variant Calling "
-        "→ Annotation → Report",
+        description=f"{PIPELINE_VERSION}: FASTQ -> QC -> Alignment -> Variant Calling "
+        "-> Annotation -> Report",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--r1", required=True, metavar="FASTQ", help="R1 FASTQ path (plain or .gz)")
@@ -1051,8 +1133,9 @@ def _build_cli_parser():
             "'full' (default) runs FASTQ through Report generation. "
             "'vcf_only' stops after Variant Calling and returns "
             "filtered_variants.vcf, skipping Kim's own annotation/ACMG/"
-            "PGx/ancestry/reporting stages — used when Kim is feeding "
-            "another interpretation pipeline (e.g. GEPER)."
+            "ancestry/reporting stages — used when Kim is feeding "
+            "another interpretation pipeline (e.g. the Bij AI "
+            "variant-interpretation component (GEPER))."
         ),
     )
     p.add_argument(
@@ -1101,6 +1184,10 @@ def main() -> None:
             sys.exit(1)
 
     runner = PipelineRunner(cfg=cfg, resume=not args.no_resume)
+    # CLI run, no API/DELETE endpoint involved -- explicitly opt out of
+    # cancellation tracking rather than leaving it unregistered (run()
+    # refuses to proceed with neither, see NO_KILL_TRACKING's docstring).
+    runner.register_kill_callback(NO_KILL_TRACKING)
     try:
         result = runner.run(
             fastq_r1=args.r1,

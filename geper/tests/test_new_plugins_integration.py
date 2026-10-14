@@ -22,6 +22,29 @@ from pipeline.models.borzoi_plugin import BorzoiPlugin
 from pipeline.models.enformer_plugin import EnformerPlugin
 from pipeline.models.manager import ModelManager
 from pipeline.models.pending_plugins import build_default_registry
+from utils.auto_install import PackageCheckStatus
+
+try:
+    import enformer_pytorch  # noqa: F401
+
+    _HAS_ENFORMER_PYTORCH = True
+except ImportError:
+    _HAS_ENFORMER_PYTORCH = False
+
+try:
+    import borzoi_pytorch  # noqa: F401
+
+    _HAS_BORZOI_PYTORCH = True
+except ImportError:
+    _HAS_BORZOI_PYTORCH = False
+
+_HAS_ENFORMER_AND_BORZOI_PYTORCH = _HAS_ENFORMER_PYTORCH and _HAS_BORZOI_PYTORCH
+_ENFORMER_AND_BORZOI_SKIP_REASON = (
+    "enformer-pytorch and/or borzoi-pytorch is not installed in this "
+    "environment -- both are optional, config-gated integrations "
+    "(CONFIG.splicing.ENABLE_ENFORMER / ENABLE_BORZOI; see requirements.txt's "
+    "own header comment for the rationale), not a broken environment."
+)
 
 
 class _FakeEnformerModel:
@@ -35,9 +58,7 @@ class _FakeEnformerModel:
         return self
 
     def __call__(self, seqs, head="human"):
-        return torch.stack(
-            [torch.full((4, 4), self.ref_value), torch.full((4, 4), self.alt_value)], dim=0
-        )
+        return torch.stack([torch.full((4, 4), self.ref_value), torch.full((4, 4), self.alt_value)], dim=0)
 
 
 class _FakeBorzoiModel:
@@ -68,15 +89,36 @@ class TestBothPluginsDisabledByDefault(unittest.TestCase):
         self.assertEqual("borzoi" in available, BorzoiPlugin.is_available())
 
     def test_manager_predict_never_crashes_for_either(self):
+        # Whether enformer/borzoi actually load is environment-
+        # dependent (their own package/model-cache availability -- see
+        # test_enformer_borzoi_dependency_gated just above, which
+        # already documents both are enabled BY CONFIG DEFAULT and
+        # gated only by package availability, not policy). Asserting
+        # `is None` pinned a broken-environment proxy ("the package
+        # isn't installed here") as if it were the real contract. The
+        # actual contract -- this test's own name -- is just "never
+        # crashes": predict() must return either None (genuinely
+        # unavailable) or a real prediction dict (genuinely available),
+        # never raise.
         manager = ModelManager(registry=build_default_registry())
         for key in ("enformer", "borzoi"):
-            self.assertIsNone(manager.predict(key, "A" * 10, "T" * 10))
+            result = manager.predict(key, "A" * 10, "T" * 10)
+            self.assertTrue(
+                result is None or isinstance(result, dict),
+                f"{key}: predict() returned {result!r}, expected None or dict",
+            )
 
 
+@unittest.skipUnless(_HAS_ENFORMER_AND_BORZOI_PYTORCH, _ENFORMER_AND_BORZOI_SKIP_REASON)
 class TestEnformerAndBorzoiEnabledTogetherThroughManager(unittest.TestCase):
     """The realistic "both plugins turned on" scenario: verifies they
     don't interfere with each other when managed by the same
-    ModelManager instance."""
+    ModelManager instance.
+
+    Every test here needs BOTH real packages installed: they assert on
+    `available_keys()` actually containing both, or mock.patch both
+    packages' real `from_pretrained` boundary -- so the class-level
+    skip is scoped to "both present", not "either present"."""
 
     def setUp(self):
         self.registry = build_default_registry()
@@ -122,14 +164,18 @@ class TestEnformerAndBorzoiEnabledTogetherThroughManager(unittest.TestCase):
         fake_enformer = _FakeEnformerModel(ref_value=0.0, alt_value=1.0)
         fake_borzoi = _FakeBorzoiModel()
 
-        with mock.patch(
-            "pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "enformer_pytorch.from_pretrained", return_value=fake_enformer
-        ), mock.patch(
-            "pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_borzoi
+        with (
+            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
+            mock.patch("enformer_pytorch.from_pretrained", return_value=fake_enformer),
+            mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
+            mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_borzoi),
         ):
             enformer_result = self.manager.predict("enformer", "A" * 10, "T" * 10)
             borzoi_result = self.manager.predict("borzoi", "A" * 10, "T" * 10)
@@ -145,14 +191,18 @@ class TestEnformerAndBorzoiEnabledTogetherThroughManager(unittest.TestCase):
     def test_one_plugin_failing_to_load_does_not_affect_the_other(self):
         fake_borzoi = _FakeBorzoiModel()
 
-        with mock.patch(
-            "pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "enformer_pytorch.from_pretrained", side_effect=ConnectionError("unreachable")
-        ), mock.patch(
-            "pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_borzoi
+        with (
+            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
+            mock.patch("enformer_pytorch.from_pretrained", side_effect=ConnectionError("unreachable")),
+            mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
+            mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_borzoi),
         ):
             enformer_result = self.manager.predict("enformer", "A" * 10, "T" * 10)
             borzoi_result = self.manager.predict("borzoi", "A" * 10, "T" * 10)

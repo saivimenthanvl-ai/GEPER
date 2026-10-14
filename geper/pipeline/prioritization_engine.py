@@ -116,7 +116,7 @@ class PrioritizationEngine:
     confidence result, passed in as inputs -- never recomputed here).
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Reused only for its static AlphaFold-band mapping (see
         # `_structural_factor`) -- no confidence state is read or
         # written here.
@@ -127,21 +127,21 @@ class PrioritizationEngine:
         *,
         acmg_classification: Optional[str],
         confidence_score: Optional[float],
-        triggered_rule_codes: List[str],
-        clinvar_result: Dict[str, Any] = None,
-        clingen_result: Dict[str, Any] = None,
-        gnomad_result: Dict[str, Any] = None,
-        dbsnp_result: Dict[str, Any] = None,
-        alphamissense_result: Dict[str, Any] = None,
-        mmsplice_result: Dict[str, Any] = None,
-        dna_models_used: List[str] = None,
-        rna_result: Dict[str, Any] = None,
-        protein_result: Dict[str, Any] = None,
-        interpro_result: Dict[str, Any] = None,
-        alphafold_result: Dict[str, Any] = None,
-        blast_result: Dict[str, Any] = None,
-        ai_consensus: List[Dict[str, Any]] = None,
-        conflicting_evidence: List[str] = None,
+        triggered_rule_codes: List[Optional[str]],
+        clinvar_result: Optional[Dict[str, Any]] = None,
+        clingen_result: Optional[Dict[str, Any]] = None,
+        gnomad_result: Optional[Dict[str, Any]] = None,
+        dbsnp_result: Optional[Dict[str, Any]] = None,
+        alphamissense_result: Optional[Dict[str, Any]] = None,
+        mmsplice_result: Optional[Dict[str, Any]] = None,
+        dna_models_used: Optional[List[str]] = None,
+        rna_result: Optional[Dict[str, Any]] = None,
+        protein_result: Optional[Dict[str, Any]] = None,
+        interpro_result: Optional[Dict[str, Any]] = None,
+        alphafold_result: Optional[Dict[str, Any]] = None,
+        blast_result: Optional[Dict[str, Any]] = None,
+        ai_consensus: Optional[List[Dict[str, Any]]] = None,
+        real_conflicts: Optional[List[Any]] = None,
         critical_conflict: bool = False,
     ) -> PriorityResult:
         cfg = CONFIG.prioritization
@@ -168,7 +168,7 @@ class PrioritizationEngine:
         raw_sum = sum(f.contribution for f in factors)
         raw_score = 100.0 * (raw_sum / max_possible) if max_possible > 0 else 0.0
 
-        penalty, penalty_explanation = self._conflict_penalty(conflicting_evidence, ai_consensus, cfg)
+        penalty, penalty_explanation = self._conflict_penalty(real_conflicts, cfg)
         if penalty > 0:
             reasons.append(f"✗ {penalty_explanation}")
         final_score = max(0.0, raw_score * (1.0 - penalty))
@@ -270,7 +270,7 @@ class PrioritizationEngine:
     @staticmethod
     def _population_rarity_factor(gnomad_result, weight, reasons) -> PriorityFactor:
         gcfg = CONFIG.gnomad
-        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error"):
+        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error") is not None:
             return PriorityFactor("Population Rarity", weight, 0.0, 0.0, "gnomAD lookup unavailable for this variant.")
         if not gnomad_result.get("found"):
             reasons.append("✓ Absent from gnomAD (very rare)")
@@ -426,7 +426,15 @@ class PrioritizationEngine:
         # Completeness-only, exactly as in Phase 3 -- these models
         # inform routing/context, not a per-variant priority verdict.
         ran = len(dna_models_used or [])
-        if rna_result and not rna_result.get("skipped") and not rna_result.get("error"):
+        # INERT (2026-08-31): truthiness on `error`, not `is not None`,
+        # but `_run_rna_stage` (orchestrator.py) keeps `skipped: True`
+        # on every failure path -- `not rna_result.get("skipped")`
+        # already excludes a failed run regardless of how `error` is
+        # read. Fixed to `is not None` for consistency only; same check
+        # duplicated (and fixed alongside this one) in
+        # confidence_engine.py, interpretation.py, and
+        # interpretation_result.py.
+        if rna_result and not rna_result.get("skipped") and rna_result.get("error") is None:
             ran += 1
         if protein_result and protein_result.get("esm2"):
             ran += 1
@@ -464,33 +472,29 @@ class PrioritizationEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _conflict_penalty(conflicting_evidence, ai_consensus, cfg) -> Tuple[float, str]:
-        units = 0
-        reasons: List[str] = []
-        n = len(conflicting_evidence or [])
-        if n:
-            units += n
-            reasons.append(f"{n} conflicting-evidence item(s) recorded across ACMG criteria.")
-        if ai_consensus and len(ai_consensus) >= 2:
-            directions = set()
-            for v in ai_consensus:
-                pred = (v.get("prediction") or "").lower()
-                if "pathogenic" in pred or pred in (
-                    "strong_donor_loss",
-                    "strong_acceptor_loss",
-                    "exon_skipping",
-                    "intron_retention",
-                    "strong",
-                    "moderate",
-                ):
-                    directions.add("damaging")
-                elif "benign" in pred:
-                    directions.add("benign")
-            if len(directions) > 1:
-                units += 1
-                reasons.append("AI classifiers disagree in predicted direction.")
+    def _conflict_penalty(real_conflicts, cfg) -> Tuple[float, str]:
+        """
+        HIGH-1: same change, same reasoning, as
+        `ConfidenceEngine._conflict_penalty` -- see its docstring. Kept
+        as a separate function rather than shared because the two
+        engines' rates are configured independently on purpose
+        (`GEPER_PRIORITY_CONFLICT_PENALTY` vs
+        `GEPER_CONFIDENCE_CONFLICT_PENALTY`); only the *definition of a
+        conflict* is now shared, via
+        `ConflictResolutionEngine._real_conflicts`.
+
+        This site matters on its own: it is what demoted TP53 R248W
+        (Pathogenic, the highest net points of the five-variant run)
+        from High review priority to Moderate on the strength of three
+        self-flagged ACMG caveats. Fixing only the confidence engine
+        would have left that demotion in place.
+        """
+        units = len(real_conflicts or [])
         penalty = min(cfg.MAX_CONFLICT_PENALTY, units * cfg.CONFLICT_PENALTY_PER_CONFLICT)
-        return penalty, (" ".join(reasons) if reasons else "No conflicting evidence detected.")
+        if not units:
+            return penalty, "No conflicting evidence detected."
+        detail = "; ".join(f"{c.conflict_type} ({c.severity})" for c in real_conflicts)
+        return penalty, f"{units} conflict(s) detected between independent evidence sources: {detail}."
 
     @staticmethod
     def _category(score: float, cfg) -> str:

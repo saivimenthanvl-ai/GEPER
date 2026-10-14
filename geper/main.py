@@ -12,21 +12,37 @@ Example (Colab or local shell):
     python main.py --vcf sample.vcf
 """
 
-import argparse
 import sys
 
-from config import CONFIG
-from pipeline.hpo.utils import build_phenotype_result
-from pipeline.orchestrator import GeperPipeline
-from utils.exceptions import PipelineError
-from utils.logger import get_logger
-from utils.service_health import HEALTH, default_service_checks
+# Fail fast on an unsupported interpreter, before any other import runs.
+# `verify_environment.py`'s EXPECTED dict is the single source of truth for
+# this range (evo2's own PyPI metadata: requires-python >=3.11,<3.13) --
+# reusing its check here instead of hardcoding a second copy of the range
+# keeps this in exactly one place, per that file's own documented intent.
+from verify_environment import check_python
+
+_python_check = check_python()
+if _python_check.status == "FAIL":
+    sys.stderr.write(f"ERROR: {_python_check.detail}\n")
+    sys.exit(1)
+
+import argparse  # noqa: E402 -- after the version guard, deliberately
+import os  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+from component_identity import COMPONENT_NAME, SHORT_NAME  # noqa: E402
+from config import CONFIG  # noqa: E402
+from pipeline.hpo.utils import build_phenotype_result  # noqa: E402
+from pipeline.orchestrator import GeperPipeline  # noqa: E402
+from utils.exceptions import PipelineError  # noqa: E402
+from utils.logger import get_logger  # noqa: E402
+from utils.service_health import HEALTH, default_service_checks  # noqa: E402
 
 logger = get_logger(__name__)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="GEPER - Genetic Evaluation & Prediction Engine for Research")
+    parser = argparse.ArgumentParser(description=f"{COMPONENT_NAME} - Genetic Evaluation & Prediction Engine")
     parser.add_argument("--vcf", required=True, help="Path to the input VCF file (.vcf or .vcf.gz)")
     parser.add_argument(
         "--output-dir",
@@ -119,7 +135,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Disable resume-from-checkpoint. By default, if geper_results.json "
-            "already exists in --output-dir, GEPER skips variants already "
+            f"already exists in --output-dir, {SHORT_NAME} skips variants already "
             "recorded there and continues from where a previous (e.g. "
             "disconnected Colab) run left off."
         ),
@@ -145,11 +161,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Path to a JSON file describing this run's upstream sequencing/alignment QC metrics "
             "(mean_coverage_depth, bases_at_20x, q30_score), for the clinical PDF's Sequencing "
-            "Quality Control Metrics table. GEPER's own VCF-only pipeline cannot compute these "
+            f"Quality Control Metrics table. {SHORT_NAME}'s own VCF-only pipeline cannot compute these "
             "itself -- this flag exists for callers like bridge/combined_pipeline.py that ran "
             "kim_pipeline's real alignment/QC stages first. Optional -- if omitted (the default "
             "for a bare `--vcf` invocation), the table renders each metric 'Not applicable' "
-            "rather than a placeholder value, since GEPER genuinely never touched any upstream "
+            f"rather than a placeholder value, since {SHORT_NAME} genuinely never touched any upstream "
             "FASTQ/BAM in that case. See report/summary.py::_parse_qc_metrics for the required "
             'per-metric {"status": "found"|"not_run"|"error", "value": float|null, '
             '"reason": str|null} shape; a missing/corrupt file or a bare number where that '
@@ -189,6 +205,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # Correlates a harness "[killed]" task-termination tag against a
+    # Windows Resource-Exhaustion-Detector event (see hive card
+    # harness-task-governor-kills-are-uninspectable and the PID-capture
+    # convention it led to) -- without this line, a killed run leaves no
+    # attributable PID anywhere. Logged FIRST, before argument parsing
+    # or anything else: kills have been observed as early as ~90s into a
+    # run, sometimes mid model-load, so anything placed later risks
+    # never being written. Uses `logger` (stdlib logging), not print --
+    # logging.StreamHandler.emit() flushes unconditionally after every
+    # record, which is what lets this line survive a hard kill (no
+    # atexit handlers run, no buffer flush); a bare print()'s buffered
+    # output would simply be discarded. Timestamp is LOCAL time,
+    # deliberately, to share a clock domain with Windows Event Log's own
+    # TimeCreated field, which is what the correlation is matched
+    # against. PARENT_PID is included because a venv-launched python.exe
+    # on this box is not always one process -- the launcher can hand off
+    # to a different worker PID under the base interpreter -- so both
+    # are logged rather than assuming they're the same.
+    logger.info(f"PID={os.getpid()} PARENT_PID={os.getppid()} START={datetime.now().isoformat()}")
+
     parser = build_arg_parser()
     args = parser.parse_args()
 
@@ -199,32 +235,44 @@ def main() -> int:
 
     phenotype_result = build_phenotype_result(args.hpo_terms, args.phenotype_file, logger=logger)
 
-    pipeline = GeperPipeline(
-        blast_mode=args.blast_mode,
-        blast_local_db=args.blast_db,
-        blast_reference_fasta=args.blast_reference_fasta,
-        species=args.species,
-        assembly=args.assembly,
-        output_dir=args.output_dir,
-        ai_only=args.ai_only or None,
-        enable_profiling=(False if args.no_profiling else None),
-        blast_disk_cache=(False if args.no_blast_cache else None),
-        patient_meta_path=args.patient_meta,
-        qc_metrics_path=args.qc_metrics_json,
-        phenotype_result=phenotype_result,
-    )
-
-    HEALTH.run_startup_checks(default_service_checks())
-
     try:
+        # Round 19: GeperPipeline's own __init__ now validates
+        # --output-dir is genuinely writable (see
+        # utils/output_paths.py::ensure_writable_output_dir) and raises
+        # PipelineError immediately if not -- construction is inside
+        # this try block, not just pipeline.run() below, so that
+        # startup-time failure gets the same clean one-line message as
+        # every other PipelineError instead of a raw traceback.
+        pipeline = GeperPipeline(
+            blast_mode=args.blast_mode,
+            blast_local_db=args.blast_db,
+            blast_reference_fasta=args.blast_reference_fasta,
+            species=args.species,
+            assembly=args.assembly,
+            output_dir=args.output_dir,
+            ai_only=args.ai_only or None,
+            enable_profiling=(False if args.no_profiling else None),
+            blast_disk_cache=(False if args.no_blast_cache else None),
+            patient_meta_path=args.patient_meta,
+            qc_metrics_path=args.qc_metrics_json,
+            phenotype_result=phenotype_result,
+        )
+
+        HEALTH.run_startup_checks(default_service_checks())
+
         pipeline.run(args.vcf, max_variants=args.max_variants, resume=not args.no_resume)
     except PipelineError as exc:
-        logger.error(f"GEPER pipeline aborted: {exc}")
+        logger.error(f"{SHORT_NAME} pipeline aborted: {exc}")
         return 1
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
         return 130
     finally:
+        # Observation only -- re-probes latched services to record whether
+        # each latch was still true at run end, and changes nothing. This
+        # is the evidence the bounded-reprobe card needs and that no log
+        # can otherwise contain (see service_health.measure_latched_services).
+        HEALTH.measure_latched_services()
         HEALTH.print_summary()
 
     return 0

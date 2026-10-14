@@ -1,3 +1,25 @@
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: Verification harness for the biological evidence layer: UniProt ->
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 Verification harness for the biological evidence layer: UniProt ->
 InterPro/Pfam -> AlphaFold DB.
@@ -72,7 +94,9 @@ def part1_graceful_fallback_against_real_blocked_network():
             ok = False
 
     status = PASS if ok else FAIL
-    print(f"\nPART 1: {status} -- every live-API path degrades to found=False/error set, no exception raised, no pipeline crash.")
+    print(
+        f"\nPART 1: {status} -- every live-API path degrades to found=False/error set, no exception raised, no pipeline crash."
+    )
     return ok
 
 
@@ -84,23 +108,49 @@ _UNIPROT_ENTRY = {
     "organism": {"scientificName": "Homo sapiens"},
     "sequence": {"length": 393},
     "comments": [
-        {"commentType": "FUNCTION", "texts": [{"value": "Acts as a tumor suppressor in many tumor types; induces cell cycle arrest or apoptosis."}]},
-        {"commentType": "DISEASE", "disease": {"diseaseId": "Li-Fraumeni syndrome 1", "description": "An autosomal dominant cancer predisposition syndrome."}},
+        {
+            "commentType": "FUNCTION",
+            "texts": [
+                {"value": "Acts as a tumor suppressor in many tumor types; induces cell cycle arrest or apoptosis."}
+            ],
+        },
+        {
+            "commentType": "DISEASE",
+            "disease": {
+                "diseaseId": "Li-Fraumeni syndrome 1",
+                "description": "An autosomal dominant cancer predisposition syndrome.",
+            },
+        },
     ],
     "features": [
         {"type": "Domain", "description": "DNA-binding", "location": {"start": {"value": 94}, "end": {"value": 289}}},
-        {"type": "Region", "description": "Interaction with WWOX", "location": {"start": {"value": 66}, "end": {"value": 110}}},
+        {
+            "type": "Region",
+            "description": "Interaction with WWOX",
+            "location": {"start": {"value": 66}, "end": {"value": 110}},
+        },
     ],
 }
 
 _INTERPRO_PAYLOAD = {
     "results": [
         {
-            "metadata": {"accession": "IPR002117", "name": "p53 tumour suppressor family", "type": "family", "source_database": "interpro"},
+            "metadata": {
+                "accession": "IPR002117",
+                "name": "p53 tumour suppressor family",
+                "type": "family",
+                "source_database": "interpro",
+            },
             "proteins": [{"entry_protein_locations": [{"fragments": [{"start": 94, "end": 289}]}]}],
         },
         {
-            "metadata": {"accession": "PF00870", "name": "P53", "type": "domain", "source_database": "pfam", "integrated": "IPR002117"},
+            "metadata": {
+                "accession": "PF00870",
+                "name": "P53",
+                "type": "domain",
+                "source_database": "pfam",
+                "integrated": "IPR002117",
+            },
             "proteins": [{"entry_protein_locations": [{"fragments": [{"start": 100, "end": 280}]}]}],
         },
     ]
@@ -133,7 +183,12 @@ def part2_full_pipeline_with_local_dataset_fixtures():
                 json.dumps(
                     {
                         "accession": "P04637",
-                        "summary": {"latestVersion": 4, "pdbUrl": "https://alphafold.ebi.ac.uk/files/AF-P04637-F1-model_v4.pdb", "uniprotStart": 1, "uniprotEnd": 393},
+                        "summary": {
+                            "latestVersion": 4,
+                            "pdbUrl": "https://alphafold.ebi.ac.uk/files/AF-P04637-F1-model_v4.pdb",
+                            "uniprotStart": 1,
+                            "uniprotEnd": 393,
+                        },
                         "residue_plddt": residue_plddt,
                     }
                 )
@@ -150,12 +205,22 @@ def part2_full_pipeline_with_local_dataset_fixtures():
         # already-constructed singleton `CONFIG` -- injecting the
         # provider directly is the correct way to point this harness at
         # the fixture files without editing any pipeline code.
-        uniprot = UniProtLookup(provider=CompositeUniProtProvider(local_provider=LocalDatasetUniProtProvider(dataset_path=uniprot_path)))
-        interpro = InterProLookup(provider=CompositeInterProProvider(local_provider=LocalDatasetInterProProvider(dataset_path=interpro_path)))
-        alphafold = AlphaFoldLookup(provider=CompositeAlphaFoldProvider(local_provider=LocalDatasetAlphaFoldProvider(dataset_path=alphafold_path)))
+        uniprot = UniProtLookup(
+            provider=CompositeUniProtProvider(local_provider=LocalDatasetUniProtProvider(dataset_path=uniprot_path))
+        )
+        interpro = InterProLookup(
+            provider=CompositeInterProProvider(local_provider=LocalDatasetInterProProvider(dataset_path=interpro_path))
+        )
+        alphafold = AlphaFoldLookup(
+            provider=CompositeAlphaFoldProvider(
+                local_provider=LocalDatasetAlphaFoldProvider(dataset_path=alphafold_path)
+            )
+        )
 
         uniprot_result = uniprot.query_gene("TP53")
-        protein_position = 150  # falls within both the InterPro domain (94-289) and the "high confidence" residue band above
+        protein_position = (
+            150  # falls within both the InterPro domain (94-289) and the "high confidence" residue band above
+        )
         interpro_result = interpro.query_variant(uniprot_result, protein_position=protein_position)
         alphafold_result = alphafold.query_variant(uniprot_result, protein_position=protein_position)
 
@@ -197,7 +262,9 @@ def part2_full_pipeline_with_local_dataset_fixtures():
     report_lines.extend(ReportGenerator._render_interpro(variant_result["interpro"]))
     report_lines.extend(ReportGenerator._render_alphafold(variant_result["alphafold"]))
     markdown = "\n".join(report_lines)
-    markdown_ok = "UniProt (Protein Annotation)" in markdown and "InterPro / Pfam" in markdown and "AlphaFold DB" in markdown
+    markdown_ok = (
+        "UniProt (Protein Annotation)" in markdown and "InterPro / Pfam" in markdown and "AlphaFold DB" in markdown
+    )
     print(f"  [{'OK' if markdown_ok else 'MISSING'}] Markdown report renders all three new sections")
     print()
     print(markdown)

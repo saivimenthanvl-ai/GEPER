@@ -187,8 +187,12 @@ class LiveAPIUniProtProvider(UniProtProviderBase):
         try:
             payload = self._get(f"{self.api_base}/search", params)
         except ExternalAPIError as exc:
-            logger.warning(f"UniProt REST API query failed for gene '{gene}': {exc}")
-            return UniProtAnnotation.from_error(gene_symbol, str(exc))
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- fall back to the exception's type name
+            # rather than reporting a failure with nothing said about it.
+            detail = str(exc) or type(exc).__name__
+            logger.warning(f"UniProt REST API query failed for gene '{gene}': {detail}")
+            return UniProtAnnotation.from_error(gene_symbol, detail)
 
         results = payload.get("results") or []
         if not results:
@@ -214,9 +218,18 @@ class LiveAPIUniProtProvider(UniProtProviderBase):
                 logger.warning(f"UniProt REST API request attempt {attempt} failed: {exc}")
                 if attempt < CONFIG.uniprot.MAX_RETRIES:
                     time.sleep(CONFIG.uniprot.RETRY_BACKOFF_SECS * attempt)
-        raise ExternalAPIError(
+        logger.warning(
             f"UniProt REST API request to '{url}' failed after {CONFIG.uniprot.MAX_RETRIES} attempts: {last_error}"
         )
+        # Round 24: the message actually raised (folded verbatim into
+        # `uniprot_error` -- see `report/clinical_report_builder.py::
+        # _protein_knowledge` -- and rendered into every report
+        # unconditionally by `report/report_generator.py`, plus
+        # embedded verbatim in geper_results.json's `uniprot` key by
+        # `report/json_builder.py`) must not embed `url`/`last_error`;
+        # full detail goes to the log line above only. Same pattern
+        # round 23 applied to `annotation/thousand_genomes_sas.py`.
+        raise ExternalAPIError(f"UniProt REST API request failed after {CONFIG.uniprot.MAX_RETRIES} attempts")
 
 
 class CompositeUniProtProvider:
@@ -232,7 +245,7 @@ class CompositeUniProtProvider:
             dataset_path=CONFIG.uniprot.LOCAL_DATASET_FILE or None
         )
         self.api_provider = api_provider or LiveAPIUniProtProvider()
-        self.max_concurrent = max_concurrent or 8
+        self.max_concurrent = max_concurrent if max_concurrent is not None else 8
 
     def query(self, gene_symbol: str) -> UniProtAnnotation:
         if CONFIG.uniprot.OFFLINE_MODE:

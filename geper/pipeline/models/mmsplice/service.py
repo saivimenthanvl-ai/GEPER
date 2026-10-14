@@ -40,8 +40,19 @@ from utils.service_health import HEALTH, is_transient_http_error
 logger = get_logger(__name__)
 
 
-def _null_result(supported: bool, predicted: bool, reason: str, runtime_ms: float = 0.0) -> Dict:
-    """The schema requirement #6 specifies, with every scored field set to None."""
+def _null_result(
+    supported: bool, predicted: bool, reason: str, runtime_ms: float = 0.0, error: Optional[str] = None
+) -> Dict:
+    """The schema requirement #6 specifies, with every scored field set to None.
+
+    `error`, when given, is the same key `_run_mmsplice_stage`'s own
+    defense-in-depth crash handler sets (pipeline/orchestrator.py) and
+    that `report_generator.py::_render_mmsplice` checks BEFORE its
+    `supported`-gated "Not scored" text -- a caller that could not
+    determine an answer (fetch failure, retries exhausted) must pass
+    `error` so a lookup failure never renders as a completed,
+    negative biological finding.
+    """
     return {
         "supported": supported,
         "predicted": predicted,
@@ -57,6 +68,7 @@ def _null_result(supported: bool, predicted: bool, reason: str, runtime_ms: floa
         "runtime_ms": round(runtime_ms, 3),
         "model_version": None,
         "skip_reason": reason if not predicted else None,
+        "error": error,
     }
 
 
@@ -104,15 +116,23 @@ class MMSpliceService:
         try:
             return self._predict_impl(variant, start)
         except Exception as exc:  # noqa: BLE001 - graceful degradation is the whole point of this method
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee), and an empty error string is indistinguishable
+            # from no error at all to a truthiness check. One variable feeds
+            # the log line, the reason and `error`, so they cannot diverge --
+            # the same shape `_run_mmsplice_stage` already uses one layer up.
+            detail = str(exc) or type(exc).__name__
             logger.error(
                 f"MMSplice prediction failed unexpectedly for "
-                f"{variant.chrom}:{variant.pos}{variant.ref}>{variant.alt}: {exc}"
+                f"{variant.chrom}:{variant.pos}{variant.ref}>{variant.alt}: {detail}"
             )
             return _null_result(
                 supported=False,
                 predicted=False,
-                reason=f"internal error during MMSplice prediction: {exc}",
+                reason=f"internal error during MMSplice prediction: {detail}",
                 runtime_ms=(time.time() - start) * 1000.0,
+                # A crash is the definition of "could not determine an answer".
+                error=f"internal error during MMSplice prediction: {detail}",
             )
 
     def predict_batch(self, variants: List[Variant]) -> List[Dict]:
@@ -135,8 +155,17 @@ class MMSpliceService:
             try:
                 prep = self._prepare(variant, start)
             except Exception as exc:  # noqa: BLE001
-                logger.error(f"MMSplice batch preparation failed for {variant.chrom}:{variant.pos}: {exc}")
-                results[i] = _null_result(False, False, f"internal error: {exc}", (time.time() - start) * 1000.0)
+                # Same contract as `predict` above, and the same reason a bare
+                # `str(exc)` will not do here either.
+                detail = str(exc) or type(exc).__name__
+                logger.error(f"MMSplice batch preparation failed for {variant.chrom}:{variant.pos}: {detail}")
+                results[i] = _null_result(
+                    False,
+                    False,
+                    f"internal error: {detail}",
+                    (time.time() - start) * 1000.0,
+                    error=f"internal error during MMSplice batch preparation: {detail}",
+                )
                 continue
             if isinstance(prep, dict):
                 results[i] = prep  # ineligible / not predicted / cache hit
@@ -161,7 +190,20 @@ class MMSpliceService:
                 if self.cache and cache_keys[idx] is not None:
                     self.cache.put(cache_keys[idx], result)
 
-        return [r if r is not None else _null_result(False, False, "unexpected: no result produced") for r in results]
+        # A slot still None here means the predictor returned fewer rows than
+        # were sent and `zip` truncated. Whatever that is, it is not a
+        # completed search that found nothing, so it carries `error` too.
+        return [
+            r
+            if r is not None
+            else _null_result(
+                False,
+                False,
+                "unexpected: no result produced",
+                error="MMSplice produced no result for this variant (batch returned fewer rows than sent)",
+            )
+            for r in results
+        ]
 
     # ------------------------------------------------------------------
     # Internal pipeline
@@ -197,7 +239,20 @@ class MMSpliceService:
                 runtime_ms=(time.time() - start) * 1000.0,
             )
 
-        exons = self._fetch_overlapping_exons(variant)
+        try:
+            exons = self._fetch_overlapping_exons(variant)
+        except ExternalAPIError as exc:
+            # Distinct from the "genuinely no exon nearby" branch below:
+            # this means Ensembl never actually answered, so `exons`
+            # being empty here would be a lookup failure disguised as a
+            # completed, negative search -- see this module's `_null_result`.
+            return _null_result(
+                supported=False,
+                predicted=False,
+                reason=f"exon annotation lookup failed: {exc}",
+                runtime_ms=(time.time() - start) * 1000.0,
+                error=str(exc),
+            )
         if not exons:
             return _null_result(
                 supported=False,
@@ -251,11 +306,19 @@ class MMSpliceService:
         try:
             ref_window, alt_window, overhang = self._build_windows(variant, best_exon)
         except ExternalAPIError as exc:
+            # THE TWIN OF THE `_fetch_overlapping_exons` HANDLER ABOVE, and it
+            # was left out when that one was fixed. Ensembl never answered, so
+            # this is a lookup failure, not a completed negative -- and because
+            # this branch reports `supported=True`, without `error` the report
+            # renders it under "_Skipped:", the heading it uses for work that
+            # finished. A fix applied at one call site of a subsystem is
+            # evidence about the others, not assurance about them.
             return _null_result(
                 supported=True,
                 predicted=False,
                 reason=f"reference sequence fetch failed: {exc}",
                 runtime_ms=(time.time() - start) * 1000.0,
+                error=str(exc) or type(exc).__name__,
             )
 
         return ref_window, alt_window, overhang, cache_key
@@ -312,8 +375,10 @@ class MMSpliceService:
 
         if HEALTH.is_offline("Ensembl"):
             HEALTH.note_skip("Ensembl")
-            self._exon_region_cache[key] = []
-            return []
+            raise ExternalAPIError(
+                f"Exon annotation lookup for {chrom}:{region_start}-{region_end} skipped: "
+                f"Ensembl was confirmed offline at startup."
+            )
 
         last_error: Optional[Exception] = None
         for attempt in range(1, CONFIG.api.MAX_RETRIES + 1):
@@ -342,8 +407,14 @@ class MMSpliceService:
             f"Failed to fetch exon annotation for {chrom}:{region_start}-{region_end} "
             f"after {CONFIG.api.MAX_RETRIES} attempts: {last_error}"
         )
-        self._exon_region_cache[key] = []
-        return []
+        # Deliberately not cached: caching `[]` here would let a
+        # transient failure poison every later variant that happens to
+        # fall in the same region for the rest of this run, reading as
+        # a permanent "no exon here" instead of a retriable failure.
+        raise ExternalAPIError(
+            f"Failed to fetch exon annotation for {chrom}:{region_start}-{region_end} "
+            f"after {CONFIG.api.MAX_RETRIES} attempts"
+        )
 
     @staticmethod
     def _parse_exon_feature(chrom: str, feature: Dict) -> Optional[ExonAnnotation]:

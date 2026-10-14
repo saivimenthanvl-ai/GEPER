@@ -24,6 +24,7 @@ import tempfile
 import unittest
 
 from report.clinical_report_builder import build_clinical_report
+from report.summary import _ICMR_OVERRIDDEN_FOOTER_TEXT
 from review import signoff as s
 from review.cli import build_arg_parser, main as cli_main
 from utils.exceptions import SignoffError
@@ -84,7 +85,7 @@ def _make_document():
             {
                 "variant": variant_dict,
                 "interpretation_result": {"gene_symbol": gene},
-                "clinical_report": clinical_report,
+                "candidate_interpretation": clinical_report,
                 "interpretation": {},
                 "errors": [],
             }
@@ -96,6 +97,12 @@ def _make_document():
         "assembly": "GRCh38",
         "vcf_samples": ["SAMPLE01"],
         "variant_count": len(variants),
+        # Round 30 part 2: mirrors JSONResultBuilder.build()'s own
+        # defaults, so this fixture matches what a real GEPER run
+        # actually writes before any review/signoff.py action.
+        "review_status": "draft",
+        "reviewed_by": None,
+        "reviewed_at": None,
         "variants": variants,
     }
 
@@ -236,6 +243,156 @@ class TestApprove(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# approve() -- model-weight hash MISMATCH refusal (human-ruled 2026-09-10:
+# "a signer approving a report without visibility into a mismatch is
+# signing something they cannot vouch for; the signature becomes
+# decorative"). No override/flag/env var exists for this check, by design.
+# ---------------------------------------------------------------------------
+
+
+def _write_run_with_model_checkpoints(root: str, model_checkpoints: dict, name: str = "run1") -> str:
+    """Same as `_write_run`, plus an explicit `model_checkpoints` key -- the
+    real orchestrator's own shape (`pipeline/provenance.py::
+    finalize_model_checkpoint_provenance`), not hand-abbreviated."""
+    output_dir = os.path.join(root, name)
+    os.makedirs(output_dir, exist_ok=True)
+    document = _make_document()
+    document["model_checkpoints"] = model_checkpoints
+    with open(os.path.join(output_dir, s.RESULTS_FILENAME), "w", encoding="utf-8") as fh:
+        json.dump(document, fh)
+    return output_dir
+
+
+_MISMATCH_CHECKPOINTS = {
+    "esm2": {
+        "identifier": "facebook/esm2_t33_650M_UR50D@main",
+        "status": "used",
+        "reason": "",
+        "resolved_version": "main",
+        "loaded_artifact": {
+            "requested_path": "/cache/esm2/model.safetensors",
+            "resolved_path": "/cache/esm2/blobs/deadbeef00000000000000000000000000000000000000000000000000000000",
+            "served_revision": "main",
+            "cache_declared_sha256": "deadbeef00000000000000000000000000000000000000000000000000000000",
+            "hash_verification": "mismatch",
+            "version_status": "unknown",
+            "note": "MISMATCH: bytes do not match the cache's declared sha256 -- corrupted or substituted model cache",
+        },
+    }
+}
+
+_MISMATCH_CHECKPOINTS_WITH_OBSERVED_HASH = {
+    "esm2": {
+        "identifier": "facebook/esm2_t33_650M_UR50D@main",
+        "status": "used",
+        "reason": "",
+        "resolved_version": "main",
+        "loaded_artifact": {
+            "requested_path": "/cache/esm2/model.safetensors",
+            "resolved_path": "/cache/esm2/blobs/deadbeef00000000000000000000000000000000000000000000000000000000",
+            "served_revision": "main",
+            "cache_declared_sha256": "deadbeef00000000000000000000000000000000000000000000000000000000",
+            "observed_sha256": "c0ffee0000000000000000000000000000000000000000000000000000000000",
+            "hash_verification": "mismatch",
+            "version_status": "unknown",
+            "note": "MISMATCH: bytes do not match the cache's declared sha256 -- corrupted or substituted model cache",
+        },
+    }
+}
+
+_VERIFIED_CHECKPOINTS = {
+    "esm2": {
+        "identifier": "facebook/esm2_t33_650M_UR50D@main",
+        "status": "used",
+        "reason": "",
+        "resolved_version": "main",
+        "loaded_artifact": {
+            "requested_path": "/cache/esm2/model.safetensors",
+            "resolved_path": "/cache/esm2/blobs/cafebabe00000000000000000000000000000000000000000000000000000000",
+            "served_revision": "main",
+            "cache_declared_sha256": "cafebabe00000000000000000000000000000000000000000000000000000000",
+            "hash_verification": "verified",
+            "version_status": "hash_only",
+            "note": "bytes streamed and matched the hash declared by the cache",
+        },
+    }
+}
+
+
+class TestApproveModelHashMismatch(unittest.TestCase):
+    def test_mismatch_refuses_and_names_model_and_expected_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run_with_model_checkpoints(tmp, _MISMATCH_CHECKPOINTS)
+            with self.assertRaises(SignoffError) as ctx:
+                s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            message = str(ctx.exception)
+            self.assertIn("esm2", message)
+            self.assertIn("deadbeef", message)  # the expected sha256
+            self.assertIn("MISMATCH", message)
+            self.assertIn("re-run", message)
+            self.assertIn(
+                "not present in this record",
+                message,
+                "a record without observed_sha256 (pre-change, or MISMATCH some other way) must say so, not print None",
+            )
+
+    def test_mismatch_names_the_observed_hash_when_the_record_has_one(self):
+        # THE CARD: a refusal that names only the expected hash is half a
+        # message -- the reader cannot tell what was actually loaded.
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run_with_model_checkpoints(tmp, _MISMATCH_CHECKPOINTS_WITH_OBSERVED_HASH)
+            with self.assertRaises(SignoffError) as ctx:
+                s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            message = str(ctx.exception)
+            self.assertIn("esm2", message)
+            self.assertIn("deadbeef", message)  # the expected sha256
+            self.assertIn("c0ffee", message)  # the observed sha256
+            self.assertIn("MISMATCH", message)
+
+    def test_mismatch_leaves_nothing_on_disk_changed(self):
+        # A block that half-writes is worse than no block -- the check must
+        # run before ANY side effect (patient_meta, the results JSON
+        # rewrite, PDF regeneration, the manifest).
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run_with_model_checkpoints(tmp, _MISMATCH_CHECKPOINTS)
+            results_path = os.path.join(output_dir, s.RESULTS_FILENAME)
+            with open(results_path, "rb") as fh:
+                results_before = fh.read()
+            files_before = sorted(os.listdir(output_dir))
+
+            with self.assertRaises(SignoffError):
+                s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+
+            files_after = sorted(os.listdir(output_dir))
+            self.assertEqual(files_before, files_after, "approve() must not create any new file on refusal")
+            with open(results_path, "rb") as fh:
+                results_after = fh.read()
+            self.assertEqual(results_before, results_after, "approve() must not modify geper_results.json on refusal")
+
+    def test_verified_hash_does_not_block_approval(self):
+        # Negative control: a model_checkpoints entry that HAS a
+        # hash_verification result, but not a mismatch, must not trip the
+        # new check -- proves the check discriminates rather than refusing
+        # on the mere presence of the field.
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run_with_model_checkpoints(tmp, _VERIFIED_CHECKPOINTS)
+            manifest = s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            self.assertTrue(os.path.exists(s._manifest_path(output_dir)))
+            self.assertEqual(manifest["clinician_name"], "Dr. Rajesh Sharma")
+
+    def test_absent_model_checkpoints_still_approves(self):
+        # Every pre-existing TestApprove test already exercises this
+        # (`_make_document()` has no `model_checkpoints` key at all), but
+        # made explicit here as the backward-compatibility case this new
+        # check must not break: a document with nothing recorded for
+        # models is not the same as a document with a mismatch.
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            self.assertTrue(os.path.exists(s._manifest_path(output_dir)))
+
+
+# ---------------------------------------------------------------------------
 # override()
 # ---------------------------------------------------------------------------
 
@@ -262,7 +419,8 @@ class TestOverride(unittest.TestCase):
                 document = json.load(fh)
             variant_result = s.find_variant(document, "2", 500, "G", "T")
             self.assertEqual(
-                variant_result["clinical_report"]["acmg_classification"]["classification"], "Uncertain significance"
+                variant_result["candidate_interpretation"]["acmg_classification"]["classification"],
+                "Uncertain significance",
             )
             self.assertEqual(len(variant_result["overrides"]), 1)
             record = variant_result["overrides"][0]
@@ -305,24 +463,31 @@ class TestOverride(unittest.TestCase):
             self.assertIn("Likely Pathogenic", full_text)
 
     @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")
-    def test_override_alone_does_not_touch_patient_meta_stays_draft(self):
+    def test_override_alone_does_not_touch_patient_meta(self):
+        # Subject under test is patient_meta being untouched (the file
+        # is never written) -- the PDF-text expectation below only
+        # confirms an override alone produces its own dedicated footer
+        # (card review-status-two-sources-of-truth), not DRAFT as it
+        # did before that footer existed.
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = _write_run(tmp)
             self.assertFalse(os.path.exists(s._patient_meta_path(output_dir)))
             s.override(output_dir, "2:500:G>T", "Likely Pathogenic", "Family history", "rajesh.sharma@aiims.edu")
             self.assertFalse(os.path.exists(s._patient_meta_path(output_dir)))
             full_text = _all_pdf_text(os.path.join(output_dir, s.FULL_PDF_FILENAME))
-            self.assertIn("DRAFT", full_text)
+            self.assertIn(_ICMR_OVERRIDDEN_FOOTER_TEXT, full_text)
 
-    @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")
-    def test_override_after_approve_preserves_reviewed_footer(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            output_dir = _write_run(tmp)
-            s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
-            s.override(output_dir, "2:500:G>T", "Likely Pathogenic", "Family history", "rajesh.sharma@aiims.edu")
-            full_text = _all_pdf_text(os.path.join(output_dir, s.FULL_PDF_FILENAME))
-            self.assertIn("reviewed by Dr. Rajesh Sharma", full_text)
-            self.assertNotIn("DRAFT", full_text)
+    # test_override_after_approve_preserves_reviewed_footer retired
+    # (card review-status-two-sources-of-truth): it pinned the PDF
+    # footer staying "reviewed by {physician}" after an approve() then
+    # override() sequence, which was the exact known divergence the fix
+    # closes. That scenario now has a superset of coverage (JSON,
+    # Markdown, and PDF, all checked for agreement) in
+    # tests/test_review_status_governance.py::
+    # TestPdfMarkdownReviewStatusConsistency::
+    # test_override_after_approve_pdf_and_markdown_agree_overridden --
+    # keeping both would just be duplicate assertions on the same
+    # approve()+override() call sequence.
 
     def test_override_appends_to_audit_log(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,7 +507,7 @@ class TestOverride(unittest.TestCase):
             results_path = os.path.join(output_dir, s.RESULTS_FILENAME)
             with open(results_path, encoding="utf-8") as fh:
                 document = json.load(fh)
-            document["variants"][0]["clinical_report"] = None
+            document["variants"][0]["candidate_interpretation"] = None
             with open(results_path, "w", encoding="utf-8") as fh:
                 json.dump(document, fh)
             with self.assertRaises(SignoffError):
@@ -414,11 +579,136 @@ class TestListPending(unittest.TestCase):
             with open(results_path, encoding="utf-8") as fh:
                 document = json.load(fh)
             for vr in document["variants"]:
-                vr["clinical_report"]["conflict_resolution"]["severity"] = None
+                vr["candidate_interpretation"]["conflict_resolution"]["severity"] = None
             with open(results_path, "w", encoding="utf-8") as fh:
                 json.dump(document, fh)
             rows = s.list_pending(tmp)
             self.assertFalse(rows[0]["has_conflicting_evidence"])
+
+
+class TestRequireReviewed(unittest.TestCase):
+    """A-2 option 2: the LIMS gate generalized into signoff.py so any
+    future automated consumer can call it, not just export_lims.py."""
+
+    def test_raises_when_not_reviewed(self):
+        with self.assertRaises(SignoffError) as ctx:
+            s.require_reviewed({"review_status": "draft"})
+        self.assertIn("draft", str(ctx.exception))
+        self.assertIn("reviewed", str(ctx.exception))
+
+    def test_raises_when_overridden(self):
+        # "overridden" must not be good enough -- same rule export_lims.py
+        # already enforced, now shared rather than duplicated.
+        with self.assertRaises(SignoffError):
+            s.require_reviewed({"review_status": "overridden"})
+
+    def test_raises_when_key_missing(self):
+        with self.assertRaises(SignoffError):
+            s.require_reviewed({})
+
+    def test_passes_when_reviewed(self):
+        s.require_reviewed({"review_status": "reviewed"})  # must not raise
+
+    def test_consumer_name_appears_in_message(self):
+        with self.assertRaises(SignoffError) as ctx:
+            s.require_reviewed({"review_status": "draft"}, consumer="Some Future Consumer")
+        self.assertIn("Some Future Consumer", str(ctx.exception))
+
+
+class TestWithdraw(unittest.TestCase):
+    """A-2 option 3: an explicit erasure of a standing sign-off."""
+
+    def test_withdraw_removes_manifest_and_resets_to_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            self.assertTrue(os.path.exists(s._manifest_path(output_dir)))
+
+            result = s.withdraw(output_dir, "Signed off in error", "rajesh.sharma@aiims.edu")
+
+            self.assertFalse(os.path.exists(s._manifest_path(output_dir)))
+            self.assertEqual(result["previous_review_status"], "reviewed")
+            with open(os.path.join(output_dir, s.RESULTS_FILENAME), encoding="utf-8") as fh:
+                document = json.load(fh)
+            self.assertEqual(document["review_status"], "draft")
+
+    def test_withdraw_fixes_list_pending_after_a_hypothetical_stale_manifest(self):
+        # Regression pin for B2 (review-status-two-sources-of-truth):
+        # withdraw() must make list_pending() agree with review_status
+        # again, the same disagreement override() now prevents from ever
+        # occurring in the first place (see TestOverride below).
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            self.assertEqual(s.list_pending(tmp, show_all=True)[0]["status"], "REVIEWED")
+
+            s.withdraw(output_dir, "Signed off in error", "rajesh.sharma@aiims.edu")
+
+            self.assertEqual(s.list_pending(tmp)[0]["status"], "DRAFT")
+
+    def test_withdraw_raises_when_no_manifest_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)  # never approved
+            with self.assertRaises(SignoffError):
+                s.withdraw(output_dir, "reason", "actor")
+
+    def test_withdraw_raises_when_no_results_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SignoffError):
+                s.withdraw(tmp, "reason", "actor")
+
+    def test_withdraw_appends_audit_log_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            s.withdraw(output_dir, "Signed off in error", "rajesh.sharma@aiims.edu")
+            with open(s._audit_log_path(output_dir), encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            actions = [line["action"] for line in lines]
+            self.assertIn("withdrawn", actions)
+            withdrawn_entry = next(line for line in lines if line["action"] == "withdrawn")
+            self.assertEqual(withdrawn_entry["previous_review_status"], "reviewed")
+            self.assertEqual(withdrawn_entry["reason"], "Signed off in error")
+
+
+class TestOverrideAutoWithdrawsStaleManifest(unittest.TestCase):
+    """A-2 option 3's stated side effect: override() no longer leaves
+    list_pending() disagreeing with review_status (card
+    review-status-two-sources-of-truth's B2 case)."""
+
+    def test_override_after_approve_removes_the_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            self.assertTrue(os.path.exists(s._manifest_path(output_dir)))
+
+            s.override(output_dir, "2:500:G>T", "Likely Pathogenic", "Family history", "rajesh.sharma@aiims.edu")
+
+            self.assertFalse(os.path.exists(s._manifest_path(output_dir)))
+
+    def test_override_after_approve_list_pending_agrees_with_review_status(self):
+        # The exact B2 scenario: before this fix, list_pending() kept
+        # reporting REVIEWED here because it only checked manifest
+        # presence, disagreeing with review_status == "overridden".
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            s.approve(output_dir, "Dr. Rajesh Sharma", "MCI-12345", "AIIMS Delhi")
+            s.override(output_dir, "2:500:G>T", "Likely Pathogenic", "Family history", "rajesh.sharma@aiims.edu")
+
+            rows = s.list_pending(tmp, show_all=True)
+            self.assertEqual(rows[0]["status"], "DRAFT")
+
+            with open(os.path.join(output_dir, s.RESULTS_FILENAME), encoding="utf-8") as fh:
+                document = json.load(fh)
+            self.assertEqual(document["review_status"], "overridden")
+
+    def test_override_without_prior_approve_is_unaffected(self):
+        # No manifest ever existed -- _withdraw_manifest must be a
+        # harmless no-op, not an error, when there's nothing to remove.
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            s.override(output_dir, "2:500:G>T", "Likely Pathogenic", "Family history", "rajesh.sharma@aiims.edu")
+            self.assertFalse(os.path.exists(s._manifest_path(output_dir)))
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +765,23 @@ class TestCli(unittest.TestCase):
         args = parser.parse_args(["list-pending", "--search-root", "/tmp"])
         self.assertFalse(args.show_all)
 
+    def test_withdraw_parses_expected_arguments(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(
+            [
+                "withdraw",
+                "--output-dir",
+                "/tmp/out",
+                "--reason",
+                "Signed off in error",
+                "--actor",
+                "rajesh.sharma@aiims.edu",
+            ]
+        )
+        self.assertEqual(args.command, "withdraw")
+        self.assertEqual(args.reason, "Signed off in error")
+        self.assertEqual(args.actor, "rajesh.sharma@aiims.edu")
+
     def test_main_approve_returns_zero_on_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = _write_run(tmp)
@@ -516,6 +823,52 @@ class TestCli(unittest.TestCase):
             _write_run(tmp)
             rc = cli_main(["list-pending", "--search-root", tmp])
             self.assertEqual(rc, 0)
+
+    def test_main_withdraw_returns_zero_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)
+            cli_main(
+                [
+                    "approve",
+                    "--output-dir",
+                    output_dir,
+                    "--clinician-name",
+                    "Dr. Rajesh Sharma",
+                    "--reg-number",
+                    "MCI-12345",
+                    "--hospital",
+                    "AIIMS Delhi",
+                ]
+            )
+            rc = cli_main(
+                [
+                    "withdraw",
+                    "--output-dir",
+                    output_dir,
+                    "--reason",
+                    "Signed off in error",
+                    "--actor",
+                    "rajesh.sharma@aiims.edu",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(s._manifest_path(output_dir)))
+
+    def test_main_withdraw_returns_nonzero_when_nothing_to_withdraw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = _write_run(tmp)  # never approved
+            rc = cli_main(
+                [
+                    "withdraw",
+                    "--output-dir",
+                    output_dir,
+                    "--reason",
+                    "reason",
+                    "--actor",
+                    "actor",
+                ]
+            )
+            self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

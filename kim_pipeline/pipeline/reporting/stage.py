@@ -45,14 +45,18 @@ from pipeline.reporting.clinical_sections import (
     clinical_interpretation,
     merge_variants_with_acmg,
     consequence_display_label,
+    SCOPE_LINE,
 )
 from pipeline.reporting import pdf_report as _pdf_report_mod
 
 logger = logging.getLogger("geper.pipeline.reporting.stage")
 
 # Single source of truth for the pipeline version string, shared by the
-# JSON payload, HTML report, and PDF report so they can never disagree.
-PIPELINE_VERSION = "Bij AI v8"
+# JSON payload, HTML report, and PDF report so they can never disagree --
+# and by main.py's --version/help, which is why it is defined in the
+# import-free pipeline/reporting/component_identity.py and re-exported here.
+from pipeline.reporting.component_identity import PIPELINE_VERSION  # noqa: E402
+from pipeline.reporting.component_identity import RESEARCH_USE_DISCLAIMER  # noqa: E402
 
 # Shared ACMG classification -> style mapping. HTML uses the CSS-string
 # values directly; pipeline/reporting/pdf_report.py uses the same keys
@@ -167,7 +171,8 @@ _HTML_TEMPLATE = """\
 
 <div class="report-header">
   <h1>{pipeline_version} — Clinical Genomic Report</h1>
-  <div class="meta">Generated: {generated_at}<br/>Reference genome: {reference_genome}</div>
+  <div class="meta">{scope_line}</div>
+  <div class="meta">Generated: {generated_at}<br/>Report Rendered: {report_rendered}<br/>Reference genome: {reference_genome}</div>
 </div>
 
 <div class="section">
@@ -241,7 +246,7 @@ _HTML_TEMPLATE = """\
 <footer class="report-footer">
   <p>{lab_disclaimer}</p>
   <p>Reference genome: {reference_genome} &nbsp;|&nbsp; Pipeline: {pipeline_version} &nbsp;|&nbsp;
-  Generated: {generated_at}</p>
+  Generated: {generated_at} &nbsp;|&nbsp; Report Rendered: {report_rendered}</p>
 </footer>
 
 </body>
@@ -266,6 +271,41 @@ def _dict_to_html_table(data: Dict[str, Any], title: Optional[str] = None) -> st
     """Render a flat dict as an HTML two-column table."""
     rows = "".join(f"<tr><td><strong>{k}</strong></td><td>{v}</td></tr>" for k, v in data.items())
     return f"<table><tr><th>Field</th><th>Value</th></tr>{rows}</table>"
+
+
+def _consequence_disagreement_caveat(acmg_results: List[Dict]) -> str:
+    """Disclose, beneath the ACMG table, every variant whose two protein-
+    consequence derivations disagree (orchestration/shared.py's
+    `consequence_disagreement`). T3-F3, ruled (b) REPORT CAVEAT,
+    2026-09-11: "Disclose it and let the reviewer weigh it." Not a table
+    column: a caveat qualifies the row rather than being a value of it.
+    Returns "" when no variant disagrees -- silence here means "compared and
+    agreed" or "nothing to compare", never "not checked" (a record without
+    the field never reached the comparison and is skipped). Values are
+    escaped: vep_consequence comes straight from the input VCF's CSQ field."""
+    from html import escape
+
+    items = []
+    for item in acmg_results:
+        disagreement = item.get("consequence_disagreement") if isinstance(item, dict) else None
+        if not disagreement:
+            continue
+        variant_str = f"{item.get('chrom', '')}:{item.get('pos', '')} {item.get('ref', '')}>{item.get('alt', '')}"
+        items.append(
+            f"<li><strong>{escape(variant_str)}</strong>: kim_pipeline's own transcript derivation gives "
+            f"<code>{escape(str(disagreement.get('kim_consequence', '')))}</code>; VEP's most-severe "
+            f"consequence gives <code>{escape(str(disagreement.get('vep_consequence', '')))}</code>.</li>"
+        )
+    if not items:
+        return ""
+    return (
+        '<div class="consequence-disagreement" style="font-size:0.85em;margin-top:8px;">'
+        "<p><strong>Protein consequence: two derivations disagree</strong> for the variant(s) below. "
+        "The ACMG criteria were evaluated on kim_pipeline's own derivation and were not withheld; "
+        "the two derivations may be keyed to different transcripts (e.g. alternative splicing). "
+        "The reviewer should weigh this disagreement when assessing the classification.</p>"
+        f"<ul>{''.join(items)}</ul></div>"
+    )
 
 
 def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
@@ -294,6 +334,7 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
         "Criteria Unknown",
         "ClinVar",
         "gnomAD",
+        "AI Models Used",
         "Exploratory Tier*",
         "Exploratory Score*",
     ]
@@ -315,34 +356,65 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
         else:
             reason = item.get("gene_unavailable_reason") or "Unknown reason"
             gene_cell = f"<em>Gene annotation unavailable<br/>Reason: {reason}</em>"
-        classification = item.get("classification", "Uncertain_Significance")
         acmg_score = item.get("score", "")
         criteria_met = ", ".join(item.get("criteria_met") or []) or "—"
         # FIX (Issue 6): surface criteria that could not be evaluated
         # (Unknown / Insufficient Data) distinctly from "not met".
         criteria_unknown = ", ".join(item.get("criteria_unknown") or []) or "—"
-        # FIX (Issue 7): ClinVar/gnomAD cells always carry a reason when
-        # the value itself is unavailable, rather than a bare blank/dash.
-        clinvar_reason = item.get("clinvar_unavailable_reason")
-        clinvar_cell = clinvar_reason or "Found"
-        gnomad_reason = item.get("gnomad_unavailable_reason")
-        if gnomad_reason:
-            gnomad_cell = gnomad_reason
+        # FIX: a variant whose per-variant classification raised (shared.py's
+        # per-variant handler appends {..., "error": ...} with no
+        # classification/clinvar_unavailable_reason/gnomad_unavailable_reason
+        # keys, by construction) must render as failed, not as a genuine
+        # Uncertain_Significance/Found/Found row -- the same
+        # never-render-a-fabricated-default principle Issue 7 already applies
+        # to `gene` two fields above, extended to the two fields it missed.
+        error = item.get("error")
+        if error:
+            classification = "Classification failed"
+            clinvar_cell = f"<em>Classification failed<br/>Reason: {error}</em>"
+            gnomad_cell = f"<em>Classification failed<br/>Reason: {error}</em>"
         else:
-            gnomad_af = item.get("gnomad_af")
-            gnomad_af_popmax = item.get("gnomad_af_popmax")
-            if gnomad_af is not None:
-                gnomad_cell = f"AF: {gnomad_af:.2e}"
-                if gnomad_af_popmax is not None:
-                    gnomad_cell += f" (popmax: {gnomad_af_popmax:.2e})"
+            classification = item.get("classification", "Uncertain_Significance")
+            # FIX (Issue 7): ClinVar/gnomAD cells always carry a reason when
+            # the value itself is unavailable, rather than a bare blank/dash.
+            clinvar_reason = item.get("clinvar_unavailable_reason")
+            clinvar_cell = clinvar_reason or "Found"
+            gnomad_reason = item.get("gnomad_unavailable_reason")
+            if gnomad_reason:
+                gnomad_cell = gnomad_reason
             else:
-                # "found" status without a numeric AF is unexpected but
-                # must never render a bare blank cell (Issue 7 principle).
-                gnomad_cell = "Found (frequency not available)"
+                gnomad_af = item.get("gnomad_af")
+                gnomad_af_popmax = item.get("gnomad_af_popmax")
+                if gnomad_af is not None:
+                    gnomad_cell = f"AF: {gnomad_af:.2e}"
+                    if gnomad_af_popmax is not None:
+                        gnomad_cell += f" (popmax: {gnomad_af_popmax:.2e})"
+                else:
+                    # "found" status without a numeric AF is unexpected but
+                    # must never render a bare blank cell (Issue 7 principle).
+                    gnomad_cell = "Found (frequency not available)"
         final_tier = item.get("final_tier", "—")
         composite = item.get("composite_score", "—")
         if disclaimer is None and item.get("disclaimer"):
             disclaimer = item["disclaimer"]
+
+        # HUMAN-DECISION-kim-s-TWO-AI-MODELS-ARE-LIVE...-ruled-(C), 2026-09-11:
+        # DNABERT-2/ESM-2 fire independently per variant (see
+        # orchestration/shared.py's ai_models_used comment) -- this cell
+        # states what actually ran for THIS row, not whether the AI stream
+        # was available for the run as a whole. "ai_models_used" absent
+        # entirely (the per-variant error-record shape, no AI scoring was
+        # ever attempted) reads as "Not attempted"; present but empty
+        # (AI stream ran, but neither model had usable input for this
+        # variant) reads as "None" -- the two are different facts and must
+        # not collapse into the same cell text.
+        ai_models_field = item.get("ai_models_used")
+        if ai_models_field is None:
+            ai_models_cell = "Not attempted"
+        elif ai_models_field:
+            ai_models_cell = ", ".join(ai_models_field)
+        else:
+            ai_models_cell = "None"
 
         cls_style = _CLASS_STYLES.get(classification, "")
         cls_cell = f'<td style="{cls_style}">{classification}</td>'
@@ -357,6 +429,7 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
             f"<td>{criteria_unknown}</td>"
             f"<td>{clinvar_cell}</td>"
             f"<td>{gnomad_cell}</td>"
+            f"<td>{ai_models_cell}</td>"
             f"<td>{final_tier}</td>"
             f"<td>{composite}</td>"
             f"</tr>"
@@ -379,7 +452,7 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
         f"</p>"
     )
 
-    return table_html + footnote
+    return table_html + footnote + _consequence_disagreement_caveat(acmg_results)
 
 
 def _annotation_summary_to_html(ann_d: Dict) -> str:
@@ -457,6 +530,20 @@ def _variants_to_html_table(
             v.get("gene_name")
             or f"<em>Gene annotation unavailable<br/>Reason: {gene_unavailable_reason}</em>"
         )
+        # DEFECT-zygosity-collapses-absent-and-malformed: a malformed GT
+        # token (empty/non-numeric) still produces a best-effort zygosity
+        # category -- do not render it as a plain confident value, and do
+        # not blank the cell either (a blank cell reads as "nothing found",
+        # the same fabricated-absence defect this floor has been removing
+        # all day). Say the category, that it is unreliable, and why --
+        # the cause is the GT column in this same row.
+        zygosity_val = v.get("zygosity", "")
+        zygosity_cell = (
+            f"{zygosity_val} <strong>(unreliable: GT field unparseable, "
+            "do not trust this category -- see GT column)</strong>"
+            if v.get("zygosity_malformed")
+            else zygosity_val
+        )
         cells = [
             v.get("chrom", ""),
             v.get("pos", ""),
@@ -467,7 +554,7 @@ def _variants_to_html_table(
             v.get("transcript_id") or "",
             v.get("hgvs", ""),
             consequence_display_label(v.get("consequence")),
-            v.get("zygosity", ""),
+            zygosity_cell,
             v.get("gt", ""),
             v.get("dp", ""),
             v.get("ad", ""),
@@ -595,6 +682,7 @@ class ReportingStage:
         ancestry_result: Any = None,
         reference_versions: Optional[Dict] = None,  # FIX 14
         patient_metadata: Optional[Dict] = None,  # Issue 3: optional patient metadata JSON
+        analysis_started_at: Optional[str] = None,  # DEFECT-kim-reporting-stage-658
     ) -> ReportResult:
         """Generate the report and write files to *output_dir*.
 
@@ -634,9 +722,16 @@ class ReportingStage:
             ]
 
         # ── JSON report ──────────────────────────────────────────────────────
+        # `generated_at` is the persisted analysis start time (set once, in
+        # `PipelineRunner.run()`, and carried unchanged across a checkpoint
+        # resume) -- NOT `datetime.now()`. A resumed run stamping the resume
+        # moment here would answer a question nobody asked
+        # (DEFECT-kim-reporting-stage-658). A checkpoint written before this
+        # field existed has no value to read; "Not available" says so rather
+        # than fabricating one.
         report_payload = {
             "sample_id": sample_id,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": analysis_started_at or "Not available",
             "pipeline": PIPELINE_VERSION,
             "reference_versions": reference_versions or {},  # FIX 14
             "qc_summary": qc_d,
@@ -654,17 +749,25 @@ class ReportingStage:
 
         # ── HTML report ──────────────────────────────────────────────────────
         html_path = str(out / "report.html")
-        generated_at_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        # Two different facts, not alternatives (same shape as the GEPER PDF
+        # fix, #17/#20): "Generated" is the persisted analysis start time,
+        # and "Report Rendered" is separately the moment THIS HTML/PDF file
+        # was produced, which can be long after the analysis on a resumed
+        # run. Never fabricate the former from `datetime.now()`.
+        if analysis_started_at:
+            try:
+                generated_at_str = datetime.fromisoformat(analysis_started_at).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+            except ValueError:
+                generated_at_str = str(analysis_started_at)
+        else:
+            generated_at_str = "Not available"
+        report_rendered_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         reference_genome = (reference_versions or {}).get("reference_genome") or (
             (reference_versions or {}).get("reference") or "Not specified"
         )
-        lab_disclaimer = (
-            "This report is generated by Bij AI, an in-development bioinformatics pipeline "
-            "that assists qualified clinicians and pathologists. It produces a draft "
-            "classification requiring qualified human review and final sign-off before "
-            "any clinical use, and does not independently provide final clinical "
-            "interpretation."
-        )
+        lab_disclaimer = RESEARCH_USE_DISCLAIMER
 
         patient_meta = normalize_patient_metadata(patient_metadata)
         acmg_list = acmg_d if isinstance(acmg_d, list) else []
@@ -677,7 +780,9 @@ class ReportingStage:
         html_content = _HTML_TEMPLATE.format(
             sample_id=sample_id,
             generated_at=generated_at_str,
+            report_rendered=report_rendered_str,
             pipeline_version=PIPELINE_VERSION,
+            scope_line=SCOPE_LINE,
             reference_genome=reference_genome,
             patient_name=patient_meta["name"],
             patient_dob=patient_meta["dob"],

@@ -273,6 +273,13 @@ class ResolvedModelArtifact(BaseModel):
     # `observed_sha256`: a reader seeing "observed" would believe the bytes
     # were read, and until `hash_verification is VERIFIED` they were not.
     cache_declared_sha256: Optional[str] = None
+    # The bytes-on-disk hash `verify_model_artifact` actually computed,
+    # populated only when bytes were streamed (VERIFIED or MISMATCH) --
+    # `None` for UNVERIFIABLE/NOT_VERIFIED, where no read happened to
+    # produce one. Previously computed and logged at error level by
+    # `WeightCache.verify_checksum` and then discarded; this is that same
+    # value, kept.
+    observed_sha256: Optional[str] = None
     hash_verification: HashVerification = HashVerification.UNVERIFIABLE
     version_status: VersionStatus = VersionStatus.UNKNOWN
     note: str = ""
@@ -325,11 +332,15 @@ def verify_model_artifact(artifact: ResolvedModelArtifact) -> ResolvedModelArtif
     which is why the free declared hash is what every run records and this is
     reachable rather than automatic.
 
-    THIS IS ALSO THE FIRST PRODUCTION CALLER OF `WeightCache.verify_checksum`,
-    which had none: it existed, carried five test assertions, and was invoked by
-    nothing -- and returns True when `expected_sha256` is None, so it would have
-    passed by default even once wired. Routing through it here gives it both a
-    caller and a non-None expected hash.
+    THIS IS ALSO THE FIRST PRODUCTION CALLER OF `WeightCache.verify_checksum`
+    (via `verify_checksum_detailed`, its bool-plus-actual-hash sibling),
+    which had none: it existed, carried five test assertions, and was invoked
+    by nothing -- and returns True when `expected_sha256` is None, so it would
+    have passed by default even once wired. Routing through it here gives it
+    both a caller and a non-None expected hash. `verify_checksum_detailed`
+    additionally returns the bytes-on-disk hash it computed to reach that
+    verdict, threaded below into `observed_sha256` -- the one this record
+    previously discarded after only logging it.
     """
     if artifact.cache_declared_sha256 is None or artifact.resolved_path is None:
         return artifact.model_copy(
@@ -343,11 +354,15 @@ def verify_model_artifact(artifact: ResolvedModelArtifact) -> ResolvedModelArtif
 
     from pipeline.models.cache import WeightCache
 
-    matches = WeightCache().verify_checksum(Path(artifact.resolved_path), artifact.cache_declared_sha256)
+    checksum_result = WeightCache().verify_checksum_detailed(
+        Path(artifact.resolved_path), artifact.cache_declared_sha256
+    )
+    matches = checksum_result.matches
 
     if matches:
         return artifact.model_copy(
             update={
+                "observed_sha256": checksum_result.actual_sha256,
                 "hash_verification": HashVerification.VERIFIED,
                 # Only now is this HASH_ONLY's own definition -- "a content hash
                 # of the actual bytes used is known" -- actually satisfied.
@@ -367,6 +382,7 @@ def verify_model_artifact(artifact: ResolvedModelArtifact) -> ResolvedModelArtif
     )
     return artifact.model_copy(
         update={
+            "observed_sha256": checksum_result.actual_sha256,
             "hash_verification": HashVerification.MISMATCH,
             # Deliberately NOT HASH_ONLY. A mismatched artifact has no known
             # content hash -- it has a REFUTED one, which is a different thing.
@@ -1229,7 +1245,7 @@ def _resolved_version(name: str, status: str) -> Optional[str]:
 # disabled/never queried this run still appears in the provenance
 # output as NOT_CONSULTED, rather than being silently absent -- the
 # structural distinction point 6 of this module's task required.
-KNOWN_SOURCES = (
+KNOWN_SOURCES: tuple[str, ...] = (
     "ClinVar",
     "dbSNP",
     "gnomAD",
@@ -1260,6 +1276,106 @@ KNOWN_SOURCES = (
     "Functional evidence (MaveDB)",
     "MANE Select (NCBI)",
 )
+
+# ---------------------------------------------------------------------------
+# Tool versions (2026-09-11, the human's ruling: "Reports not recording which
+# htslib version produced them is the same gap as the model-hash -- the thing
+# that determines the output isn't captured alongside the output.")
+#
+# Each is MEASURED where the tool actually ran, never copied from the image's
+# package pin:
+#   - tabix/htslib is the one of these this pipeline RUNS (AlphaMissense and
+#     local-gnomAD lookups): its own `--version`, read at run time.
+#   - the software that created the VCF (Kim: freeBayes), bcftools and the
+#     htslib bcftools used ran UPSTREAM,
+#     in whatever produced the input VCF. Those tools write their own version
+#     into the VCF header as they produce it (`##source=freeBayes v1.3.10`,
+#     `##bcftools_viewVersion=1.16+htslib-1.16`), so the header is read.
+#     Probing a local `bcftools --version` instead would record a binary that
+#     did not produce this report -- and would be wrong for a supplied VCF.
+#   - samtools runs on the alignment, which this pipeline never receives, and
+#     writes nothing into a VCF. Recorded as not recorded, with the reason.
+# See `pipeline/orchestrator.py::GeperPipeline._capture_tool_provenance`.
+# ---------------------------------------------------------------------------
+TOOL_SOURCE_TABIX = "tabix / htslib (run by this pipeline)"
+# `##source` names the software that CREATED the file (VCF spec) -- a variant
+# caller for Kim's output (freeBayes), but a curation label for a hand-made
+# VCF (a fixture here says "GEPER_manual_curation_v1"). So not "variant caller".
+TOOL_SOURCE_CALLER = "Software that created the input VCF (its ##source)"
+TOOL_SOURCE_BCFTOOLS = "bcftools (declared in the input VCF)"
+TOOL_SOURCE_HTSLIB = "htslib used by bcftools (declared in the input VCF)"
+TOOL_SOURCE_SAMTOOLS = "samtools"
+# Kim reads this from the BAM's own @PG header (the aligner writes it as it
+# runs), so it names whichever aligner actually produced the alignment.
+TOOL_SOURCE_ALIGNER = "Aligner (declared in the input VCF)"
+KNOWN_SOURCES = KNOWN_SOURCES + (
+    TOOL_SOURCE_TABIX,
+    TOOL_SOURCE_CALLER,
+    TOOL_SOURCE_BCFTOOLS,
+    TOOL_SOURCE_HTSLIB,
+    TOOL_SOURCE_SAMTOOLS,
+    TOOL_SOURCE_ALIGNER,
+)
+
+_BCFTOOLS_STAMP = re.compile(r"^##bcftools_\w+Version=([^+\s]+)(?:\+htslib-(\S+))?")
+# Written by kim_pipeline/pipeline/variant_calling/tool_versions.py. A value
+# beginning "NOT READ" is that pipeline's honest marker, not a version.
+_KIM_STAMPS = {"##samtoolsVersion=": "samtools", "##alignerVersion=": "aligner"}
+NOT_READ_MARKER = "NOT READ"
+
+
+def parse_vcf_tool_stamps(header_lines: List[str]) -> Dict[str, List[str]]:
+    """
+    The tool versions an input VCF declares about itself, in order of first
+    appearance, duplicates removed -- EVERY distinct value, never one chosen
+    among several: a VCF touched by two bcftools versions says so. An empty
+    list means the header declares nothing, which callers must render as
+    such rather than fill in.
+    """
+    found: Dict[str, List[str]] = {"caller": [], "bcftools": [], "htslib": [], "samtools": [], "aligner": []}
+
+    def _add(key: str, value: Optional[str]) -> None:
+        if value and value not in found[key]:
+            found[key].append(value)
+
+    for line in header_lines:
+        if line.startswith("##source="):
+            _add("caller", line[len("##source=") :].strip())
+            continue
+        m = _BCFTOOLS_STAMP.match(line)
+        if m:
+            _add("bcftools", m.group(1))
+            _add("htslib", m.group(2))
+            continue
+        for prefix, key in _KIM_STAMPS.items():
+            if line.startswith(prefix):
+                _add(key, line[len(prefix) :].strip())
+    return found
+
+
+def capture_tool_version(binary: str, timeout_secs: float = 10.0) -> Dict[str, Optional[str]]:
+    """
+    `binary --version`'s first non-empty output line, read from the binary
+    itself. `{"version": None, "error": ...}` when it cannot be run or says
+    nothing -- never a guessed or pinned value. Never raises: a provenance
+    capture must not break a run.
+    """
+    try:
+        proc = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=timeout_secs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"version": None, "error": str(exc) or type(exc).__name__}
+    first = next(
+        (ln.strip() for stream in (proc.stdout, proc.stderr) for ln in (stream or "").splitlines() if ln.strip()),
+        None,
+    )
+    # Exit status first: a binary that rejects `--version` prints its USAGE
+    # and exits non-zero, and that text must not be recorded as a version.
+    if proc.returncode != 0:
+        return {"version": None, "error": f"`{binary} --version` exited {proc.returncode}: {first or 'no output'}"}
+    if first is None:
+        return {"version": None, "error": f"`{binary} --version` printed nothing"}
+    return {"version": first, "error": None}
+
 
 # Evidence-source short names, exactly as recorded in a variant's
 # `clinical_report["evidence_sources"]` (see

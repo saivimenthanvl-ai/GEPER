@@ -7,7 +7,7 @@ the exact `document` shape `report/json_builder.py::JSONResultBuilder.build()`
 produces (or the single-`variant_result` ad hoc shape `generate_pdf`
 also accepts), and reads only fields the full report already reads --
 `clinical_report["executive_summary"]`, `["acmg_classification"]`,
-`["confidence"]`, `interpretation_result["gene_symbol"]`,
+`["confidence"]`, `["references"]`, `interpretation_result["gene_symbol"]`,
 `normalization["hgvs_c"]/["hgvs_g"]`, and `case_prioritization`.
 Nothing here re-derives ACMG classification, confidence, evidence, or
 phenotype ranking, and nothing here gathers new evidence; it is purely
@@ -63,6 +63,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Image, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from component_identity import SHORT_NAME
 from pipeline.acmg_rules import mtdna_interpretation_disclaimer_short
 from pipeline.hgvs_utils import is_mitochondrial_chrom
 from report.clinical_report_builder import (
@@ -75,6 +76,11 @@ from report.clinical_report_builder import (
     _offline_sources_caveat_text,
     _variant_hgvs_or_locus,
     _variant_reviewer_flags,
+    DATA_ATTRIBUTION_HEADING,
+    EVIDENCE_SOURCES_USED_HEADING,
+    NO_EVIDENCE_SOURCES_TEXT,
+    reference_blocks,
+    report_revision_banners,
 )
 from report.pdf_escape import esc
 from report.summary import (
@@ -93,7 +99,7 @@ from report.summary import (
     _resolve_logo_path,
 )
 from utils.logger import get_logger
-from utils.timezone_utils import format_ist
+from utils.timezone_utils import format_ist, format_ist_from_iso
 
 logger = get_logger(__name__)
 
@@ -162,7 +168,7 @@ def _split_sentences(text: str) -> List[str]:
 
 
 _COMPANION_NOTE = (
-    "This is a summary report. The full detailed Bij AI report for this run -- including the "
+    "This is a summary report. The full detailed GEPER report for this run -- including the "
     "sequencing QC table, the complete ACMG/AMP criteria applied to each variant with their "
     "rationale, all supporting evidence, and the stated limitations of each finding -- is "
     "available as a companion document ({companion}) generated from the same analysis run and "
@@ -209,6 +215,17 @@ def _build_short_stylesheet() -> Dict[str, ParagraphStyle]:
             fontSize=8,
             leading=10,
             textColor=colors.HexColor("#9a6a00"),
+            fontName="Helvetica-Bold",
+        ),
+        # Per-variant stage errors (approved 2026-09-11, see _build_variant_block).
+        # Same hex as the full report's StatusError style (summary.py) --
+        # a stage failure should read the same colour on both PDFs.
+        "StatusError": ParagraphStyle(
+            "GeperShortStatusError",
+            parent=base["BodyText"],
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#a11d1d"),
             fontName="Helvetica-Bold",
         ),
         "Footnote": ParagraphStyle(
@@ -328,10 +345,13 @@ def _ordered_variants(variants: List[Dict[str, Any]]) -> List[tuple]:
 # ---------------------------------------------------------------------------
 
 
+from report.summary import SCOPE_LINE  # noqa: E402 -- one source of truth for the scope line
+
+
 def _build_short_header(logo_path: Optional[str], styles: Dict[str, ParagraphStyle]) -> List[Any]:
     """Compact letterhead line: optional logo plus the report title. Same graceful degradation as the full report -- a missing or corrupt logo logs and falls back to the text-only title, never fails the render."""
     content_width = _PAGE_W - 2 * _MARGIN
-    title = Paragraph("Bij AI Clinical Genomic Summary Report", styles["ReportTitle"])
+    title = Paragraph(f"{SHORT_NAME} Clinical Genomic Summary Report", styles["ReportTitle"])
     _, title_height = title.wrap(content_width, 1000)
 
     resolved = _resolve_logo_path(logo_path)
@@ -373,6 +393,7 @@ def _build_identity_block(
     run_id: str,
     assembly: Optional[str],
     variant_count: int,
+    generated_at: Optional[str],
     styles: Dict[str, ParagraphStyle],
 ) -> Table:
     """
@@ -409,9 +430,15 @@ def _build_identity_block(
     pairs.append(("Run ID", run_id))
     pairs.append(("Reference Build", assembly or "Not specified"))
     pairs.append(("Variants Reported", str(variant_count)))
-    # IST for the same reason the full report uses it (Indian
-    # hospitals); the underlying timestamp is still UTC.
-    pairs.append(("Report Generated", format_ist(datetime.now(timezone.utc))))
+    # Two different facts, not alternatives (#17): the document's own
+    # persisted `generated_at` (falls back to the same "Not available"
+    # marker Markdown already uses, never to `datetime.now()`), and
+    # separately the moment THIS PDF FILE was rendered, under its own
+    # honest label -- see `report/summary.py::_build_patient_header_table`
+    # for the full reasoning, mirrored here. IST for the same reason the
+    # full report uses it (Indian hospitals); underlying timestamps stay UTC.
+    pairs.append(("Report Generated", format_ist_from_iso(generated_at)))
+    pairs.append(("PDF Rendered", format_ist(datetime.now(timezone.utc))))
 
     rows: List[List[Any]] = []
     for i in range(0, len(pairs), 2):
@@ -473,7 +500,7 @@ def _build_variant_block(idx: int, variant_result: Dict[str, Any], styles: Dict[
             Paragraph(heading, styles["VariantHeading"]),
             Paragraph(
                 f"Out of scope ({esc(out_of_scope.get('scope', 'unspecified'))}): "
-                f"{esc(out_of_scope.get('reason')) or 'This variant is out of scope for this Bij AI build.'}",
+                f"{esc(out_of_scope.get('reason')) or f'This variant is out of scope for this {SHORT_NAME} build.'}",
                 styles["BodyText"],
             ),
             Paragraph(
@@ -536,6 +563,22 @@ def _build_variant_block(idx: int, variant_result: Dict[str, Any], styles: Dict[
         strip,
     ]
 
+    # Per-variant stage errors, directly under the result strip (wording
+    # approved by the human 2026-09-11; drafted by angela in 9765c41). Same
+    # shape as report/summary.py::_build_variant_section's identical
+    # addition; see that function's comment for why. Pinned by
+    # tests/test_stage_errors_on_both_pdfs.py.
+    # The marker is the WORD "Warning:", not the "⚠" first approved: no font
+    # this PDF uses (Helvetica family, no TTF registered) has U+26A0, so
+    # ReportLab drew its fallback black square. Re-ruled by the human
+    # 2026-09-11 -- plain text, no embedded font. Any non-Latin-1 marker
+    # added here must pass tests/test_pdf_glyph_coverage.py.
+    stage_errors = variant_result.get("errors") or []
+    if stage_errors:
+        flow.append(Spacer(1, 1 * mm))
+        for err in stage_errors:
+            flow.append(Paragraph(f"Warning: {esc(err)}", styles["StatusError"]))
+
     # Round 14, B2: per-finding, not report-level -- see
     # report/report_generator.py's identical placement/reasoning. Uses
     # the SHORT disclaimer text (no criterion counts) for this report's
@@ -576,6 +619,28 @@ def _build_variant_block(idx: int, variant_result: Dict[str, Any], styles: Dict[
     if flags:
         flow.append(Spacer(1, 1 * mm))
         flow.append(Paragraph("! Reviewer attention: " + "; ".join(flags) + ".", styles["Flag"]))
+
+    # AM-04/#10 ruling (human, 2026-09-11): a dual sign-off document must
+    # show what the classification rests on. `clinical["references"]` is
+    # the SAME list `report/clinical_report_builder.py::_references()`
+    # already computed and `report/report_generator.py`'s Markdown
+    # section 16 already renders -- gated on `evidence_sources`, i.e.
+    # only sources this run actually used, never a static catalogue.
+    # Ruling (A), 2026-09-11: the fixed licence notices follow as their own
+    # labelled "Data attribution" block instead of sharing that list.
+    evidence_refs, attribution = reference_blocks(clinical)
+    flow.append(Spacer(1, 1 * mm))
+    if evidence_refs:
+        evidence_text = "<br/>".join(f"• {esc(r)}" for r in evidence_refs)
+    else:
+        evidence_text = esc(NO_EVIDENCE_SOURCES_TEXT)
+    flow.append(Paragraph(f"{EVIDENCE_SOURCES_USED_HEADING}: {evidence_text}", styles["Footnote"]))
+    flow.append(
+        Paragraph(
+            f"{DATA_ATTRIBUTION_HEADING}: " + "<br/>".join(f"• {esc(r)}" for r in attribution),
+            styles["Footnote"],
+        )
+    )
 
     flow.append(Spacer(1, 3 * mm))
     return flow
@@ -714,7 +779,9 @@ def generate_short_pdf(
     patient["consent"] = _document_consent(document)
     sample_id = _derive_sample_id(document)
     resolved_run_id = _derive_run_id(document, run_id)
-    assembly = document.get("assembly")
+    # Display only: `assembly_note` (card #15) says why an all-mitochondrial
+    # run has no build, and fills the build slot in its place.
+    assembly = document.get("assembly") or document.get("assembly_note")
     header_label = patient["patient_name"] if not patient["deidentified"] else sample_id
 
     styles = _build_short_stylesheet()
@@ -730,13 +797,32 @@ def generate_short_pdf(
         bottomMargin=28 * mm,
         leftMargin=_MARGIN,
         rightMargin=_MARGIN,
-        title="Bij AI Clinical Genomic Summary Report",
+        title=(
+            "Bij AI Clinical Genomic Summary Report — variant interpretation from a supplied VCF"
+            " — Bij AI variant-interpretation component (GEPER)"
+        ),
     )
 
     story: List[Any] = list(_build_short_header(logo_path, styles))
+    # WHAT THIS REPORT IS -- the same line the full report carries, and for
+    # the same reason: both trees in this repository render a "Clinical
+    # Genomic Report" under one brand, so either alone reads as the whole
+    # product. In the STORY rather than the title because this header sizes
+    # its logo to the title's height.
+    story.append(Paragraph(SCOPE_LINE, styles["Footnote"]))
     story.append(Spacer(1, 3 * mm))
-    story.append(_build_identity_block(patient, sample_id, resolved_run_id, assembly, len(variants), styles))
+    story.append(
+        _build_identity_block(
+            patient, sample_id, resolved_run_id, assembly, len(variants), document.get("generated_at"), styles
+        )
+    )
     story.append(Spacer(1, 4 * mm))
+    # Revision traceability (amended / superseded / re-analysis): same block
+    # and wording as the full PDF and Markdown, above the result. None of the
+    # four states -> nothing printed.
+    for banner in report_revision_banners(document):
+        story.append(Paragraph(esc(banner), styles["Flag"]))
+        story.append(Spacer(1, 2 * mm))
 
     story.append(Paragraph("Result", styles["SectionHeading"]))
     if variants:

@@ -108,6 +108,21 @@ def seeded(clinical_dsn):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, now),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_id, user_id, now),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org_id, user_id, now),
+        )
         test_id = uuid.uuid4()
         cur.execute(
             "INSERT INTO tests (test_id, org_id, name, assembly, status, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
@@ -293,7 +308,7 @@ class TestDataAccessIsRequestScoped:
         class Recording(real):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                seen.append(id(self))
+                seen.append(self)
 
         monkeypatch.setattr(endpoints, "DataAccess", Recording)
 
@@ -301,8 +316,14 @@ class TestDataAccessIsRequestScoped:
         assert client.get(f"/exceptions/orders/{order_id}", headers=_auth(session)).status_code == 200
         assert client.get(f"/exceptions/orders/{order_id}", headers=_auth(session)).status_code == 200
 
+        # Hold the references (not `id(self)`) so CPython cannot reuse a
+        # freed instance's address and make two genuinely different objects
+        # compare equal -- observed in CI run 34592847655: `len(seen) == 2`
+        # passed while `id(seen[0]) != id(seen[1])` failed, because both
+        # instances had already been garbage collected by the time their
+        # ids were compared.
         assert len(seen) == 2, f"expected one DataAccess per request, got {len(seen)}"
-        assert seen[0] != seen[1], "both requests shared one DataAccess -- the singleton is back"
+        assert seen[0] is not seen[1], "both requests shared one DataAccess -- the singleton is back"
 
 
 class TestAuthenticationIsRequiredOnEVERYRoute:

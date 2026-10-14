@@ -1,7 +1,7 @@
 """
 geper/api/submission_worker.py
 ──────────────────────────────
-Background worker for Bij AI interpretation submissions.
+Background worker for GEPER interpretation submissions.
 
 Polls submissions with status='queued', invokes geper/main.py via spawn_tracked
 (so interpretations are killable), handles timeouts, and updates submission status.
@@ -26,10 +26,21 @@ the CLI to correlate it; (3) reads success/failure from the exit code
 and the run document from disk instead of parsing a stdout JSON envelope
 geper/main.py has never produced (geper/main.py:206-281 never prints to
 stdout; its output is files under --output-dir plus an exit code).
+
+2026-09-12 (D0, "build the link"): a completed run is now RECORDED as
+clinical records -- sequencing run, VCF, interpretation, draft report, in
+one transaction (clinical/data_access.py::record_pipeline_result) -- as the
+organisation's system principal, after the Phase 5 preconditions pass, and
+the submission's interpretation_id is that clinical interpretation (it was
+a uuid4 naming nothing). A retry, a re-queue or a restart adopts an
+existing record for the same VCF bytes and sample instead of running the
+engine twice. Scope (ruling D1): runs whose patient/order/sample records
+already exist; nothing in production creates those yet.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -37,9 +48,13 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Optional
 
+from component_identity import SHORT_NAME
 from pipeline.hpo.utils import is_well_formed_hpo_id
+from report.clinical_report_builder import _QC_METRIC_ORDER
 from shared.process_control import spawn_tracked, kill_process_tree_now
 
 from .submission_store import SubmissionStore
@@ -65,19 +80,77 @@ _DEFAULT_GEPER_MAIN_PATH = str((Path(__file__).resolve().parent.parent / "main.p
 # uses for GEPER_SUBMISSION_STORE_PATH.
 _DEFAULT_OUTPUT_ROOT = str(Path(__file__).parent / ".submission_outputs")
 
+# Written into each submission's output directory once its run is recorded:
+# which clinical organisation, order, sample, interpretation, report and VCF
+# the directory's files became. Anything that later acts on the directory
+# can tell a run governed by the clinical record from a standalone one by
+# this file alone. (Nothing reads it yet: how review/signoff.py should treat
+# a linked run is a separate, pending design.)
+CLINICAL_LINK_FILENAME = "clinical_link.json"
+
+
+@dataclass(frozen=True)
+class _ClinicalLink:
+    """One submission resolved to its clinical identity (see
+    InterpretationWorker._clinical_preflight)."""
+
+    session: Any
+    org_id: uuid.UUID
+    order_id: uuid.UUID
+    sample_id: uuid.UUID
+    vcf_hash: str
+    submission_key: str
+
+
+def _sha256_file(path: str) -> str:
+    """Streamed: a VCF can be large. Same digest create_vcf records."""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _write_clinical_link(output_dir: str, link: dict) -> None:
+    """Atomic: written to a temporary name and renamed, so a reader never
+    sees half a file."""
+    os.makedirs(output_dir, exist_ok=True)
+    final = os.path.join(output_dir, CLINICAL_LINK_FILENAME)
+    tmp = final + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(link, fh, indent=2)
+    os.replace(tmp, final)
+
 
 def _hpo_terms_to_cli_arg(hpo_terms) -> str:
     """
     Converts the platform's `hpo_terms` JSON into the comma-separated
     "HP:#######" string geper/main.py's --hpo-terms wants
-    (geper/main.py:175-189's own help text). The platform spec
-    (GEPER_CLINICAL_PLATFORM_SPEC.md:457) declares hpo_terms as a plain
-    list -- ["HP:0000001", ...] -- but the implemented request model
-    (geper/api/main.py:209) is Optional[Dict[str, Any]], so in practice a
-    dict is what reaches here; the one shape attested anywhere in this
-    repo (geper/api/tests/test_interpretations_api.py:77,
+    (geper/main.py:175-189's own help text). The platform spec declares
+    hpo_terms as an OBJECT -- `"hpo_terms": { ... }`
+    (GEPER_CLINICAL_PLATFORM_SPEC.md:526, in the POST /interpretations
+    contract block) -- and the implemented request model
+    (geper/api/main.py:310) agrees: Optional[Dict[str, Any]]. The one
+    concrete shape attested anywhere in this repo
+    (geper/api/tests/test_interpretations_api.py:197,
     geper/api/tests/test_submission_worker.py) is {"terms": [...]}.
-    Accepts either shape.
+    A bare list is also accepted, defensively; it is not a declared
+    shape and nothing on the wire produces one.
+
+    CORRECTED 2026-09-13 (wave 117): this docstring used to say the spec
+    "declares hpo_terms as a plain list -- ["HP:0000001", ...]" and cited
+    GEPER_CLINICAL_PLATFORM_SPEC.md:457 for it. That was true when
+    written and stopped being true when the POST /interpretations
+    contract block was reconciled against geper/api/main.py on
+    2026-09-13 and the field became an object; :457 is now section 10.2's
+    build-mismatch paragraph and says nothing about hpo_terms at all.
+    Ruled: the object shipping today is correct, so the false CLAIM is
+    what gets fixed, not the API -- "the fix is to correct the comment,
+    not to change the API to match a document that already changed."
+    Nothing about the shapes this function accepts changed here.
+    TestHpoTermsDocstringCitations
+    (geper/api/tests/test_submission_worker.py) now re-checks the
+    citations above, so the next time the spec moves, a test says so.
 
     Raises ValueError, naming exactly what's wrong, on anything that
     isn't a non-empty list of well-formed HPO IDs -- ruled 2026-09-08:
@@ -110,8 +183,50 @@ def _hpo_terms_to_cli_arg(hpo_terms) -> str:
     return ",".join(terms)
 
 
+def _qc_metrics_validated(qc_metrics) -> dict:
+    """
+    Converts the platform's `qc_metrics` JSON -- a flat
+    {metric_name: number} dict, e.g. {"mean_coverage_depth": 45.2} --
+    into the `{"status": "found", "value": float, "reason": None}`-per-
+    metric shape `report/clinical_report_builder.py::_parse_qc_metrics`
+    requires. Raises ValueError, naming exactly what's wrong, on
+    anything that isn't a dict of real numbers keyed by one of
+    `_QC_METRIC_ORDER` -- same "convert, and if conversion fails, RAISE
+    rather than proceed" pattern `_hpo_terms_to_cli_arg` above already
+    applies (2026-09-08 ruling).
+
+    2026-09-11 ruling (PHASE8-bij-interpret, option A): the platform's
+    own tests (geper/api/tests/test_interpretations_api.py:78,
+    test_submission_worker.py:247) use {"depth": 50} as "a normal
+    qc_metrics submission". Written through unconverted, that shape
+    reached `_parse_qc_metrics` as a `.get()` miss on every recognized
+    key and rendered "Not reported by the upstream sequencing/alignment
+    pipeline for this run" about a value that WAS reported -- a FALSE
+    SENTENCE in a clinical report. Option C (aliasing an unrecognized
+    key like "depth" onto "mean_coverage_depth") is deliberately NOT
+    done here: guessing clinical meaning from a key name is how a wrong
+    mapping becomes invisible.
+    """
+    if not isinstance(qc_metrics, dict):
+        raise ValueError(f"qc_metrics must be a JSON object keyed by metric name, got {qc_metrics!r}.")
+
+    unrecognized = [k for k in qc_metrics if k not in _QC_METRIC_ORDER]
+    if unrecognized:
+        raise ValueError(
+            f"qc_metrics contained unrecognized key(s) {unrecognized!r}; "
+            f"recognized metric names are {list(_QC_METRIC_ORDER)!r}."
+        )
+
+    converted = {}
+    for key, value in qc_metrics.items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"qc_metrics[{key!r}] must be a real number, got {value!r}.")
+        converted[key] = {"status": "found", "value": float(value), "reason": None}
+    return converted
+
+
 class InterpretationWorker:
-    """Poll and process Bij AI interpretation submissions."""
+    """Poll and process GEPER interpretation submissions."""
 
     def __init__(self, store: SubmissionStore, data_access=None):
         self.store = store
@@ -157,6 +272,227 @@ class InterpretationWorker:
         except Exception as e:
             logger.error(f"[{submission.id}] Failed to create exception: {e}", exc_info=True)
 
+    # ── The clinical link (2026-09-12, D0 "build the link") ──────────────────
+    #
+    # A submission is a clinical act: the run's result becomes a clinical
+    # interpretation of one sample, with a draft report, inside the
+    # organisation that owns the submission. The worker acts as that
+    # organisation's SYSTEM PRINCIPAL (Phase 5c) -- the same principal it
+    # already used for failure exceptions -- because no human session
+    # exists for an automatic submission.
+    #
+    # SCOPE (human ruling D1, 2026-09-12): this links runs whose patient,
+    # order and sample ALREADY EXIST as clinical records. Nothing in
+    # production creates those records yet (order entry is its own card), so
+    # until it does every real submission is refused here as not linked.
+
+    def _fail(self, submission, message: str, reason_code: Optional[str] = None) -> None:
+        logger.error(f"[{submission.id}] {message}")
+        self.store.update_status(submission.id, "failed", error_message=message)
+        if reason_code:
+            self._create_submission_failure_exception(submission, reason_code, message)
+
+    def _identity(self, submission) -> Optional[tuple[uuid.UUID, uuid.UUID, uuid.UUID]]:
+        """(org_id, order_id, sample_id) as UUIDs, or None when the submission
+        does not carry all three -- every row from before 2026-09-12 (org
+        "default", no sample_id) and any row written without them."""
+        try:
+            return (
+                uuid.UUID(str(submission.org_id)),
+                uuid.UUID(str(submission.order_id)),
+                uuid.UUID(str(submission.sample_id)),
+            )
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _clinical_preflight(self, submission) -> Optional["_ClinicalLink"]:
+        """Everything that must hold before the engine runs. Returns None
+        after marking the submission failed (with an exception on the order
+        wherever the order exists to carry one)."""
+        from clinical.data_access import interpretation_submission_key
+
+        if self.data_access is None:
+            self._fail(
+                submission,
+                "No clinical record store is configured: refusing to run an interpretation "
+                "whose result cannot be recorded as a clinical record.",
+            )
+            return None
+
+        identity = self._identity(submission)
+        if identity is None:
+            self._fail(
+                submission,
+                "Submission is not linked to a clinical record: it must name a clinical "
+                f"organisation, order and sample (org_id={submission.org_id!r}, "
+                f"order_id={submission.order_id!r}, sample_id={getattr(submission, 'sample_id', None)!r}).",
+            )
+            return None
+        org_id, order_id, sample_id = identity
+
+        session = self.data_access._create_system_session(org_id)
+        order = self.data_access.get_order(session, order_id)
+        if order is None:
+            # No exception: exceptions hang off an order, and this
+            # organisation has none by that id.
+            self._fail(submission, f"Order {order_id} not found in this submission's organisation.")
+            return None
+
+        sample = self.data_access.get_sample(session, sample_id)
+        if sample is None or sample.get("order_id") != order_id:
+            self._fail(
+                submission,
+                f"Sample {sample_id} is not a sample of order {order_id} in this organisation.",
+                "sample_unresolved",
+            )
+            return None
+
+        passed, exception_id = self.data_access.validate_order_for_submission(
+            session,
+            order_id,
+            order["patient_id"],
+            sample_id,
+            submission.vcf_path,
+            submission.assembly,
+            order["required_scope"],
+            "system",
+        )
+        if not passed:
+            # validate_order_for_submission has already recorded its own
+            # exception, with the precise reason code.
+            self.store.update_status(
+                submission.id,
+                "failed",
+                error_message=f"Submission preconditions not met; see clinical exception {exception_id}.",
+            )
+            return None
+
+        vcf_hash = _sha256_file(submission.vcf_path)
+        return _ClinicalLink(
+            session=session,
+            org_id=org_id,
+            order_id=order_id,
+            sample_id=sample_id,
+            vcf_hash=vcf_hash,
+            submission_key=interpretation_submission_key(vcf_hash, sample_id),
+        )
+
+    def _complete(self, submission, link: "_ClinicalLink", output_dir: str, record: dict, results_path) -> None:
+        """Write clinical_link.json, then mark the submission complete with the
+        clinical interpretation id. The file comes first: a submission must
+        never read 'complete' while its output directory cannot say which
+        clinical records it became."""
+        _write_clinical_link(
+            output_dir,
+            {
+                "submission_id": submission.id,
+                "org_id": str(link.org_id),
+                "order_id": str(link.order_id),
+                "sample_id": str(link.sample_id),
+                "interpretation_id": str(record["interpretation_id"]),
+                "report_id": str(record["report_id"]) if record.get("report_id") else None,
+                "vcf_id": str(record["vcf_id"]),
+                "submission_key": link.submission_key,
+            },
+        )
+        logger.info(f"[{submission.id}] Recorded as clinical interpretation {record['interpretation_id']}")
+        self.store.update_status(
+            submission.id,
+            "complete",
+            interpretation_id=str(record["interpretation_id"]),
+            run_document_ref=results_path,
+        )
+
+    def _adopt_existing_record(self, submission, link: "_ClinicalLink", output_dir: str) -> bool:
+        """If this run (same VCF bytes, same sample) is already recorded --
+        an earlier attempt committed and then lost its SQLite update, or the
+        row was re-queued after success -- complete the submission with that
+        record instead of running the engine again. True if adopted."""
+        found = self.data_access.find_interpretation_by_submission_key(link.session, link.submission_key)
+        if found is None:
+            return False
+        results_path = os.path.join(output_dir, "geper_results.json")
+        self._complete(submission, link, output_dir, found, results_path if os.path.isfile(results_path) else None)
+        return True
+
+    def _record_run(self, submission, link: "_ClinicalLink", output_dir: str, results_path: str, run_document) -> bool:
+        from clinical.data_access import DuplicateInterpretationError
+
+        try:
+            recorded = self.data_access.record_pipeline_result(
+                link.session, link.sample_id, submission.vcf_path, link.vcf_hash, run_document
+            )
+            record = {
+                "interpretation_id": recorded.interpretation_id,
+                "report_id": recorded.report_id,
+                "vcf_id": recorded.vcf_id,
+            }
+        except DuplicateInterpretationError:
+            # A concurrent attempt recorded this run first; adopt it.
+            if self._adopt_existing_record(submission, link, output_dir):
+                return True
+            record = None
+            failure = "the clinical record refused a duplicate it then could not find"
+        except Exception as e:
+            record = None
+            failure = f"{type(e).__name__}: {e}"
+
+        if record is None:
+            self._fail(
+                submission,
+                f"The interpretation ran but could not be recorded as a clinical record ({failure}). "
+                "Nothing was recorded; a retry will run it again.",
+                "clinical_record_write_failed",
+            )
+            return True
+
+        try:
+            self._complete(submission, link, output_dir, record, results_path)
+        except OSError as e:
+            self._fail(
+                submission,
+                f"Recorded as clinical interpretation {record['interpretation_id']}, but "
+                f"clinical_link.json could not be written ({e}). A retry will adopt the record.",
+                "clinical_record_write_failed",
+            )
+        return True
+
+    def reconcile_interrupted_submissions(self, limit: int = 100) -> int:
+        """
+        Startup: SubmissionStore marks rows left 'running' by a dead worker
+        as 'interrupted' -- nobody knows how far they got. For each one, ask
+        the clinical record: if this run was recorded before the worker
+        died, complete the row with that record. Otherwise leave it
+        interrupted (unchanged semantics: an operator decides). Never runs
+        the engine and never creates an exception. Returns how many were
+        completed.
+        """
+        from clinical.data_access import interpretation_submission_key
+
+        if self.data_access is None:
+            return 0
+        completed = 0
+        for submission in self.store.get_submissions_with_status("interrupted", limit):
+            identity = self._identity(submission)
+            if identity is None or not os.path.isfile(submission.vcf_path):
+                continue
+            org_id, order_id, sample_id = identity
+            try:
+                vcf_hash = _sha256_file(submission.vcf_path)
+                link = _ClinicalLink(
+                    session=self.data_access._create_system_session(org_id),
+                    org_id=org_id,
+                    order_id=order_id,
+                    sample_id=sample_id,
+                    vcf_hash=vcf_hash,
+                    submission_key=interpretation_submission_key(vcf_hash, sample_id),
+                )
+                if self._adopt_existing_record(submission, link, os.path.join(self.output_root, submission.id)):
+                    completed += 1
+            except Exception as e:
+                logger.error(f"[{submission.id}] Could not reconcile interrupted submission: {e}", exc_info=True)
+        return completed
+
     def process_queued_submission(self, submission) -> bool:
         """Process a single queued submission.
 
@@ -175,6 +511,18 @@ class InterpretationWorker:
             # below).
             output_dir = os.path.join(self.output_root, submission.id)
             os.makedirs(output_dir, exist_ok=True)
+
+            # THE CLINICAL LINK (2026-09-12, D0). Before the engine runs:
+            # resolve the submission to its organisation, order and sample,
+            # run the Phase 5 preconditions, and ask whether this exact run
+            # (same VCF bytes, same sample) is already recorded. A refusal
+            # here marks the submission failed and returns; the engine never
+            # starts for a run that could not be recorded.
+            link = self._clinical_preflight(submission)
+            if link is None:
+                return True
+            if self._adopt_existing_record(submission, link, output_dir):
+                return True
 
             # Build the geper/main.py invocation. sys.executable, not a
             # bare command name -- see _DEFAULT_GEPER_MAIN_PATH.
@@ -258,9 +606,20 @@ class InterpretationWorker:
                 # path. Mirrored here (not reused directly --
                 # that helper is shaped around a kim_pipeline checkpoint
                 # dict, not this submission's already-final qc_metrics dict).
+                #
+                # CONVERT, DO NOT DEGRADE (2026-09-11 ruling, PHASE8-
+                # bij-interpret option A, same pattern as hpo_terms
+                # above): _qc_metrics_validated raises ValueError, caught
+                # by this function's own existing generic `except
+                # Exception` handler below, on any key it doesn't
+                # recognize -- rather than writing the platform's raw
+                # dict through unconverted, which is what let
+                # {"depth": 50} reach `_parse_qc_metrics` as a silent
+                # `.get()` miss and render a false "not reported" for a
+                # value that was, in fact, reported.
                 qc_metrics_path = os.path.join(output_dir, "qc_metrics.json")
                 with open(qc_metrics_path, "w", encoding="utf-8") as fh:
-                    json.dump(submission.qc_metrics, fh)
+                    json.dump(_qc_metrics_validated(submission.qc_metrics), fh)
                 cmd.extend(["--qc-metrics-json", qc_metrics_path])
 
             logger.info(f"Executing: {' '.join(cmd)}")
@@ -302,7 +661,7 @@ class InterpretationWorker:
             # is files under --output-dir plus this exit code. stderr is
             # still surfaced in the error message for diagnosis, as before.
             if proc.returncode != 0:
-                error_msg = f"Bij AI returned exit code {proc.returncode}"
+                error_msg = f"{SHORT_NAME} returned exit code {proc.returncode}"
                 if stderr:
                     error_msg += f": {stderr[:500]}"
                 logger.error(f"[{submission.id}] {error_msg}")
@@ -330,7 +689,7 @@ class InterpretationWorker:
             # than crashing on open() below.
             results_path = os.path.join(output_dir, "geper_results.json")
             if not os.path.isfile(results_path):
-                error_msg = f"Bij AI exited 0 but did not write {results_path}"
+                error_msg = f"{SHORT_NAME} exited 0 but did not write {results_path}"
                 logger.error(f"[{submission.id}] {error_msg}")
                 self.store.update_status(
                     submission.id,
@@ -344,46 +703,19 @@ class InterpretationWorker:
                 )
                 return True
 
-            # interpretation_id: THE PLATFORM MINTS IT (2026-09-08 ruling,
-            # correcting this file's own prior "left None" note -- that
-            # was right while unresolved and is now resolved the other
-            # way). geper/main.py's real output (geper_results.json) has
-            # no run-id/interpretation-id concept anywhere -- confirmed
-            # again: grepped geper/pipeline/orchestrator.py and
-            # geper/report/json_builder.py, zero hits -- so this was
-            # never the engine's to supply, and
-            # the ruling is explicit that it also isn't submission.id
-            # reused ("generate one rather than leaving the column empty
-            # or borrowing the response id" -- that would make this
-            # column redundant with the API's own response `id` field,
-            # the objection this file raised and which the ruling
-            # answered by minting a genuinely distinct id, not by
-            # dropping the column). Minted here, at completion, the same
-            # way geper/api/submission_store.py:165 mints submission.id
-            # itself (uuid.uuid4()) -- this worker is "the platform" at
-            # the one layer it actually touches; wiring this to
-            # clinical/data_access.py::create_interpretation() (the
-            # OTHER, Postgres-side "platform creates the interpretations
-            # row" -- clinical/schema.sql:438-440,
-            # clinical/data_access.py:1703-1773) would need a vcf_id and
-            # an authenticated Session
-            # this SQLite-backed submission has neither of; that's a real
-            # architecture decision, out of this diff's scope, and not
-            # what was ruled on.
-            interpretation_id = str(uuid.uuid4())
-            # run_document_ref: the PATH to the file main.py wrote, not a
-            # re-serialization of its content -- "the run document IS
-            # ALREADY A FILE the platform stores" (human's ruling).
-            run_document_ref = results_path
-
-            logger.info(f"[{submission.id}] Interpretation complete: {results_path}")
-            self.store.update_status(
-                submission.id,
-                "complete",
-                interpretation_id=interpretation_id,
-                run_document_ref=run_document_ref,
-            )
-            return True
+            # interpretation_id: THE CLINICAL INTERPRETATION THIS RUN IS
+            # RECORDED AS (2026-09-12, D0 "build the link"). This replaces
+            # the uuid4 the 2026-09-08 ruling had this worker mint here --
+            # that id named nothing in the clinical record, which is the
+            # gap D0 closes. The 2026-09-08 ruling's actual point survives:
+            # the id is genuinely distinct from submission.id (the API's
+            # own response `id`), not a borrowed copy of it.
+            #
+            # run_document_ref stays the PATH to the file main.py wrote;
+            # the clinical record holds the content.
+            with open(results_path, "r", encoding="utf-8") as fh:
+                run_document = json.load(fh)
+            return self._record_run(submission, link, output_dir, results_path, run_document)
 
         except FileNotFoundError as e:
             # NOTE (2026-09-08): with cmd = [sys.executable, main_path,
@@ -394,7 +726,7 @@ class InterpretationWorker:
             # branch above instead, with a less specific message. This
             # branch still covers spawn_tracked/subprocess machinery
             # itself being unavailable.
-            error_msg = f"Bij AI CLI not found: {e}"
+            error_msg = f"{SHORT_NAME} CLI not found: {e}"
             logger.error(f"[{submission.id}] {error_msg}")
             self.store.update_status(
                 submission.id,
@@ -433,6 +765,17 @@ class InterpretationWorker:
         """
         logger.info("Starting interpretation worker loop")
 
+        # Before taking new work: complete any submission a dead worker left
+        # interrupted AFTER its clinical record was already written.
+        try:
+            reconciled = self.reconcile_interrupted_submissions()
+            if reconciled:
+                logger.warning(
+                    f"Startup reconciliation: {reconciled} interrupted submission(s) completed from the clinical record"
+                )
+        except Exception as e:
+            logger.exception(f"Startup reconciliation failed: {e}")
+
         while True:
             try:
                 queued = self.store.get_queued_submissions(limit=batch_size)
@@ -467,7 +810,8 @@ def main():
     )
     store = SubmissionStore(store_path)
 
-    # Initialize DataAccess for exception creation. NOT optional -- see below.
+    # Initialize DataAccess: the clinical record every completed run is written
+    # into (D0), and the exceptions every failure raises. NOT optional -- see below.
     #
     # 2026-09-08 (F4), fail-closed. This block used to log a warning and carry
     # on when CLINICAL_DSN was unset or the connection failed, leaving
@@ -504,7 +848,7 @@ def main():
         from clinical.data_access import DataAccess
 
         data_access = DataAccess(connection)
-        logger.info("DataAccess initialized for exception creation")
+        logger.info("DataAccess initialized for clinical records and exceptions")
     except Exception as e:
         # Second route to the same silent-nothing state: with CLINICAL_DSN set
         # but the database unreachable (or psycopg missing), this handler used

@@ -32,6 +32,7 @@ from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils.profiling import StageProfiler
+from component_identity import SHORT_NAME
 
 from config import CONFIG
 from database.blast_client import BLASTClient
@@ -39,7 +40,7 @@ from database.clinvar_client import ClinVarClient
 from database.dbsnp_client import DbSNPClient
 from models import MODEL_REGISTRY as _BASE_MODEL_REGISTRY
 from models.alphamissense import catalogue_cache_path as alphamissense_catalogue_cache_path
-from pipeline.assembly_validator import validate_assembly
+from pipeline.assembly_validator import mito_only_exemption_reason, validate_assembly
 from pipeline.acmg_rules import (
     mtdna_alphamissense_skip_result,
     mtdna_ensemble_skip_result,
@@ -77,11 +78,20 @@ from pipeline.models.status import build_ai_model_status, rollup_run_status
 from pipeline.prioritization_engine import rank_batch
 from pipeline.protein_translator import ProteinTranslator
 from pipeline.provenance import (
+    NOT_READ_MARKER,
+    TOOL_SOURCE_ALIGNER,
+    TOOL_SOURCE_BCFTOOLS,
+    TOOL_SOURCE_CALLER,
+    TOOL_SOURCE_HTSLIB,
+    TOOL_SOURCE_SAMTOOLS,
+    TOOL_SOURCE_TABIX,
     RetrievalMode,
     RunProvenanceCollector,
     VersionStatus,
     capture_blast_local_tool_versions,
     capture_ensembl_release,
+    capture_tool_version,
+    parse_vcf_tool_stamps,
     finalize_model_checkpoint_provenance,
     get_geper_code_version,
     get_model_checkpoint_identifiers,
@@ -534,6 +544,110 @@ class GeperPipeline:
 
         self._capture_bootstrapped_datasets_provenance()
 
+    def _capture_tool_provenance(self, vcf_header_lines: List[str]) -> None:
+        """
+        Records the versions of the tools that produced this report (the
+        human's ruling, 2026-09-11), each MEASURED where it ran -- see
+        `pipeline/provenance.py`'s tool-version block for why tabix is read
+        from its binary while the VCF's creating software and bcftools are read from
+        the input VCF's own header, and why samtools cannot be recorded here.
+        Never a pinned or default value: anything unreadable is recorded as
+        UNKNOWN with the reason. Never raises.
+        """
+        try:
+            measured: Dict[str, Dict[str, Optional[str]]] = {}
+            uses = [
+                ("AlphaMissense lookups", CONFIG.alphamissense.TABIX_BINARY),
+                ("gnomAD local lookups", CONFIG.gnomad.TABIX_BINARY),
+            ]
+            for _, binary in uses:
+                if binary not in measured:
+                    measured[binary] = capture_tool_version(binary)
+            versions = {b: r["version"] for b, r in measured.items() if r["version"]}
+            if not versions:
+                self.provenance.record(
+                    TOOL_SOURCE_TABIX,
+                    VersionStatus.UNKNOWN,
+                    notes="tabix version could not be read at run time: "
+                    + "; ".join(f"`{b}`: {r['error']}" for b, r in measured.items()),
+                )
+            else:
+                if len(set(versions.values())) == 1 and len(versions) == len(measured):
+                    version = next(iter(versions.values()))
+                else:
+                    version = "; ".join(
+                        f"{use}: {measured[binary]['version'] or 'could not be read (' + str(measured[binary]['error']) + ')'}"
+                        for use, binary in uses
+                    )
+                self.provenance.record(
+                    TOOL_SOURCE_TABIX,
+                    VersionStatus.VERSION_KNOWN,
+                    version=version,
+                    notes="Read from `<binary> --version` at the start of this run, from the binary this run "
+                    "invokes -- not copied from the image's package pin.",
+                )
+        except Exception as exc:  # noqa: BLE001 -- provenance capture must never break a run
+            logger.warning(f"tabix tool-version provenance capture failed: {exc}")
+
+        try:
+            stamps = parse_vcf_tool_stamps(vcf_header_lines)
+            declared = (
+                (TOOL_SOURCE_CALLER, "caller", "creating software (no `##source=` line)"),
+                (TOOL_SOURCE_BCFTOOLS, "bcftools", "bcftools version (no `##bcftools_*Version=` line)"),
+                (TOOL_SOURCE_HTSLIB, "htslib", "htslib version (no `+htslib-` in a `##bcftools_*Version=` line)"),
+            )
+            for source, key, what in declared:
+                if stamps[key]:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.VERSION_KNOWN,
+                        version="; ".join(stamps[key]),
+                        notes="Read from the input VCF's own header, written by that tool when it produced "
+                        "the file. Not measured by this pipeline, which did not run it.",
+                    )
+                else:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.UNKNOWN,
+                        notes=f"The input VCF declares no {what}; what produced this file is not recorded in it.",
+                    )
+            # samtools and the aligner run upstream on the alignment, which
+            # this pipeline never receives; Kim stamps both into its VCF
+            # (`##samtoolsVersion=`, `##alignerVersion=`), or writes
+            # "NOT READ: <why>" when it could not measure one -- a marker
+            # carried through as a marker, never shown as a version.
+            upstream = (
+                (TOOL_SOURCE_SAMTOOLS, "samtools", "samtools version"),
+                (TOOL_SOURCE_ALIGNER, "aligner", "aligner version"),
+            )
+            for source, key, what in upstream:
+                read = [v for v in stamps[key] if not v.startswith(NOT_READ_MARKER)]
+                not_read = [v for v in stamps[key] if v.startswith(NOT_READ_MARKER)]
+                if read:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.VERSION_KNOWN,
+                        version="; ".join(read),
+                        notes="Read from the input VCF's own header, stamped at run time by the pipeline that "
+                        "ran it." + (f" Also declared: {'; '.join(not_read)}" if not_read else ""),
+                    )
+                elif not_read:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.UNKNOWN,
+                        notes=f"The pipeline that produced the input VCF could not read the {what}: "
+                        + "; ".join(not_read),
+                    )
+                else:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.UNKNOWN,
+                        notes=f"Not recorded. It runs upstream on the alignment (BAM), which this pipeline "
+                        f"does not receive, and the input VCF declares no {what}.",
+                    )
+        except Exception as exc:  # noqa: BLE001 -- provenance capture must never break a run
+            logger.warning(f"VCF-declared tool-version provenance capture failed: {exc}")
+
     def _capture_blast_retrieval_provenance(self) -> None:
         """
         Records WHERE this run's BLAST evidence came from -- the network,
@@ -709,7 +823,7 @@ class GeperPipeline:
                 present there are skipped and the run continues from
                 where it left off (issue #8 -- Colab-disconnect resume).
         """
-        logger.info(f"Starting Bij AI pipeline run for '{vcf_path}'.")
+        logger.info(f"Starting {SHORT_NAME} pipeline run for '{vcf_path}'.")
         if self.enable_profiling:
             self.profiler.mark_run_start()
         if max_variants is not None and max_variants <= 0:
@@ -728,6 +842,9 @@ class GeperPipeline:
         except VCFParsingError as exc:
             raise PipelineError(f"Fatal error parsing input VCF: {exc}") from exc
 
+        # Tool versions that produced this report -- needs the parsed header.
+        self._capture_tool_provenance(parser.header_lines)
+
         if not variants:
             raise PipelineError(f"'{vcf_path}' contained no usable variant records.")
 
@@ -735,12 +852,23 @@ class GeperPipeline:
         # Runs before any variant is processed / any reference sequence
         # is fetched, using the header lines the parser already
         # collected while reading up to `variants`.
+        # The record chromosomes are passed for the all-mitochondrial exception
+        # (card #15): the header alone cannot prove a run is ALL mito.
+        record_chroms = [v.chrom for v in variants]
         try:
-            resolved_assembly = validate_assembly(parser.header_lines, self._cli_assembly)
+            resolved_assembly = validate_assembly(parser.header_lines, self._cli_assembly, record_chroms=record_chroms)
         except AssemblyMismatchError as exc:
             raise PipelineError(str(exc)) from exc
         if resolved_assembly and not self._cli_assembly:
             self.sequence_context_gen.assembly = resolved_assembly
+        # Set ONLY when the exception actually fired -- `validate_assembly`
+        # returns None on the no-build path for no other reason now -- so the
+        # report can say the build check was skipped, and why.
+        assembly_note = (
+            mito_only_exemption_reason(parser.header_lines, record_chroms)
+            if resolved_assembly is None and not self._cli_assembly
+            else None
+        )
 
         # --- Ensembl batch prefetch (Phase 2 performance pass) -------------
         # Best-effort: warms the sequence-context generator's region
@@ -819,6 +947,7 @@ class GeperPipeline:
         result_builder = JSONResultBuilder(
             input_vcf_path=vcf_path,
             assembly=self.sequence_context_gen.assembly,
+            assembly_note=assembly_note,
             vcf_samples=parser.samples,
             provenance_collector=self.provenance,
             code_version=self.geper_code_version,
@@ -863,6 +992,7 @@ class GeperPipeline:
                 result_builder = JSONResultBuilder(
                     input_vcf_path=vcf_path,
                     assembly=self.sequence_context_gen.assembly,
+                    assembly_note=assembly_note,
                     vcf_samples=parser.samples,
                     provenance_collector=self.provenance,
                     code_version=self.geper_code_version,
@@ -1003,7 +1133,7 @@ class GeperPipeline:
             short_pdf_path = None
 
         logger.info(
-            f"Bij AI run complete. {len(json_document['variants'])} variant(s) "
+            f"{SHORT_NAME} run complete. {len(json_document['variants'])} variant(s) "
             f"total in output. JSON: '{json_path}', Report: '{report_path}'"
             + (f", PDF: '{pdf_path}'" if pdf_path else " (full PDF generation failed -- see error above)")
             + (
@@ -1238,7 +1368,7 @@ class GeperPipeline:
             return "".join(parts)
 
         header = _render_row({key: label for key, label, _floor in columns})
-        lines = ["", "===== Bij AI Startup Model Validation =====", "", header, "-" * len(header)]
+        lines = ["", f"===== {SHORT_NAME} Startup Model Validation =====", "", header, "-" * len(header)]
         for row in rows:
             lines.append(_render_row(row))
         lines.append("=" * len(header))

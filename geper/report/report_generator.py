@@ -9,6 +9,7 @@ numeric payloads deliberately summarized (not dumped) for readability.
 from typing import Any, Dict, List, Optional
 
 from annotation.thousand_genomes_sas import DIASPORA_DISCLOSURE, SAMPLE_SIZE_DISCLOSURE
+from component_identity import SHORT_NAME
 from report.clinical_report_builder import (
     candidate_interpretation_of,
     _QC_METRIC_LABELS,
@@ -26,6 +27,11 @@ from report.clinical_report_builder import (
     _variant_hgvs_or_locus,
     _variant_reviewer_flags,
     variant_allele_fraction_text,
+    DATA_ATTRIBUTION_HEADING,
+    EVIDENCE_SOURCES_USED_HEADING,
+    NO_EVIDENCE_SOURCES_TEXT,
+    reference_blocks,
+    report_revision_banners,
 )
 from utils.logger import get_logger
 from utils.timezone_utils import format_ist_from_iso
@@ -240,7 +246,16 @@ def _render_consent_line(json_document: Dict[str, Any]) -> Optional[str]:
     timestamp = consent.get("timestamp")
     if timestamp:
         parts.append(f"Recorded: {timestamp}")
-    return "**Data processing consent (DPDP Act 2023):** " + " · ".join(parts)
+    # Statutory citation removed pending counsel (human ruling, 2026-09-10):
+    # an unsourced legal claim inside a generated clinical report reads as
+    # verified because of where it sits. The consent VALUES below are this
+    # module's own recorded data and stay; only the Act name is withheld
+    # until counsel confirms it. Restore verbatim if confirmed -- the exact
+    # removed string is `"**Data processing consent (DPDP Act 2023):** "`.
+    return "**Data processing consent:** " + " · ".join(parts)
+
+
+from report.summary import SCOPE_LINE  # noqa: E402 -- one source of truth for the scope line
 
 
 class ReportGenerator:
@@ -248,16 +263,44 @@ class ReportGenerator:
 
     def generate(self, json_document: Dict[str, Any]) -> str:
         lines: List[str] = []
-        lines.append("# Bij AI Variant Analysis Report")
+        lines.append(f"# {SHORT_NAME} Variant Analysis Report")
         lines.append("")
         lines.append(_render_review_status_banner(json_document))
+        # WHAT THIS REPORT IS -- the same line the PDF renderers carry, from the
+        # same constant, so the three surfaces cannot drift. It sits AFTER the
+        # review-status banner deliberately: that banner is the most
+        # safety-critical line in the document and several governance tests
+        # read it by position, so nothing may be inserted above it.
         lines.append("")
+        lines.append(f"*{SCOPE_LINE}*")
+        lines.append("")
+        # Revision traceability (amended / superseded / re-analysis): above
+        # every finding, below the line-3 review-status banner, which must
+        # stay where governance tests read it. None of the four states ->
+        # nothing printed. See `clinical_report_builder.report_revision_banners`.
+        for banner in report_revision_banners(json_document):
+            lines.append(f"> {banner}")
+            lines.append("")
         # Displayed in IST (report is for Indian hospitals); the
         # stored `generated_at` itself stays UTC (see
         # report/json_builder.py) -- only this human-facing line
         # converts it. See utils/timezone_utils.py.
         lines.append(f"**Generated:** {format_ist_from_iso(json_document.get('generated_at'))}")
         lines.append(f"**Input VCF:** `{json_document.get('input_vcf')}`")
+        # The build every coordinate in this report was resolved
+        # against. The full PDF has always printed it (summary.py's
+        # "Genome Reference Build" row and "Reference build:" line) and
+        # this surface did not, so the same report disclosed its build
+        # in one format and withheld it in another. Same wording and
+        # same "Not specified" fallback as the PDF, so the two cannot
+        # drift into saying different things.
+        # `assembly_note` fills the slot only when a run legitimately has no
+        # build (card #15, all-mitochondrial) -- it says the check was skipped
+        # and why, where "Not specified" would say nothing.
+        lines.append(
+            "**Genome reference build:** "
+            f"{json_document.get('assembly') or json_document.get('assembly_note') or 'Not specified'}"
+        )
         lines.append(f"**Variants analyzed:** {json_document.get('variant_count')}")
         consent_line = _render_consent_line(json_document)
         if consent_line:
@@ -381,7 +424,7 @@ class ReportGenerator:
             "the exact data-source versions and code version below are what to match.*"
         )
         lines.append("")
-        lines.append(f"- **Bij AI code version:** `{json_document.get('code_version') or 'unknown'}`")
+        lines.append(f"- **{SHORT_NAME} code version:** `{json_document.get('code_version') or 'unknown'}`")
         lines.append("")
 
         checkpoints = json_document.get("model_checkpoints") or {}
@@ -657,7 +700,7 @@ class ReportGenerator:
             # unassessable variant class.
             lines.append(f"**Status:** Out of scope ({out_of_scope.get('scope', 'unspecified')})")
             lines.append("")
-            lines.append(out_of_scope.get("reason") or "This variant is out of scope for this Bij AI build.")
+            lines.append(out_of_scope.get("reason") or f"This variant is out of scope for this {SHORT_NAME} build.")
             lines.append("")
             lines.append(
                 "*No ACMG/AMP criteria were evaluated for this variant. This is not a Variant of "
@@ -1043,23 +1086,54 @@ class ReportGenerator:
         lines.append("### 10. Population Evidence")
         lines.append("")
         g = pop["gnomad"]
-        if g["queried"]:
+        if g.get("skip_reason"):
+            lines.append(f"- **gnomAD:** {g['skip_reason']}")
+        elif g.get("error") is not None:
+            # A genuine crash, not "gnomAD was never asked" -- see this
+            # section's own producer, `_population_evidence`, for why this
+            # branch exists (2026-09-11 fix: the field used to be dropped
+            # entirely, and both cases rendered as the generic "lookup
+            # unavailable" line below).
+            lines.append(
+                f"- **gnomAD:** _lookup failed (external service issue: {g['error']}) -- not evidence "
+                "of an absent variant, see Annotation Detail below._"
+            )
+        elif g["queried"]:
             lines.append(
                 f"- **gnomAD:** {'found, AF=' + str(g['global_af']) if g['found'] else 'variant not found (absent from gnomAD)'}"
             )
-        elif g.get("skip_reason"):
-            lines.append(f"- **gnomAD:** {g['skip_reason']}")
         else:
             lines.append("- **gnomAD:** lookup unavailable for this variant.")
         d = pop["dbsnp"]
-        lines.append(f"- **dbSNP:** {'catalogued as ' + d['rsid'] if d['found'] else 'not found'}")
+        if d.get("skip_reason"):
+            lines.append(f"- **dbSNP:** {d['skip_reason']}")
+        elif d.get("error") is not None:
+            # Same distinction and same fix as gnomAD above.
+            lines.append(
+                f"- **dbSNP:** _lookup failed (external service issue: {d['error']}) -- not evidence "
+                "of no dbSNP record, see Annotation Detail below._"
+            )
+        elif d["queried"]:
+            lines.append(f"- **dbSNP:** {'catalogued as ' + d['rsid'] if d['found'] else 'not found'}")
+        else:
+            lines.append("- **dbSNP:** lookup unavailable for this variant.")
         lines.append("")
 
         ipf = clinical_report.get("indian_population_frequency") or {}
         lines.append("### 11. Indian Population Frequency")
         lines.append("")
         gnomad_sas_af = ipf.get("gnomad_af_sas")
-        if ipf.get("gnomad_sas_queried"):
+        if ipf.get("gnomad_sas_error") is not None:
+            # Same distinction and same fix as Section 10's gnomAD line
+            # above -- this reads the identical gnomAD stage result for
+            # its South Asian subpopulation figure and had the same
+            # collapse (2026-09-11 fix).
+            lines.append(
+                f"- **gnomAD (South Asian, SAS):** _lookup failed (external service issue: "
+                f"{ipf['gnomad_sas_error']}) -- not evidence of no South Asian subpopulation data, "
+                "see Annotation Detail below._"
+            )
+        elif ipf.get("gnomad_sas_queried"):
             lines.append(
                 f"- **gnomAD (South Asian, SAS):** {'AF=' + str(gnomad_sas_af) if gnomad_sas_af is not None else 'no South Asian subpopulation data for this variant'}"
             )
@@ -1067,9 +1141,16 @@ class ReportGenerator:
             lines.append("- **gnomAD (South Asian, SAS):** lookup unavailable for this variant.")
         if ipf.get("sas_shown"):
             lines.extend(_render_1000_genomes_sas_markdown(ipf))
-        threshold_pct = f"{ipf.get('common_af_threshold', 0.01):.0%}"
+        # Ruling #18 (2026-09-11): the number only when recorded; `:g` so a
+        # recorded 0.5% is not rounded to a "0%"/"1%" the pipeline never used.
+        recorded_threshold = ipf.get("common_af_threshold")
+        threshold_text = (
+            f"the {recorded_threshold * 100:g}% threshold"
+            if recorded_threshold is not None
+            else "the pipeline's configured threshold"
+        )
         if ipf.get("common_in_indian_population"):
-            lines.append(f"- **⚠ Common in Indian populations** (at or above the {threshold_pct} threshold).")
+            lines.append(f"- **⚠ Common in Indian populations** (at or above {threshold_text}).")
         lines.append("")
 
         clin = clinical_report["clinical_evidence"]
@@ -1114,8 +1195,14 @@ class ReportGenerator:
             lines.append(
                 f"- **BLAST:** _lookup failed ({blast_error}) -- not evidence of no homology, see Annotation Detail below._"
             )
+        elif seq["blast"].get("skipped"):
+            lines.append(
+                f"- **BLAST:** _not run for this variant ({seq['blast'].get('reason') or 'no reason recorded'}) -- not evidence of no homology._"
+            )
+        elif seq["blast"].get("hit_count") is None:
+            lines.append("- **BLAST:** _hit count not recorded -- not evidence of no homology._")
         else:
-            lines.append(f"- **BLAST:** {seq['blast'].get('hit_count', 0)} homology hit(s)")
+            lines.append(f"- **BLAST:** {seq['blast']['hit_count']} homology hit(s)")
         lines.append(f"- *{seq.get('ensembl_note')}*")
         lines.append("")
 
@@ -1135,14 +1222,23 @@ class ReportGenerator:
             lines.append(f"- {lim}")
         lines.append("")
 
-        lines.append("### 16. References")
+        # Ruling (A), 2026-09-11: two blocks, two different claims -- what
+        # this run used (gated), then the fixed licence notices. Was a single
+        # "### 16. References" list mixing both.
+        evidence_refs, attribution = reference_blocks(clinical_report)
+        lines.append(f"### 16. {EVIDENCE_SOURCES_USED_HEADING}")
         lines.append("")
-        refs = clinical_report.get("references") or []
-        if refs:
-            for r in refs:
+        if evidence_refs:
+            for r in evidence_refs:
                 lines.append(f"- {r}")
         else:
-            lines.append("*No evidence sources contributed to this variant's interpretation.*")
+            lines.append(f"*{NO_EVIDENCE_SOURCES_TEXT}*")
+        lines.append("")
+
+        lines.append(f"### {DATA_ATTRIBUTION_HEADING}")
+        lines.append("")
+        for r in attribution:
+            lines.append(f"- {r}")
         lines.append("")
 
         lines.append("### 17. Evidence Sources")
@@ -1354,6 +1450,10 @@ class ReportGenerator:
                 f"_Not catalogued in dbSNP under this exact allele ({dbsnp.get('record_count')} other "
                 "rsID(s) exist at this genomic position, but do not match this allele)._"
             )
+            lines.append("")
+            return lines
+        if dbsnp and dbsnp.get("error") is not None:
+            lines.append(f"- **Status:** query failed ({dbsnp['error']})")
             lines.append("")
             return lines
         if not dbsnp or not dbsnp.get("found"):
@@ -1635,22 +1735,40 @@ class ReportGenerator:
         labeled summary lines. `ensemble_result` is always the clean,
         already-sanitized dict `pipeline.models.ensemble.
         EnsembleManager.evaluate` returns (see that module) -- never a
-        raw exception or traceback, so nothing here needs its own
-        try/except: there is no technical error text this function
-        could accidentally leak into a clinical report.
+        raw exception or traceback reaching this function directly.
 
         The section is hidden entirely (returns an empty list, adding
-        no heading at all) whenever no ensemble evidence exists for
-        this variant -- either because `ensemble_result` itself is
-        empty/missing, or because it exists but no model actually ran
-        (`models_used` is empty, e.g. both Enformer and Borzoi were
-        disabled/unavailable). This mirrors exactly what
-        `report/json_builder.py::build_variant_result` does: the
+        no heading at all) only when no ensemble evidence exists AND no
+        model genuinely crashed -- `ensemble_result` itself empty/
+        missing, or `models_used` empty because both Enformer and
+        Borzoi were cleanly disabled/unavailable. This mirrors exactly
+        what `report/json_builder.py::build_variant_result` does: the
         `ai_splicing_ensemble` key is only present in the JSON output
         under that same condition, so JSON and Markdown agree on when
         this evidence "exists."
+
+        WHEN `models_used` IS EMPTY BECAUSE A MODEL GENUINELY CRASHED
+        (2026-09-11 fix, sweep finding 3): `ensemble_result["error"]` is
+        set by `EnsembleManager.evaluate()` in that case specifically
+        (never set for a clean disable), and this function renders a
+        "_Failed: ..._" line instead of silently disappearing -- before
+        this fix, a genuine double crash produced a report with NO
+        SECTION AT ALL, not even a "Failed" line, which is a stronger
+        fabricated absence than a wrong statement would have been: a
+        reader has nothing here to be suspicious of. Matches the exact
+        wording `_render_mmsplice`/`_render_rna`/`_render_protein`/
+        `_render_alphamissense` already use for the identical situation
+        (a model that ran and crashed, not one that never ran).
         """
         if not ensemble_result or not ensemble_result.get("models_used"):
+            if ensemble_result and ensemble_result.get("error") is not None:
+                return [
+                    "### AI Splicing Analysis (Enformer + Borzoi Ensemble)",
+                    "",
+                    f"_Failed: {ensemble_result['error']} -- not evidence Enformer/Borzoi found no "
+                    "splicing effect, see the AI Model Status table above._",
+                    "",
+                ]
             return []
 
         lines = ["### AI Splicing Analysis (Enformer + Borzoi Ensemble)", ""]

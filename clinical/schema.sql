@@ -44,6 +44,37 @@ CREATE TABLE users (
     org_id                  UUID        NOT NULL REFERENCES organisations (org_id),
 
     email                   TEXT        NOT NULL,
+
+    -- ─── signing identity (R10, human ruling 2026-09-13) ────────────────────
+    --
+    -- A clinical report shows the signing clinician's NAME, REGISTRATION
+    -- NUMBER and HOSPITAL. Before these three columns the user record held an
+    -- email address and nothing else, so all three were typed in by hand at
+    -- sign-off time (geper/review/signoff.py::approve's --clinician-name /
+    -- --reg-number / --hospital) with nothing tying the printed identity to
+    -- the account that signed. A report could therefore show any identity at
+    -- all, including a colleague's, and the record could not contradict it.
+    --
+    -- NULLABLE, DELIBERATELY. Not every user signs reports: system accounts
+    -- (is_system_account) never do, and an Auditor or Administrator has no
+    -- registration number to record. Making these NOT NULL would force a
+    -- fabricated value onto every such account, which is the opposite of the
+    -- guarantee. The gate is at the point of USE instead --
+    -- data_access.py::get_signing_identity refuses an incomplete identity
+    -- rather than the schema refusing an incomplete row.
+    full_name               TEXT,
+    -- NO FORMAT CONSTRAINT, and this is a decision rather than an omission.
+    -- Indian registration numbers are issued per state medical council with
+    -- no single national format (NMC/SMC numbers vary in length, prefix and
+    -- punctuation), so any regex here would refuse valid registrations --
+    -- refusing a real clinician's real number is a worse failure than storing
+    -- one that is merely well-formed-looking. Non-empty and trimmed is
+    -- enforced by data_access.py::set_clinician_identity; correctness against
+    -- the issuing council is a verification step this platform does not
+    -- perform and does not claim to.
+    registration_number     TEXT,
+    hospital                TEXT,
+
     -- bcrypt. The column holds the full modular-crypt string (algorithm,
     -- cost, salt, digest), so the cost factor can be raised later and old
     -- hashes still verify.
@@ -62,6 +93,26 @@ CREATE TABLE users (
     -- unimplementable. NULL until an administrator enrols the user.
     totp_secret             TEXT,
     totp_enrolled_at        TIMESTAMPTZ,
+
+    -- w164 (migration 0006): THE REPLAY GUARD, and it is the only place
+    -- one-time use of a TOTP code can live. A code is valid for its whole
+    -- 30-second step -- three steps, with the one-step skew allowance
+    -- data_access.py::TOTP_WINDOW_STEPS carries -- so refusing a code that has
+    -- already been accepted means REMEMBERING which step was spent. RFC 6238
+    -- 5.2: "the verifier MUST NOT accept the second attempt of the OTP
+    -- generated for the same time-step".
+    --
+    -- THE STEP NUMBER, NOT THE CODE. Storing the last accepted code would
+    -- store a credential and would be weaker besides: it refuses only the code
+    -- it saw, so the PREVIOUS step's code -- still inside the window and still
+    -- arithmetically valid -- would be admitted after it. A step counter is
+    -- monotonic, so everything at or before the last accepted step is refused
+    -- at once. BIGINT because a step is unix_seconds/30, which leaves INTEGER
+    -- in 2038.
+    --
+    -- NULL means "no code has been accepted yet". enrol_totp sets it back to
+    -- NULL, so a new authenticator does not inherit the old one's spent steps.
+    totp_last_used_step     BIGINT,
 
     -- Reset to 0 only by a successful login BY THIS USER (data_access.py::
     -- login). Per-user by construction, so one account's successful login
@@ -100,6 +151,20 @@ CREATE TABLE users (
 );
 
 CREATE INDEX users_org_disabled ON users (org_id, disabled);
+
+-- One registration number, one clinician, within an organisation (R10). Two
+-- accounts claiming the same registration number would make the identity a
+-- report prints ambiguous about WHICH account signed, which is the whole
+-- property these columns exist to establish. PARTIAL: NULL is the ordinary
+-- state for every account that does not sign (see the column comments), and a
+-- plain UNIQUE would be satisfied by unlimited NULLs anyway -- the WHERE makes
+-- that explicit rather than incidental. Scoped to org_id, not global: the
+-- platform is multi-tenant and one clinician legitimately holding accounts in
+-- two organisations must not be blocked by the other tenant's row, which would
+-- also leak the existence of that row across the isolation boundary.
+CREATE UNIQUE INDEX users_org_registration_number_unique
+    ON users (org_id, registration_number)
+    WHERE registration_number IS NOT NULL;
 
 
 -- ─── totp_backup_codes ──────────────────────────────────────────────────────
@@ -277,6 +342,151 @@ CREATE TABLE external_identifiers (
 
 CREATE UNIQUE INDEX external_identifiers_unique
     ON external_identifiers (org_id, id_type, id_value);
+
+
+-- ─── patient portal identity (w130) ─────────────────────────────────────────
+--
+-- A PATIENT IS A PRINCIPAL, AND IT IS NOT A `users` ROW. Not because of roles
+-- -- a roleless `users` row is legal and is what create_user produces -- but
+-- because of what a `users` row is STRUCTURALLY ELIGIBLE for. Counted at
+-- ca183d3, BEFORE this table existed: `REFERENCES users` occurred 22 times in
+-- this file (patient_logins_enroller_fk below is the twenty-third, and it is
+-- correctly a staff reference -- the enroller IS staff). Nineteen of the
+-- twenty-two are clinical-record actor columns, including reports.created_by and
+-- reports.approver_id. A patient placed in `users` is a database-legal report
+-- approver, and the only thing refusing it would be a Python check -- the
+-- exact shape this schema records as a defect elsewhere (see the note on
+-- users_org_user_unique above, which spends seven lines explaining that a
+-- structural guarantee must not be downgraded to a remembered one).
+--
+-- A separate principal table makes "a patient cannot approve a report"
+-- INEXPRESSIBLE rather than merely unwritten. That is the guarantee shape
+-- this schema already uses for tenancy, applied to a second question.
+--
+-- NO ROLE IS ADDED. ROLES, role_assignments_role_known and _require_role are
+-- untouched by these two tables; a patient holds no role assignment and
+-- cannot, because role_assignments.user_id is a composite FK to `users`.
+
+CREATE TABLE patient_logins (
+    patient_login_id        UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    patient_id              UUID        NOT NULL,
+    org_id                  UUID        NOT NULL,
+
+    email                   TEXT        NOT NULL,
+    -- bcrypt, the same modular-crypt string users.password_hash holds, written
+    -- by the same hasher. No second credential format was introduced.
+    password_hash           TEXT        NOT NULL,
+    password_changed_at     TIMESTAMPTZ NOT NULL,
+    password_reset_required BOOLEAN     NOT NULL DEFAULT FALSE,
+
+    -- Same lockout policy as users: the counter and the ceiling are the same
+    -- columns under the same names, read by the same constants
+    -- (MAX_FAILED_LOGIN_ATTEMPTS, LOCKOUT_MINUTES).
+    failed_login_attempts   INTEGER     NOT NULL DEFAULT 0,
+    locked_until            TIMESTAMPTZ,
+
+    disabled                BOOLEAN     NOT NULL DEFAULT FALSE,
+
+    -- WHICH STAFF PRINCIPAL ISSUED THIS CREDENTIAL. Enrolment is a staff act
+    -- (no self-registration), so the record of who performed it belongs on the
+    -- row. Composite FK, so the enroller cannot be from another organisation.
+    enrolled_by             UUID        NOT NULL,
+
+    created_at              TIMESTAMPTZ NOT NULL,
+    updated_at              TIMESTAMPTZ NOT NULL,
+
+    -- The link to the clinical record, and the whole point of the table. The
+    -- composite FK makes a credential for a patient in ANOTHER organisation
+    -- inexpressible, exactly as role_assignments_user_fk does for staff.
+    CONSTRAINT patient_logins_patient_fk
+        FOREIGN KEY (patient_id, org_id) REFERENCES patients (patient_id, org_id),
+    CONSTRAINT patient_logins_enroller_fk
+        FOREIGN KEY (enrolled_by, org_id) REFERENCES users (user_id, org_id),
+
+    CONSTRAINT patient_logins_org_email_unique UNIQUE (org_id, email),
+
+    -- EXACTLY ONE PATIENT PER LOGIN, AND ONE LOGIN PER PATIENT. The second
+    -- half is a DECISION, not a default: proxy and guardian access (a child, an
+    -- adult without capacity) would relax it, and the schema already knows
+    -- minors exist (retention_days_minor). Relaxing it is a ruling, and until
+    -- one is made this constraint is what stops a second credential appearing
+    -- for a patient without anybody deciding that it should.
+    CONSTRAINT patient_logins_one_per_patient UNIQUE (org_id, patient_id),
+
+    -- DO NOT REMOVE THIS AS REDUNDANT -- the same reasoning as
+    -- users_org_user_unique above, and for the same reason. patient_sessions'
+    -- composite FK references (patient_login_id, org_id) and Postgres will only
+    -- accept a composite FOREIGN KEY against a matching UNIQUE constraint.
+    -- Drop this line and that foreign key fails to create, taking the
+    -- structural org isolation of every patient session with it.
+    CONSTRAINT patient_logins_org_login_unique UNIQUE (org_id, patient_login_id)
+);
+
+CREATE INDEX patient_logins_org_patient ON patient_logins (org_id, patient_id);
+
+
+-- Mirrors `sessions` column for column and policy for policy: the same 24-hour
+-- absolute cap that activity never extends, the same 30-minute idle window
+-- refreshed per validated request with the same inclusive boundary, the same
+-- server-side termination, the same ip_address/user_agent.
+--
+-- A SEPARATE TABLE RATHER THAN A NULLABLE COLUMN ON `sessions`, deliberately.
+-- The rejected alternative was patient_login_id nullable on sessions with an
+-- XOR check: it needs ALTER TABLE ... DROP NOT NULL on a live table whose
+-- composite FK is load-bearing, it makes Session.user_id optional in a layer
+-- that writes session.user_id as created_by/recorded_by in roughly thirty
+-- statements, and one table invites one session_valid() returning a union of
+-- two principal kinds -- which is the dependency-widening that this whole
+-- design exists to refuse.
+--
+-- THE TWO SESSION ID SPACES ARE DIFFERENT TABLES. A staff session id presented
+-- to the portal is simply not found, and a patient session id presented to the
+-- staff dependency is simply not found. That separation is structural, not
+-- checked.
+
+CREATE TABLE patient_sessions (
+    session_id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    patient_login_id     UUID        NOT NULL,
+    org_id               UUID        NOT NULL,
+
+    -- DENORMALISED ON PURPOSE, AND IT IS THE SECOND AXIS OF ISOLATION.
+    -- patient_id is derivable by joining patient_logins, but it is carried
+    -- here for the same reason sessions carries org_id: every patient-facing
+    -- statement binds it FROM THE SESSION and never from a caller argument,
+    -- and a value that has to be fetched before it can be bound is a value
+    -- somebody will eventually pass in instead. The composite FK below plus
+    -- patient_logins_one_per_patient keep it from disagreeing with the login.
+    patient_id           UUID        NOT NULL,
+
+    created_at           TIMESTAMPTZ NOT NULL,
+    expires_at           TIMESTAMPTZ NOT NULL,
+    last_activity_at     TIMESTAMPTZ NOT NULL,
+    idle_timeout_minutes INTEGER     NOT NULL DEFAULT 30,
+
+    terminated_at        TIMESTAMPTZ,
+    terminated_by        UUID,
+
+    ip_address           INET,
+    user_agent           TEXT,
+
+    CONSTRAINT patient_sessions_termination_complete CHECK (
+        (terminated_at IS NULL) = (terminated_by IS NULL)
+    ),
+    CONSTRAINT patient_sessions_login_fk
+        FOREIGN KEY (patient_login_id, org_id)
+        REFERENCES patient_logins (patient_login_id, org_id),
+    -- The carried patient_id is held to the patients table by the same
+    -- composite FK every other patient reference in this schema uses, so a
+    -- session cannot carry a patient from another organisation even if the
+    -- application tried to write one.
+    CONSTRAINT patient_sessions_patient_fk
+        FOREIGN KEY (patient_id, org_id) REFERENCES patients (patient_id, org_id)
+);
+
+CREATE INDEX patient_sessions_live
+    ON patient_sessions (org_id, patient_login_id)
+    WHERE terminated_at IS NULL;
+
 
 
 CREATE TABLE consents (
@@ -684,6 +894,17 @@ CREATE INDEX idx_reports_org_state ON reports (org_id, state);
 --      together on report surfaces.
 --   4. Report claims -- which claims reach the released report, and how they
 --      are attributed there.
+--      DECIDED, 2026-09-13 (human ruling, R9 defect (a)): A REPORT CARRIES
+--      ITS OWN CLAIMS AND ONLY ITS OWN. An amended report does NOT carry the
+--      cumulative set including the original's. Two reasons, both about the
+--      reader: showing the original's claims presents reasoning about a
+--      document the reader is not holding, and a cumulative set makes it
+--      impossible to tell which claim applied to which version. The
+--      attribution mechanism is report_id on this table (see that column);
+--      the retrieval is get_reviewer_claims(session, report_id). The
+--      original is still never withdrawn -- it keeps its own claims, on its
+--      own report, and both reports stay queryable.
+--      Points 1, 2, 3, 5 and 6 remain open and are untouched by this.
 --   5. D1 applicability -- whether the D1 criterion applies to a re-derived
 --      classification on the same terms as to a ratified one.
 --   6. Evidence capture -- what evidence_json must hold per claim_type;
@@ -695,6 +916,68 @@ CREATE TABLE reviewer_claims (
     org_id              UUID        NOT NULL,
     id                  UUID        PRIMARY KEY NOT NULL DEFAULT gen_random_uuid(),
     interpretation_id   UUID        NOT NULL,
+
+    -- THE REPORT THIS CLAIM BELONGS TO (R9 defects (a) and (b), human ruling
+    -- 2026-09-13). Added because scoping claims to the INTERPRETATION alone
+    -- made two different reports on one interpretation indistinguishable.
+    --
+    -- An amendment (see the amendments table below) is a SECOND reports row
+    -- on the SAME interpretation. With claims scoped only to the
+    -- interpretation, two things followed, both wrong:
+    --
+    --   (b) THE FALSE TAMPER ALARM. _compute_report_content_hash() hashed
+    --       every claim on the interpretation, so the FIRST claim recorded
+    --       for an amendment changed the recomputed hash of the ORIGINAL
+    --       report, and verify_report_integrity() reported the original as
+    --       tampered. Nothing had been tampered with. A false alarm on an
+    --       integrity check teaches people to ignore integrity checks.
+    --
+    --   (a) THE AMENDED REPORT WITH THE ORIGINAL'S BODY. An amendment could
+    --       not carry reviewer claims of its own, because every claim on the
+    --       interpretation was equally every report's claim. There was no
+    --       query that could answer "this report's claims" at all.
+    --
+    -- THE ALTERNATIVE THAT WAS REJECTED, recorded because it is cheaper and
+    -- will be proposed again: bound the hash by reports.approved_at instead,
+    -- hashing only claims recorded at or before approval. No schema change,
+    -- and it silences the false alarm. It was rejected because it trades a
+    -- false alarm for a real blind spot: a claim INJECTED after approval is
+    -- precisely what an integrity check exists to catch, and a timestamp
+    -- cutoff cannot tell that injection apart from an amendment's first
+    -- legitimate claim. The check was never wrong to care that a claim
+    -- appeared; it was wrong about which claims belong to which report.
+    -- This column is what makes the data model match what is being verified.
+    --
+    -- NOT NULL, no "unassigned" state: a claim that names no report is the
+    -- ambiguity this column exists to remove, and admitting one would put
+    -- the old bug back one row at a time. A claim is therefore recorded
+    -- AGAINST an existing report -- create_report() first, then the claims,
+    -- then submit_for_review().
+    --
+    -- The claim's report must be a report OF this claim's interpretation.
+    -- That is not a CHECK here (a row constraint cannot read the reports
+    -- row) and is enforced by _validate_claim_inputs(), alongside variant
+    -- membership and supersession uniqueness, which are unenforceable here
+    -- for the same reason.
+    --
+    -- BACKFILL, for any database predating this column: every existing claim
+    -- belongs to its interpretation's ORIGINAL report -- the earliest report
+    -- on that interpretation that is not itself an amendment, the same
+    -- derivation find_interpretation_by_submission_key() uses. Amendments
+    -- could not have had claims of their own before this column existed, so
+    -- there is no case this misattributes.
+    --
+    --   ALTER TABLE reviewer_claims ADD COLUMN report_id UUID;
+    --   UPDATE reviewer_claims c SET report_id = (
+    --       SELECT r.id FROM reports r
+    --        WHERE r.org_id = c.org_id AND r.interpretation_id = c.interpretation_id
+    --          AND NOT EXISTS (SELECT 1 FROM amendments a
+    --                           WHERE a.org_id = r.org_id AND a.amendment_report_id = r.id)
+    --        ORDER BY r.created_at, r.id LIMIT 1);
+    --   ALTER TABLE reviewer_claims ALTER COLUMN report_id SET NOT NULL;
+    --   ALTER TABLE reviewer_claims ADD CONSTRAINT fk_claim_report
+    --       FOREIGN KEY (org_id, report_id) REFERENCES reports (org_id, id);
+    report_id           UUID        NOT NULL,
 
     -- The variant this claim is about, identified within
     -- interpretations.run_document. NOT a foreign key, and cannot be one:
@@ -718,23 +1001,52 @@ CREATE TABLE reviewer_claims (
     -- (chrom-pos-ref-alt as produced by parse_variant_key). Reviewer claims
     -- reference them by that key rather than a foreign key. The system does
     -- not maintain a variant table; this column holds the key the engine
-    -- assigned. NULLABLE: 'accept' is interpretation-scoped and names no
-    -- variant; the other three claim types are variant-scoped.
+    -- assigned. NULLABLE: 'accept' and 'sole_signatory' are
+    -- interpretation-scoped and name no variant; the other three claim types
+    -- are variant-scoped.
     variant_key         TEXT,
 
     -- Spec 13.2's four reviewer actions, closed. 'disagree' does not remove
     -- the classification it disagrees with; 'variant_added' names a variant
     -- the pipeline did not surface; 'variant_not_relevant' scopes a variant
     -- out against the indication without deleting it.
+    --
+    -- 'sole_signatory' IS A FIFTH VALUE AND NOT ONE OF SPEC 13.2's FOUR
+    -- (human ruling, 2026-09-13, w117). The product signs off with ONE
+    -- person today. That person's concurrence had nowhere truthful to go:
+    -- 'accept' is documented above and in _record_accept as an INDEPENDENT
+    -- CONCURRENCE BY A SECOND CLINICIAN, so a same-person accept would write
+    -- a row the schema itself defines as false -- the record would assert
+    -- two-clinician review where one person acted.
+    --
+    -- A DISTINCT KIND MAKES THE RECORD TRUE AT THE LEVEL THINGS QUERY IT.
+    -- Two consequences the ruling named, neither obtainable from prose in a
+    -- reason field:
+    --   - a later audit asking WHICH REPORTS HAD INDEPENDENT CONCURRENCE gets
+    --     a correct answer by claim_type alone, without reading free text;
+    --   - a site that adopts two-person sign-off can see WHICH HISTORICAL
+    --     REPORTS WERE SINGLE-SIGNED, and decide what to do about them.
+    --
+    -- It is interpretation-scoped like 'accept' (variant_key and
+    -- classification both NULL) and it satisfies submit_for_review's
+    -- at-least-one-claim precondition like any other claim: review happened,
+    -- and the row says exactly how much of it happened.
+    --
+    -- WHAT THIS VALUE DOES NOT DO: it does not change enforcement anywhere.
+    -- The two-person path is untouched -- _approve_report still requires the
+    -- Approver role on both the session and the recorded approver, and
+    -- nothing here makes a second signature optional that was not already
+    -- optional. Adopting two-person sign-off is a separate, carded decision.
     claim_type          TEXT        NOT NULL
         CHECK (claim_type IN ('accept', 'disagree', 'variant_added',
-                              'variant_not_relevant')),
+                              'variant_not_relevant', 'sole_signatory')),
 
     -- The classification the REVIEWER asserts: the replacement on a
     -- 'disagree', the proposed call on a 'variant_added'. NULL on 'accept'
-    -- (which asserts no new classification, only concurrence with the one
-    -- already there) and on 'variant_not_relevant' (which scopes a variant
-    -- out against the indication rather than reclassifying it).
+    -- and 'sole_signatory' (both of which assert no new classification, only
+    -- concurrence with the one already there) and on 'variant_not_relevant'
+    -- (which scopes a variant out against the indication rather than
+    -- reclassifying it).
     --
     -- Deliberately unconstrained for now. A CHECK against the ACMG five-tier
     -- vocabulary is the obvious next move and is NOT made here: the
@@ -792,9 +1104,10 @@ CREATE TABLE reviewer_claims (
     -- constraint cannot see the rest of the table.
     --
     -- A superseded claim is still a claim that was made, and the read path
-    -- must not quietly drop it. ISO 15189 7.4.1.8's rule for amended reports
-    -- -- the original is never modified and never withdrawn from the record
-    -- -- is the same rule one level down.
+    -- must not quietly drop it. GEPER's own rule for amended reports (spec
+    -- 15.2, implementing ISO 15189 7.4.1.8 b)/d)) -- the original is never
+    -- modified and never withdrawn from the record -- is the same rule one
+    -- level down.
     supersedes          UUID,
 
     -- Human ruling, tombstone-cascade (2026-09-09, following D2): a
@@ -812,6 +1125,8 @@ CREATE TABLE reviewer_claims (
 
     CONSTRAINT fk_claim_interp
         FOREIGN KEY (org_id, interpretation_id) REFERENCES interpretations (org_id, id),
+    CONSTRAINT fk_claim_report
+        FOREIGN KEY (org_id, report_id) REFERENCES reports (org_id, id),
     CONSTRAINT fk_claim_actor
         FOREIGN KEY (org_id, actor_id) REFERENCES users (org_id, user_id),
     CONSTRAINT fk_claim_supersedes
@@ -827,6 +1142,13 @@ CREATE TABLE reviewer_claims (
 -- The review screen reads every claim on one interpretation, oldest first.
 CREATE INDEX idx_claims_org_interp
     ON reviewer_claims (org_id, interpretation_id, "timestamp");
+
+-- "This report's claims", oldest first: the read behind both
+-- _compute_report_content_hash() and get_reviewer_claims(). Ordered by
+-- ("timestamp", id) at the query, so the index leads with "timestamp";
+-- id can never tie, which is what makes that order total.
+CREATE INDEX idx_claims_org_report
+    ON reviewer_claims (org_id, report_id, "timestamp");
 
 
 -- ─── Phase 6: release_events ───────────────────────────────────────────
@@ -1098,6 +1420,182 @@ CREATE INDEX idx_receipt_org_notification
     ON notification_read_receipts (org_id, notification_id);
 
 
+-- ─── w122: Report retraction (model 3, human-approved 2026-09-13) ──────────
+--
+-- A retraction says "DO NOT ACT ON THIS DOCUMENT". It is NOT a state, NOT a
+-- sixth value of reports.state, and NOT a column on reports. The approved
+-- `reports` row stays BYTE-IDENTICAL: the report WAS approved on the day it
+-- was approved, and a row rewritten to say otherwise would destroy THE
+-- REPORT'S OWN record of that approval. Not the last trace of it -- w124
+-- checked before letting "the only record" stand: _approve_report is
+-- @auditable, so an audit_log 'report_approved' entry keeps the actor and the
+-- moment. But no reader of this platform asks audit_log whether a report is
+-- approved, and reports_approval_complete and
+-- reports_released_states_need_approval force the three approval facts to
+-- travel with the state, so "un-approving" cannot be done truthfully.
+--
+-- THE TRIGGER IS NOT BEING WORKED AROUND, IT IS BEING SERVED. The walk-back
+-- clause in enforce_content_immutability() below exists because an approved
+-- report could be "effectively WITHDRAWN FROM THE RECORD without touching a
+-- single content column" -- the harm it names is INVISIBILITY, not
+-- withdrawal. A row carrying an actor, a timestamp, a reason and a composite
+-- FK to the report is the maximally visible withdrawal. No clause of that
+-- trigger changes, no CHECK on reports.state changes, and the
+-- GRANT UPDATE (state, approver_id, approved_at, content_hash) ON reports
+-- line at the bottom of this file is untouched.
+--
+-- Append-only, exactly as reviewer_claims/release_events/amendments are, and
+-- for the same reason: a retraction quietly edited or deleted after the fact
+-- would leave no trace. There is no UPDATE grant for clinical_app and there
+-- should never be one -- see the "WITH NO EXCEPTION" note in the grant block
+-- below. E5 (human ruling): retraction is NOT reversible in this wave and no
+-- reversal is built; if it is ever ruled in, its shape is already settled by
+-- the rest of this schema -- a second row superseding the first, never an
+-- edit -- and adding a self-FK to an append-only table is additive.
+
+CREATE TABLE report_retractions (
+    org_id              UUID        NOT NULL,
+    id                  UUID        PRIMARY KEY NOT NULL DEFAULT gen_random_uuid(),
+
+    -- The report being retracted. Composite FK: a retraction of another
+    -- organisation's report is structurally impossible, not merely unlikely
+    -- (the same reasoning as reports.approver_id).
+    report_id           UUID        NOT NULL,
+
+    retracted_at        TIMESTAMPTZ NOT NULL,
+    retracted_by        UUID        NOT NULL,
+
+    -- Reason (NOT NULL), following amendments.reason and
+    -- reviewer_claims.reason: the reason a document was withdrawn must be
+    -- retrievable, and a retraction nobody can account for is the invisible
+    -- withdrawal this table exists to replace.
+    reason              TEXT        NOT NULL,
+
+    -- HUMAN RULING E1: a retraction may be recorded against a report that is
+    -- 'approved' OR 'released', AND THE ROW RECORDS WHICH. Stored rather than
+    -- inferred from reports.state, for the same reason the banners carry an
+    -- explicit *_basis (ruling R2): reports.state advances after this row is
+    -- written -- an approved report retracted today can be released
+    -- tomorrow -- so reading it back later would silently change what this
+    -- row claims. A report that was approved but never issued must never be
+    -- described to a clinician as having been issued.
+    retracted_from_state TEXT       NOT NULL
+        CHECK (retracted_from_state IN ('approved', 'released')),
+
+    -- HUMAN RULING E4: a replacement is OPTIONAL. A report issued against the
+    -- wrong patient's sample has nothing to replace it with, and requiring a
+    -- replacement would force a false row into existence to satisfy a
+    -- constraint -- the exact shape reviewer_claims' sole_signatory ruling
+    -- was created to avoid. NULL means "no replacement report has been
+    -- issued", which the banner states rather than glossing over.
+    replacement_report_id UUID,
+
+    -- HUMAN RULING E8: no change to the retention clock. A retraction is an
+    -- artefact of a specific clinical action on a specific report, not a
+    -- record with standing of its own, so it cascade-tombstones WITH the
+    -- report it retracts, in the same transaction, exactly like
+    -- release_events and amendments (RetentionPrincipal
+    -- ::_cascade_tombstone_report_dependents).
+    tombstoned_at       TIMESTAMPTZ,
+    tombstoned_by       UUID,
+
+    CONSTRAINT fk_retraction_report
+        FOREIGN KEY (org_id, report_id) REFERENCES reports (org_id, id),
+    CONSTRAINT fk_retraction_retractor
+        FOREIGN KEY (org_id, retracted_by) REFERENCES users (org_id, user_id),
+    CONSTRAINT fk_retraction_replacement
+        FOREIGN KEY (org_id, replacement_report_id) REFERENCES reports (org_id, id),
+    CONSTRAINT fk_retraction_tombstoner
+        FOREIGN KEY (org_id, tombstoned_by) REFERENCES users (org_id, user_id),
+    CONSTRAINT retraction_tombstone_complete CHECK (
+        (tombstoned_at IS NULL) = (tombstoned_by IS NULL)
+    ),
+    -- A report cannot be its own replacement: that would render a banner
+    -- instructing the reader to obtain the document they are already holding.
+    CONSTRAINT retraction_replacement_is_not_itself CHECK (
+        replacement_report_id IS NULL OR replacement_report_id <> report_id
+    ),
+    CONSTRAINT uk_retraction_org_id UNIQUE (org_id, id)
+);
+
+CREATE INDEX idx_retraction_org_report
+    ON report_retractions (org_id, report_id, retracted_at);
+
+
+-- ─── w122: Retraction notification obligations (human ruling E6) ───────────
+--
+-- E6: notification of a retraction to the parties who already hold the report
+-- is OWED, is RECORDED, and does NOT BLOCK the retraction. A lab that has
+-- discovered a dangerous report must never be prevented from recording that
+-- fact because an email did not send -- and no email can send, because THERE
+-- IS NO DELIVERY TRANSPORT ANYWHERE IN THIS PLATFORM.
+--
+-- PER CONSUMER, NOT PER ROLE (human ruling E6, stated in those words). This
+-- is the difference the RULING names, not the only structural difference from
+-- amendment_notifications -- w124 counted them: that table has no `status`
+-- column at all (see the paragraph below) and no uniqueness on its recipient,
+-- so this one carries two columns and one constraint it has no counterpart
+-- for. What E6 settled is the recipient column: amendment_notifications
+-- hardcodes delivered_to_role = 'ordering_clinician'. release_events.consumer
+-- is free text and names "a clinician, a patient, a LIMS, any consumer"
+-- (spec 13.4): a release event's consumer may be a LIMS, and a role is an
+-- abstraction over people that a LIMS is not. One obligation per DISTINCT
+-- consumer that received this report, deduplicated by the unique constraint
+-- below -- re-delivery to the same consumer is one debt, not two, the same
+-- way D3 rules that re-delivery does not restart the retention clock.
+--
+-- WHAT `status` DOES NOT SAY. amendment_notifications' docstring says
+-- notifications are "Recorded as sent" while the sentence before it says the
+-- transport is deferred; only one of those can be true and it is the first.
+-- A row here asserts a DEBT, never a transmission. The vocabulary therefore
+-- has exactly one value today: there is no 'sent' and no 'discharged',
+-- because nothing in this platform can send or discharge one. A discharge
+-- value is added by the commit that builds the transport, which is the
+-- commit that can honestly write it.
+CREATE TABLE retraction_notifications (
+    org_id              UUID        NOT NULL,
+    id                  UUID        PRIMARY KEY NOT NULL DEFAULT gen_random_uuid(),
+    retraction_id       UUID        NOT NULL,
+
+    -- The downstream recipient, copied from release_events.consumer -- the
+    -- party that actually received the retracted report.
+    consumer            TEXT        NOT NULL,
+
+    -- Denormalized from report_retractions.reason, for the same reason
+    -- amendment_notifications denormalizes amendments.reason: the recipient
+    -- has to be able to understand why without a join.
+    reason_for_retraction TEXT      NOT NULL,
+
+    status              TEXT        NOT NULL DEFAULT 'notification_owed'
+        CHECK (status = 'notification_owed'),
+
+    created_at          TIMESTAMPTZ NOT NULL,
+    created_by          UUID        NOT NULL,
+
+    tombstoned_at       TIMESTAMPTZ,
+    tombstoned_by       UUID,
+
+    CONSTRAINT fk_retraction_notification_retraction
+        FOREIGN KEY (org_id, retraction_id) REFERENCES report_retractions (org_id, id),
+    CONSTRAINT fk_retraction_notification_creator
+        FOREIGN KEY (org_id, created_by) REFERENCES users (org_id, user_id),
+    CONSTRAINT fk_retraction_notification_tombstoner
+        FOREIGN KEY (org_id, tombstoned_by) REFERENCES users (org_id, user_id),
+    CONSTRAINT retraction_notification_tombstone_complete CHECK (
+        (tombstoned_at IS NULL) = (tombstoned_by IS NULL)
+    ),
+    -- One outstanding debt per consumer per retraction. Enforced here rather
+    -- than by the writer's SELECT DISTINCT alone, so a second delivery path
+    -- cannot double-count the same recipient.
+    CONSTRAINT uk_retraction_notification_consumer
+        UNIQUE (org_id, retraction_id, consumer),
+    CONSTRAINT uk_retraction_notification_org_id UNIQUE (org_id, id)
+);
+
+CREATE INDEX idx_retraction_notification_org_retraction
+    ON retraction_notifications (org_id, retraction_id);
+
+
 -- ─── Phase 7 commit 4: Retention policy configuration (spec 22) ────────────
 --
 -- Human ruling D2 (2026-09-04): retention periods are CONFIGURABLE, never
@@ -1177,16 +1675,124 @@ CREATE INDEX idx_exceptions_retry_scheduler ON exceptions (org_id, next_retry_at
     WHERE status = 'open';
 
 
+-- w129 GAP-1 -- THE ONE TABLE IN THIS SCHEMA THAT WAS NOT ORG-SCOPED, AND THE
+-- ONLY PLACE A CROSS-TENANT WRITE WAS REACHABLE OVER AUTHENTICATED HTTP.
+--
+-- This table used to carry no org_id and to name `REFERENCES exceptions (id)`
+-- alone. The consequence was measured, not reasoned (w129 Phase A): an
+-- authenticated session in organisation B, issuing
+-- PATCH /exceptions/{id} against an exception id belonging to organisation A,
+-- left A's exception untouched -- the UPDATE is org-scoped and matched zero
+-- rows, silently, because _execute never inspects rowcount -- and then
+-- appended a 'resolve' row to A's APPEND-ONLY event history, carrying B's user
+-- id as actor and B's free text as action_note. A could see the row (its
+-- readers resolve the exception org-scoped first and then read events by the
+-- already-validated id) and could not explain it: the only audit record of who
+-- wrote it sat in B's audit partition, which A's Auditor cannot read.
+--
+-- The single-column FK was satisfied because the row existed GLOBALLY. That is
+-- the whole defect in one clause: a foreign key that does not carry the tenant
+-- asks "does this id exist?" when the question is "does this id exist HERE?".
+--
+-- The composite target it needed already existed, twelve lines above:
+-- exceptions_org_exception_unique UNIQUE (org_id, id). It was simply not used.
+-- With the FK composite, the contaminating row is not refused at runtime by
+-- code anyone has to remember to write -- it is INEXPRESSIBLE, which is the
+-- guarantee every other child table in this schema already had (see
+-- users_org_user_unique's comment for why that unique key is not redundant).
+--
+-- org_id is NOT NULL and references organisations directly as well, so a row
+-- cannot exist without naming its tenant even in the seconds before the
+-- composite FK is checked.
 CREATE TABLE exception_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    exception_id UUID NOT NULL REFERENCES exceptions (id),
+    org_id UUID NOT NULL REFERENCES organisations (org_id),
+    exception_id UUID NOT NULL,
     actor TEXT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
-    action TEXT NOT NULL CHECK (action IN ('open', 'resolve', 'reopen')),
-    action_note TEXT
+    -- w161 (migration 0005): THE AMENDMENT ACTION VOCABULARY. Four verbs, not
+    -- three. `'amend_resolution'` is APPENDED rather than inserted, and the
+    -- order matters: `pg_get_constraintdef` renders the list in the order it
+    -- was written, and migration 0005 re-creates this constraint with the same
+    -- four tokens in this same order so that a fresh database and an upgraded
+    -- one carry one identical definition. Change the order here and the drift
+    -- detector in test_w126m_schema_equivalence.py will report the two
+    -- databases as different, correctly.
+    --
+    -- THE CONSTRAINT IS UNNAMED HERE AND NAMED IN 0005, ON PURPOSE. PostgreSQL
+    -- names this `exception_events_action_check` -- it is the only unnamed
+    -- CHECK on this table -- and 0005 DROPs and re-ADDs that exact name, so
+    -- neither path invents an identifier the other does not have.
+    --
+    -- THE TOKEN CAME FROM THE HELD BRANCH w126-reresolve-amendment (95a33be),
+    -- which names `'amend_resolution'` in its own schema.sql and in
+    -- ExceptionEventAction.AMEND_RESOLUTION. Nothing else about that branch is
+    -- imported. See 0005's header for the full derivation.
+    --
+    -- WHAT IS STILL NOT HERE: the held branch's
+    -- `exception_events_amendment_names_its_target CHECK ((action =
+    -- 'amend_resolution') = (amends_event_id IS NOT NULL))`. That is a
+    -- SEMANTIC rule about what an amendment must carry, not a vocabulary, and
+    -- it cannot be settled without ruling on the amendment verb -- which this
+    -- wave is not authorised to do. It is carded for the verb's wave, where it
+    -- is still additive: every row this schema can hold today satisfies the
+    -- biconditional already.
+    --
+    -- AND STILL NOTHING WRITES ONE. `'amend_resolution'` is now a value the
+    -- database will accept; no code in this repository produces it. The verb
+    -- is the next authorisation's, exactly as `amends_event_id` was left by
+    -- migration 0004.
+    action TEXT NOT NULL CHECK (action IN ('open', 'resolve', 'reopen', 'amend_resolution')),
+    action_note TEXT,
+
+    -- w149 (migration 0004): THE AMENDMENT RELATIONSHIP, AND IT CARRIES THE
+    -- TENANT. The event this row amends -- always another row of this same
+    -- table. NULLABLE: an `open`, `resolve` or `reopen` amends nothing, and
+    -- being NULL on every one of them is what makes it mean something when set.
+    --
+    -- THE HELD BRANCH w126 WROTE `amends_event_id UUID REFERENCES
+    -- exception_events (id)` AND THAT SHAPE IS FORBIDDEN HERE. It is the exact
+    -- defect the comment above this table describes: a single-column foreign
+    -- key is satisfied because the row exists GLOBALLY, so an amendment could
+    -- name an event belonging to another organisation and the database would
+    -- accept it. The composite form below asks "does this id exist HERE?".
+    --
+    -- MATCH SIMPLE (the default) is correct and is a real difference from
+    -- exception_events_org_exception_fk, whose two referencing columns are both
+    -- NOT NULL. Here amends_event_id is nullable, so a NULL skips the check --
+    -- which is the intent. When it is SET, org_id is NOT NULL, so both
+    -- referencing columns are non-null and the check runs in full. The only way
+    -- to evade MATCH SIMPLE is to null a referencing column, and nulling
+    -- amends_event_id is nulling the amendment itself.
+    --
+    -- THE VOCABULARY ARRIVED IN 0005, THE PAIRING CHECK HAS NOT. This comment
+    -- used to read "no action value denotes an amendment"; that stopped being
+    -- true when migration 0005 (w161) widened the action CHECK above to admit
+    -- `'amend_resolution'`, which is why it is rewritten here rather than left
+    -- to rot. What the held branch ALSO carries and this schema still does not
+    -- is `exception_events_amendment_names_its_target CHECK ((action =
+    -- 'amend_resolution') = (amends_event_id IS NOT NULL))` -- a semantic rule
+    -- about what an amendment must name, carded for the wave that rules the
+    -- amendment verb. So an amendment event is now EXPRESSIBLE and still
+    -- UNWRITTEN: `amends_event_id` appears in no INSERT in this repository
+    -- outside the migration tests.
+    amends_event_id UUID,
+
+    CONSTRAINT exception_events_org_exception_fk
+        FOREIGN KEY (exception_id, org_id) REFERENCES exceptions (id, org_id),
+
+    -- The FOREIGN KEY TARGET for the self-reference below, derived from
+    -- exceptions_org_exception_unique. Not redundant with the primary key: the
+    -- primary key already enforces uniqueness, and this exists so that a
+    -- foreign key can name (id, org_id) at all -- without it PostgreSQL answers
+    -- 42830, "there is no unique constraint matching the given keys".
+    CONSTRAINT exception_events_org_event_unique UNIQUE (org_id, id),
+
+    CONSTRAINT exception_events_amends_event_fk
+        FOREIGN KEY (amends_event_id, org_id) REFERENCES exception_events (id, org_id)
 );
 
-CREATE INDEX idx_exception_events_exception ON exception_events (exception_id, timestamp);
+CREATE INDEX idx_exception_events_exception ON exception_events (org_id, exception_id, timestamp);
 
 
 -- ─── append-only enforcement ────────────────────────────────────────────────
@@ -1228,9 +1834,10 @@ GRANT  USAGE, SELECT          ON SEQUENCE audit_log_log_id_seq TO clinical_app;
 -- reason audit_log is: both are exactly what someone would want to alter after
 -- the fact. A reviewer's disagreement quietly edited into an agreement, or a
 -- release event's consumer or content_hash rewritten after a report went out,
--- would leave no trace that anything had changed -- and ISO 15189 7.4.1.8's
--- requirement that the original is never modified and never withdrawn from the
--- record cannot be met by a table the application is free to rewrite.
+-- would leave no trace that anything had changed -- and GEPER's own rule
+-- (spec 15.2, implementing ISO 15189 7.4.1.8 b)/d)) that the original is
+-- never modified and never withdrawn from the record cannot be met by a
+-- table the application is free to rewrite.
 --
 -- A wrong claim is corrected by appending a correcting claim that names the
 -- one it replaces, which is what reviewer_claims.supersedes is for and what
@@ -1258,6 +1865,20 @@ REVOKE UPDATE, DELETE ON fastq_sets FROM PUBLIC;
 GRANT  SELECT, INSERT ON reviewer_claims, release_events, amendments, amendment_notifications, notification_read_receipts TO clinical_app;
 REVOKE UPDATE, DELETE ON reviewer_claims, release_events, amendments, amendment_notifications, notification_read_receipts FROM clinical_app;
 REVOKE UPDATE, DELETE ON reviewer_claims, release_events, amendments, amendment_notifications, notification_read_receipts FROM PUBLIC;
+
+-- w122: report_retractions and retraction_notifications join the append-only
+-- block above, under the same "WITH NO EXCEPTION" rule and for the sharpest
+-- version of the same reason: a retraction is a deliberate safety act, and a
+-- retraction that could be edited or deleted after the fact would let a
+-- withdrawal be un-said with no trace -- which is the invisible withdrawal
+-- the immutability trigger exists to forbid, arriving by the other door.
+--
+-- A SEPARATE GRANT LINE, NOT AN ADDITION TO THE ONE ABOVE, so this wave's
+-- diff cannot be misread as having touched the five tables that were already
+-- there.
+GRANT  SELECT, INSERT ON report_retractions, retraction_notifications TO clinical_app;
+REVOKE UPDATE, DELETE ON report_retractions, retraction_notifications FROM clinical_app;
+REVOKE UPDATE, DELETE ON report_retractions, retraction_notifications FROM PUBLIC;
 
 -- D0b half one (human ruling, 2026-09-04): NOTHING DELETES. DELETE is revoked
 -- on all nineteen of these, from clinical_app and from PUBLIC, in the same
@@ -1287,7 +1908,13 @@ GRANT  SELECT, INSERT, UPDATE
     ON organisations, users, totp_backup_codes, role_assignments, sessions,
        patients, external_identifiers, consents, tests, test_genes, orders, samples,
        sequencing_runs, reports,
-       exceptions, exception_events, retention_policies
+       exceptions, exception_events, retention_policies,
+       -- w130. EXACTLY the privileges users and sessions hold, and no more:
+       -- both are mutated in place (the lockout counter, the idle window, the
+       -- terminated_at stamp), so UPDATE is required and is not a widening.
+       -- DELETE is absent here as it is for every table above, under the same
+       -- D0b ruling: nothing deletes.
+       patient_logins, patient_sessions
     TO clinical_app;
 
 -- D0b, the free win (human ruling, 2026-09-04): interpretations and vcfs are
@@ -1407,9 +2034,23 @@ GRANT  SELECT, UPDATE              ON vcfs, interpretations, reports TO clinical
 GRANT  UPDATE (tombstoned_at, tombstoned_by)
     ON reviewer_claims, release_events, amendments, amendment_notifications, notification_read_receipts
     TO clinical_retention;
+-- w122, human ruling E8: a retraction and its notification obligations
+-- cascade-tombstone WITH the report they are about -- same category as the
+-- five above ("artefacts of a specific clinical action ... not records with
+-- standing of their own"), same COLUMN-LEVEL grant shape rather than the
+-- table-level one, so this wave introduces no fresh instance of the
+-- over-broad-grant shape. E8 also settles what does NOT change: the purge
+-- eligibility query in RetentionPrincipal::_purge_reports is untouched -- a
+-- retraction neither shortens the window nor blocks the purge the way a live
+-- amendment does (D6).
+GRANT  SELECT                      ON report_retractions, retraction_notifications TO clinical_retention;
+GRANT  UPDATE (tombstoned_at, tombstoned_by)
+    ON report_retractions, retraction_notifications
+    TO clinical_retention;
 REVOKE DELETE
     ON vcfs, interpretations, reports, reviewer_claims, release_events, amendments, amendment_notifications, notification_read_receipts
     FROM clinical_retention;
+REVOKE DELETE ON report_retractions, retraction_notifications FROM clinical_retention;
 GRANT  INSERT                      ON audit_log TO clinical_retention;
 GRANT  USAGE, SELECT               ON SEQUENCE audit_log_log_id_seq TO clinical_retention;
 
@@ -1651,3 +2292,61 @@ CREATE TRIGGER trg_vcfs_content_immutability
 -- either table -- not even a narrowed one.
 REVOKE UPDATE ON reports, interpretations, vcfs FROM clinical_app;
 GRANT UPDATE (state, approver_id, approved_at, content_hash) ON reports TO clinical_app;
+
+
+-- ─── schema_migrations ───────────────────────────────────────────────────────
+--
+-- THE ONE OBJECT THIS FILE GAINS FOR THE MIGRATION MECHANISM (w126m), and the
+-- only schema change in that wave. Its DDL is not written out here: it is
+-- `clinical/migrations/0001_schema_migrations.sql`, reproduced below so that
+-- this file stays what it has always been -- the complete, self-contained
+-- description of a NEW database -- while the migration file stays what a
+-- migration has to be, the operation that reaches this state from the one
+-- before it. The two are kept in step by
+-- `clinical/tests/test_w126m_schema_equivalence.py`, which builds a database
+-- from THIS file and another from the migrations and fails on any catalog
+-- difference. That test, not a convention, is what stops them drifting.
+--
+-- Read `clinical/migrations/0001_schema_migrations.sql` for why the columns
+-- are what they are.
+CREATE TABLE schema_migrations (
+    version     INTEGER     PRIMARY KEY,
+    name        TEXT        NOT NULL,
+    checksum    TEXT        NOT NULL,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    applied_by  TEXT        NOT NULL DEFAULT current_user
+);
+
+REVOKE ALL                    ON schema_migrations FROM PUBLIC;
+GRANT  SELECT                 ON schema_migrations TO clinical_app;
+REVOKE INSERT, UPDATE, DELETE ON schema_migrations FROM clinical_app;
+
+-- A FRESH DATABASE IS ALREADY AT THE LATEST VERSION, AND SAYS SO.
+--
+-- This file creates the CURRENT state directly -- it does not replay the
+-- migrations -- so a database built from it has never run migration 1 or 2
+-- and yet holds exactly what they produce. Without these two rows it would
+-- report "2 pending" for ever, and the next deploy would try to run the
+-- baseline against a database that already has it.
+--
+-- They are INSERTed here rather than by the application, or by a later step,
+-- because `clinical/bootstrap.py --apply-schema` sends this whole file as one
+-- statement inside one transaction: the stamps land in the same transaction
+-- as the tables they describe, or neither lands. A stamp written afterwards
+-- could be lost while the schema survived, which is the falsely-ready
+-- database this mechanism exists to prevent.
+--
+-- THE CHECKSUMS ARE THE MIGRATION FILES' BYTES, SHA-256 OVER LF-NORMALISED
+-- CONTENT (clinical/migrate.py::checksum_of; the normalisation is why a
+-- Windows CRLF checkout and the Linux CI container agree). Adding a migration
+-- means adding its DDL above AND its stamp here;
+-- test_w126m_migration_mechanism.py::test_schema_sql_stamps_exactly_the_migration_set
+-- reads these rows back OUT OF A DATABASE and fails if they do not match the
+-- files on disk, so the pair cannot be half-done.
+INSERT INTO schema_migrations (version, name, checksum) VALUES
+    (1, 'schema_migrations', '00d8c90bb0eaba561d843cde7a45eca5af4d594aca6a3e230938aef27286f559'),
+    (2, 'baseline',          'cc842c3943b7aa1e5786d638eff742f63fd47ce5a5048d7321036234a5290af8'),
+    (3, 'report_retraction', 'd0e0ae8d149aa20aea64e18e47424f48efb63d0a7ccdd5cbfd9b3f8016202204'),
+    (4, 'exception_amendment', 'a379abc3cf0a81da3af438f4bc092648ab196d1c53e5039cef106a02200743a0'),
+    (5, 'exception_amendment_vocabulary', 'b2569f6f9927c82e8dd3c66142b053cd25efa8100abeeec607fc625fcc626de0'),
+    (6, 'totp_replay_guard', '3db752c93973912b85076708d08f120b7062dcb6e8d949720fee43ff03fead94');

@@ -2,16 +2,16 @@
 """
 main.py
 ────────
-Bij AI v8 — unified command-line interface.
+Bij AI sequencing-analysis component v8 — unified command-line interface.
 
 Subcommands
 ───────────
-  analyze     Full FASTQ → Report pipeline (GEPER primary workflow)
+  analyze     Full FASTQ → Report pipeline (primary workflow)
   vcf         Annotate + classify an existing VCF (skip alignment & variant calling)
   classify    Classify a single variant from CLI flags (ACMG + evidence score)
   serve       Start the FastAPI REST server
   validate    Validate a config file without running the pipeline
-  test        Run the GEPER test suite
+  test        Run the Bij AI sequencing-analysis component test suite
 
 Examples
 ────────
@@ -49,6 +49,10 @@ import os
 import sys
 from pathlib import Path
 from typing import Dict, Optional
+
+# What this component calls itself -- the same import-free constants the
+# reports use (pipeline/reporting/component_identity.py).
+from pipeline.reporting.component_identity import COMPONENT_NAME, PIPELINE_VERSION, SCOPE_LINE
 
 logger = logging.getLogger("geper.main")
 
@@ -93,7 +97,7 @@ def _setup_logging(level: str = "INFO") -> None:
 
 
 def _print_startup_validation(args: argparse.Namespace, cfg: Dict) -> None:
-    """Print the GEPER startup validation banner and run the consolidated
+    """Print the startup validation banner and run the consolidated
     dependency check before Stage 1. Raises DependencyValidationError if a
     required external tool is missing, or FileNotFoundError if --ref/--r1
     don't exist (both are caught by the caller for a clean CLI exit).
@@ -103,9 +107,10 @@ def _print_startup_validation(args: argparse.Namespace, cfg: Dict) -> None:
     """
     from pipeline.utils.dependency_validator import assert_required_dependencies
 
-    print("=" * 30)
-    print("Bij AI Environment Validation")
-    print("=" * 30)
+    banner = f"{COMPONENT_NAME} Environment Validation"
+    print("=" * len(banner))
+    print(banner)
+    print("=" * len(banner))
 
     py_ok = sys.version_info[:2] >= (3, 10)
     print(f"Python     : {sys.version.split()[0]} {'OK' if py_ok else 'UNSUPPORTED (<3.10)'}")
@@ -184,7 +189,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from pipeline.fastq.errors import FastqPipelineError
     from pipeline.config_validator import ConfigValidationError
 
-    # ── Fix #5: wire --cadd/--revel/--spliceai CLI overrides into acmg_thresholds ──
+    # ── Fix #5: wire --cadd/--revel CLI overrides into acmg_thresholds ──
+    # (--spliceai was the third until 2026-09-11; see the note below.)
     score_overrides = {}
     if getattr(args, "cadd", None) is not None:
         score_overrides["pp3_cadd_phred"] = args.cadd
@@ -192,9 +198,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     if getattr(args, "revel", None) is not None:
         score_overrides["pp3_revel"] = args.revel
         score_overrides["bp4_revel"] = args.revel
-    if getattr(args, "spliceai", None) is not None:
-        score_overrides["pp3_spliceai"] = args.spliceai
-        score_overrides["bp4_spliceai"] = args.spliceai
+    # `analyze --spliceai` was REMOVED 2026-09-11, with the two thresholds it
+    # wrote (pp3_spliceai / bp4_spliceai). They were dead -- the SpliceAI input
+    # is closed and PP3/BP4 read neither key -- so the flag set a number that
+    # governed nothing. The "separate, user-visible decision" this comment used
+    # to defer was ruled: remove them.
     if score_overrides:
         cfg.setdefault("acmg_thresholds", {}).update(score_overrides)
         logger.info("ACMG threshold overrides from CLI: %s", score_overrides)
@@ -223,7 +231,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             mode=getattr(args, "mode", "full"),
             stop_after=getattr(args, "stop_after", None),
         )
-        print(f"\n✓ Pipeline complete in {result.total_elapsed_seconds:.1f}s")
+        print(f"\n[OK] Pipeline complete in {result.total_elapsed_seconds:.1f}s")
         if result.stopped_after:
             print(f"  Stopped after: {result.stopped_after} (mode={args.mode})")
             print(f"  Filtered VCF : {result.variant_calling.get('filtered_vcf_path')}")
@@ -282,11 +290,35 @@ def cmd_vcf(args: argparse.Namespace) -> int:
     build_detection = warn_if_unsupported_build(str(vcf_path), sample_id=sample_id)
     if build_detection.build and build_detection.build != SUPPORTED_BUILD:
         print(
-            f"  [WARN] Detected genome build {build_detection.build}, but Bij AI only "
+            f"  [WARN] Detected genome build {build_detection.build}, but the {COMPONENT_NAME} only "
             f"supports {SUPPORTED_BUILD}. ClinVar/gnomAD results will be "
             f"coordinate-mismatched. Liftover to {SUPPORTED_BUILD} first.",
             file=sys.stderr,
         )
+
+    # ── Preflight: VCF vs GFF3 genome build ─────────────────────────────────
+    # `cmd_vcf` was an unimplemented site of the ruling `runner.py` already
+    # applies for the FASTQ->Report path (`check_vcf_gff3_build_consistency`,
+    # pipeline/utils/genome_build.py) -- not a separate decision. From this
+    # point on, `AnnotationStage` uses the configured GFF3's transcript
+    # model to build every HGVS c. position (see Stage 2 below); a VCF/GFF3
+    # build disagreement here produces a confidently wrong, well-formed
+    # coordinate with no missing value and no error, exactly as it does on
+    # the FASTQ path this check already guards. Deliberately not wrapped in
+    # a try/except beyond the one immediately below -- swallowing it would
+    # reinstate the silence this check exists to end.
+    _gff_for_build_check = (cfg.get("annotation", {}) or {}).get("refseq_gff") or (
+        cfg.get("rna_analysis", {}) or {}
+    ).get("refseq_gff")
+    if _gff_for_build_check:
+        from pipeline.config_validator import ConfigValidationError
+        from pipeline.utils.genome_build import check_vcf_gff3_build_consistency
+
+        try:
+            check_vcf_gff3_build_consistency(str(vcf_path), _gff_for_build_check)
+        except ConfigValidationError as exc:
+            print(f"\nConfig validation failed:\n{exc}", file=sys.stderr)
+            return 2
 
     stages_completed: list = []
     stages_skipped: list = []
@@ -429,7 +461,6 @@ def cmd_classify(args: argparse.Namespace) -> int:
         gene=args.gene,
         cadd_phred=args.cadd,
         revel_score=args.revel,
-        spliceai_score=args.spliceai,
         gnomad_af=args.gnomad_af,
         is_lof=args.lof,
         lof_gene_intolerant=args.lof_intolerant,
@@ -444,14 +475,13 @@ def cmd_classify(args: argparse.Namespace) -> int:
     comp_score = EvidenceAggregator.compute_computational_score(
         cadd_phred=args.cadd,
         revel_score=args.revel,
-        spliceai_score=args.spliceai,
     )
     ev_result = aggregator.aggregate_from_acmg(
         acmg_result,
         computational_score=comp_score,
     )
 
-    print(f"\n{'─' * 55}")
+    print(f"\n{'-' * 55}")
     print(f"  Variant   : {args.chrom}:{args.pos} {args.ref}>{args.alt}")
     if args.gene:
         print(f"  Gene      : {args.gene}")
@@ -459,7 +489,7 @@ def cmd_classify(args: argparse.Namespace) -> int:
     print(f"  ACMG score: {acmg_result.score:.4f}")
     print(f"  Criteria  : {', '.join(acmg_result.criteria_met) or 'none'}")
     print(f"  Evidence  : {ev_result.final_tier} (composite={ev_result.composite_score:.4f})")
-    print(f"{'─' * 55}")
+    print(f"{'-' * 55}")
 
     if args.output_dir:
         out = Path(args.output_dir)
@@ -483,7 +513,7 @@ def cmd_classify(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Start the GEPER FastAPI REST server."""
+    """Start the Bij AI sequencing-analysis component FastAPI REST server."""
     _setup_logging(args.log_level)
     try:
         import uvicorn
@@ -530,7 +560,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         return 1
 
-    print(f"Starting Bij AI API server on {args.host}:{args.port} …")
+    print(f"Starting the {COMPONENT_NAME} API server on {args.host}:{args.port} …")
     uvicorn.run(
         "api.main:app",
         host=args.host,
@@ -545,7 +575,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    """Validate a GEPER config file without running anything."""
+    """Validate a config file without running anything."""
     _setup_logging(args.log_level)
     cfg = _load_config(args.config)
 
@@ -553,10 +583,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     try:
         validate_config(cfg)
-        print(f"✓ Config is valid: {args.config or 'config/default.yaml'}")
+        print(f"[OK] Config is valid: {args.config or 'config/default.yaml'}")
         return 0
     except ConfigValidationError as exc:
-        print(f"✗ Config validation failed:\n{exc}", file=sys.stderr)
+        print(f"[FAIL] Config validation failed:\n{exc}", file=sys.stderr)
         return 2
 
 
@@ -583,7 +613,7 @@ def cmd_verify_environment(args: argparse.Namespace) -> int:
 
 
 def cmd_test(args: argparse.Namespace) -> int:
-    """Run the GEPER test suite via pytest."""
+    """Run the Bij AI sequencing-analysis component test suite via pytest."""
     _setup_logging(args.log_level)
     try:
         import pytest
@@ -605,12 +635,19 @@ def cmd_test(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    # The same constants the reports print (imported at module top from the
+    # import-free component_identity.py), so the CLI and the reports cannot
+    # name or describe this component differently: the name, then the
+    # ratified scope sentence verbatim.
     parser = argparse.ArgumentParser(
-        prog="geper",
-        description="Bij AI v8 — Genomic Evidence Pipeline with Evidence-based Risk assessment",
+        # The installed command's name (pyproject.toml [project.scripts],
+        # kim-pipeline = "main:cli"); was "geper", the platform's name, until
+        # 2026-09-12. Only the usage line and error prefix print it.
+        prog="kim-pipeline",
+        description=f"{PIPELINE_VERSION}\n{SCOPE_LINE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version="Bij AI v8.0.0")
+    parser.add_argument("--version", action="version", version=PIPELINE_VERSION)
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     sub.required = True
 
@@ -628,7 +665,11 @@ def _build_parser() -> argparse.ArgumentParser:
         )
 
     # ── analyze ──────────────────────────────────────────────────────────────
-    p_analyze = sub.add_parser("analyze", help="Full FASTQ → Report pipeline")
+    # Every string this CLI prints stays inside cp1252 (a default Windows
+    # console): "->" not U+2192, "[OK]"/"[FAIL]" not check/ballot marks, "-"
+    # rules not box-drawing -- human ruling 2026-09-11, pinned by
+    # tests/test_cli_cp1252_console.py. The em dash (in cp1252) is fine.
+    p_analyze = sub.add_parser("analyze", help="Full FASTQ -> Report pipeline")
     _common(p_analyze)
     p_analyze.add_argument("--r1", required=True, metavar="FASTQ", help="Read 1 FASTQ (required)")
     p_analyze.add_argument("--r2", metavar="FASTQ", help="Read 2 FASTQ (paired-end)")
@@ -668,12 +709,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--revel", type=float, metavar="0-1", help="Override ACMG PP3/BP4 REVEL score threshold"
     )
     p_analyze.add_argument(
-        "--spliceai",
-        type=float,
-        metavar="0-1",
-        help="Override ACMG PP3/BP4 SpliceAI score threshold",
-    )
-    p_analyze.add_argument(
         "--mode",
         default="full",
         choices=["full", "vcf_only"],
@@ -683,7 +718,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "ACMG/ancestry/reporting stages. 'vcf_only': stop after "
             "Variant Calling and emit filtered_variants.vcf only — use this "
             "when Kim is the FASTQ-to-VCF engine in front of another "
-            "interpretation pipeline (e.g. Bij AI)."
+            "interpretation pipeline (e.g. the Bij AI variant-interpretation "
+            "component (GEPER))."
         ),
     )
     p_analyze.add_argument(
@@ -716,7 +752,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_clf.add_argument("--gene", metavar="SYMBOL", help="Gene symbol (e.g. BRCA1)")
     p_clf.add_argument("--cadd", type=float, metavar="PHRED", help="CADD Phred score")
     p_clf.add_argument("--revel", type=float, metavar="0-1", help="REVEL score [0-1]")
-    p_clf.add_argument("--spliceai", type=float, metavar="0-1", help="SpliceAI delta score [0-1]")
     p_clf.add_argument("--gnomad-af", type=float, metavar="AF", help="gnomAD allele frequency")
     p_clf.add_argument("--lof", action="store_true", help="Flag as loss-of-function variant")
     p_clf.add_argument(
@@ -727,7 +762,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_clf.set_defaults(func=cmd_classify)
 
     # ── serve ─────────────────────────────────────────────────────────────────
-    p_serve = sub.add_parser("serve", help="Start the Bij AI FastAPI REST server")
+    p_serve = sub.add_parser("serve", help=f"Start the {COMPONENT_NAME} FastAPI REST server")
     _common(p_serve)
     p_serve.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     p_serve.add_argument("--port", default=8000, type=int, help="Bind port (default: 8000)")
@@ -755,7 +790,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_env.set_defaults(func=cmd_verify_environment)
 
     # ── test ─────────────────────────────────────────────────────────────────
-    p_test = sub.add_parser("test", help="Run the Bij AI test suite")
+    p_test = sub.add_parser("test", help=f"Run the {COMPONENT_NAME} test suite")
     _common(p_test)
     p_test.add_argument("-k", metavar="EXPR", help="pytest -k filter expression")
     p_test.add_argument("--cov", action="store_true", help="Run with coverage report")
@@ -768,7 +803,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def cli() -> None:
-    """Main entry point for ``geper`` console script (pyproject.toml)."""
+    """Main entry point for the ``kim-pipeline`` console script (pyproject.toml)."""
     parser = _build_parser()
     args = parser.parse_args()
     sys.exit(args.func(args))

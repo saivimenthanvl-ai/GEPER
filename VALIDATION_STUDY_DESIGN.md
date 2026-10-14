@@ -189,7 +189,7 @@ inference.
 - **[INVENTED]** — reasoned out here, nothing backs it. Flagged so a reviewer knows exactly
   where to push back hardest.
 
-### 0.2a What would make a `[VERIFIED-IN-REPO]` badge self-invalidating — proposed, not built (god's question, conv-validation-badges, 2026-09-10)
+### 0.2a What would make a `[VERIFIED-IN-REPO]` badge self-invalidating — proposed 2026-09-10, options 1 and 2 BUILT the same day (god's question, conv-validation-badges; header corrected 2026-09-10 after the "not built" framing below itself went stale -- see the note after the recommendation)
 
 **The structural defect, stated plainly:** a `[VERIFIED-IN-REPO]` badge as used throughout
 this document is a claim about a moment — this session, this commit — written in a form
@@ -214,29 +214,42 @@ rows with the identical badge on every row.
    what the citation was even supposed to prove. This is the weakest fix that is still a real
    fix, and is the one §0.4 already does informally (naming `9112411`) without extending the
    convention to the other 18 badges — which is exactly why only §0.4 caught its own second
-   drift and the PP5 row did not catch its first.
+   drift and the PP5 row did not catch its first. **BUILT, same day, after this section was
+   written**: every badge in this document now carries a pinned sha (confirmed by grep,
+   2026-09-10).
 2. **A quoted string a test greps for.** For badges that cite an exact string (PP5's reason
    text, `_BP6_DEPRECATION_CAVEAT`'s content, `STAR_PRACTICE_GUIDELINE = 4`), a small CI check
-   — not built here, a proposal only — could grep the cited file for the quoted substring and
-   fail the build if it's gone, the same shape as
-   `tests/test_round16_not_evaluated_categories.py`'s existing drift-protection test for
-   `_NEVER_INTEGRATED_ACMG_CODES`. This catches the PP5 defect's first half (the quote no
+   could grep the cited file for the quoted substring and fail the build if it's gone, the same
+   shape as `tests/test_round16_not_evaluated_categories.py`'s existing drift-protection test
+   for `_NEVER_INTEGRATED_ACMG_CODES`. This catches the PP5 defect's first half (the quote no
    longer existing) automatically and continuously, not just at audit time — but it cannot
    catch a moved-but-still-correct line number (most of this audit's findings), and it cannot
    catch a characterisation that is wrong while the quote is still accurate word-for-word,
    which is PP5's more serious half. A passing grep is weaker evidence than it looks: it would
-   have stayed green through everything except the exact string going missing.
+   have stayed green through everything except the exact string going missing. **BUILT, same
+   day**: `geper/tests/test_validation_study_design_badge_pins.py` (three tests: PP5's reason
+   string, `_BP6_DEPRECATION_CAVEAT`'s fragment, `STAR_PRACTICE_GUIDELINE == 4`; each imports
+   or calls the real production object rather than re-implementing the value under test) --
+   catches exactly what this paragraph says it can, and nothing more. The paragraph's own
+   limits above are unchanged by the test existing; they are the reason a green run of it must
+   not be over-trusted, and the test's own docstring says so.
 3. **Drop the badge, cite the git blame instead, or don't cite a line at all.** The dispatch's
    own framing — an unverifiable verification claim is worse than no claim — taken to its
    conclusion: state the fact and let a reader run `git log -S"<distinctive phrase>"` or
    `grep -rn` themselves rather than asserting a location that will go stale. Loses the
    "reviewer can re-check it in seconds" property this document's own legend (§0.2) claims for
-   the badge, which is a real cost, not a free option.
+   the badge, which is a real cost, not a free option. Not taken.
 
-**Recommendation, not a decision:** option 1 (pin the sha on every badge) for all of them, plus
-option 2 for the handful whose entire evidentiary weight rests on one exact string (PP5, BP6's
-caveat, the star-rating default) rather than a broader "this function does X" claim that a line
-number alone can't fully capture anyway. Not built in this pass, per boundary.
+**Recommendation, not a decision when this was written:** option 1 (pin the sha on every badge)
+for all of them, plus option 2 for the handful whose entire evidentiary weight rests on one
+exact string (PP5, BP6's caveat, the star-rating default) rather than a broader "this function
+does X" claim that a line number alone can't fully capture anyway. **Both were built the same
+day this section was written, and this paragraph originally said "not built in this pass" --
+which was accurate for a few hours and then became the exact kind of stale, unrechecked claim
+this whole section exists to describe. Corrected 2026-09-10 (`conv-andy-pp5-clo`) after god
+caught a document whose own "we have not built this" had quietly gone false and drawn no
+scrutiny for it, precisely because a pessimistic claim about your own state reads as honest
+modesty rather than something to verify.**
 
 ### 0.3 Citation verification status — every external citation was attempted, 2026-08-22
 
@@ -1157,7 +1170,9 @@ scoring semantics (§7.3).
              [**[INVENTED]** as originally described — the clause NUMBER is right, but this
              token originally described 7.3.7.3 as "evaluation of performance in
              interlaboratory comparison", treating 7.3.7.2 and 7.3.7.3 as two stages of one
-             EQA requirement. They are not: 7.3.7.2 is Internal quality control and 7.3.7.3
+             EQA requirement. Verification (2026-08-22, the same citation-verification
+             pass as EJ-05/EJ-12/EJ-15 and §4.3, tabulated in §9) establishes they are
+             not: 7.3.7.2 is Internal quality control and 7.3.7.3
              is External quality assessment. Retained as INVENTED because the description,
              not merely the number, was wrong. See §4.3]. CLIA 42 CFR §493.801-493.865,
              proficiency testing programme requirements and unsuccessful-participation
@@ -2307,11 +2322,18 @@ the consolidated list.
 ##### Cross-tree check, stated because the finding is product-shaped
 
 **`kim_pipeline/` was checked directly, not assumed.** It has **no variant-prioritisation
-stage and no ranked output**: its only `priorit`/`rank` matches are
-`pipeline/annotation/gff_index.py:269-321` (deterministic **transcript** selection order) and
-`pipeline/pgx/stage.py:296` (deterministic **allele** specificity order), neither of which is
-a review queue. **F5 is therefore scoped to `geper/` only**, and that is a checked fact rather
-than a scope assumed from where the finding was made.
+stage and no ranked output**: at the time of this check, its only `priorit`/`rank` matches
+were `pipeline/annotation/gff_index.py:269-321` (deterministic **transcript** selection order)
+and `pipeline/pgx/stage.py:296` (deterministic **allele** specificity order), neither of which
+was a review queue. **F5 is therefore scoped to `geper/` only**, and that is a checked fact
+rather than a scope assumed from where the finding was made.
+**[CORRECTED 2026-09-10 (angela-mszpsmyw): `pipeline/pgx/` was deleted 2026-09-10 (merge
+`51320e1`) -- the second citation above is now a dead pointer, not a re-checkable one. This
+does not weaken the conclusion: one of the two examples proving "no ranking stage" no longer
+exists at all, which is consistent with, not contrary to, F5 being scoped to `geper/` only.
+Left the original citation in place rather than deleted, per this document's own standard of
+correcting rather than erasing a stale pointer, since the surrounding reasoning still needs
+both named examples to make its point as originally written.]**
 
 <<<EXPERT-JUDGEMENT-REQUIRED: EJ-24
   DECIDE   — whether a **score TIE across the ratified boundary** counts as an F5 inversion:
@@ -2469,8 +2491,10 @@ Agreement text was not reachable.
              the Indian Council of Medical Research, released 12 October 2017]. ISO
              15189:2022, biological reference intervals and clinical decision limits and
              their applicability to the served population [**[INVENTED]** — this token
-             originally cited **clause 7.3.4**. Verification establishes that **7.3.4 is
-             "Evaluation of measurement uncertainty (MU)"**, not reference intervals.
+             originally cited **clause 7.3.4**. Verification (2026-08-22, the same
+             citation-verification pass as EJ-05/EJ-15/EJ-16 and §4.3, tabulated in
+             §9) establishes that **7.3.4 is "Evaluation of measurement uncertainty
+             (MU)"**, not reference intervals.
              Biological reference intervals and clinical decision limits ARE a subject of
              clause 7.3, but at a different subclause — most likely 7.3.5, which could NOT
              be confirmed to this document's standard and is therefore not asserted.
@@ -2492,7 +2516,7 @@ Agreement text was not reachable.
 | S1 | ClinVar 3★/4★ subset | **No** | Public domain; already flowing through the existing client; no new integration **[VERIFIED-IN-REPO @ c2258df1]** |
 | S2 | GIAB HG001-007 | **No, but licence citation is not closed** | Meredith's outstanding item 4: no GIAB-specific licence document was locatable. Inherited, not resolved |
 | S3 | An external QA scheme's materials | **Yes — unresolved** | Enrolment eligibility for a non-laboratory is unknown (§4.1). Blocks S3's design past its current state |
-| — | kim_pipeline PGx star-allele truth | **Yes — blocked** | PharmVar is CC-BY-NC-ND. **No usable ground truth exists for the PGx stage**, so no PGx validation is designed here. Named as an uncovered area rather than omitted |
+| — | kim_pipeline PGx star-allele truth | **Yes — blocked, then deleted** | PharmVar is CC-BY-NC-ND. **No usable ground truth exists for the PGx stage**, so no PGx validation is designed here. Named as an uncovered area rather than omitted. **[CORRECTED 2026-09-10 (angela-mszpsmyw): `kim_pipeline/pipeline/pgx/` was deleted 2026-09-10 (merge `51320e1`, the human's ruling to remove pharmacogenomics from the clinical report) -- the row's original reasoning (ground truth blocked, so no validation designed) is left as written, since it is still true of the period it describes and still the reason no PGx study exists in this document; the stage itself is now gone as well, which is a stronger, not weaker, version of "no PGx validation is designed here."]** |
 
 ### 6.3 Cross-lane dependencies
 

@@ -2,7 +2,8 @@
 
 Containerizes the whole combined pipeline described in
 [README_INTEGRATION.md](README_INTEGRATION.md): Kim (FASTQ → VCF),
-Bij AI (VCF → draft clinical report), and the `bridge/` glue that chains them.
+the Bij AI variant-interpretation component (GEPER) (VCF → draft clinical
+report), and the `bridge/` glue that chains them.
 
 **Why this exists:** every fresh Colab runtime this session required
 manually reinstalling `bwa`/`samtools`/`bcftools`/`freebayes`/`tabix`
@@ -19,6 +20,67 @@ bigger machine.
 
 ---
 
+## Before you build: three pre-fetched wheels the repository does not contain
+
+**A fresh clone cannot build this image.** The `Dockerfile` `COPY`s three
+CPU-only torch wheels from the repository root, and those files are not in
+git -- they are 180 MB of binary, and they are ignored (see `.gitignore`).
+You must put them there yourself before the first build.
+
+| file | bytes | sha256 |
+|---|---|---|
+| `torch-2.7.1+cpu-cp312-cp312-manylinux_2_28_x86_64.whl` | 175,833,687 | `8f8b3cfc53010a4b4a3c7ecb88c212e9decc4f5eeb6af75c3c803937d2d60947` |
+| `torchvision-0.22.1+cpu-cp312-cp312-manylinux_2_28_x86_64.whl` | 2,016,876 | `b5fa7044bd82c6358e8229351c98070cf3a7bf4a6e89ea46352ae6c65745ef94` |
+| `torchaudio-2.7.1+cpu-cp312-cp312-manylinux_2_28_x86_64.whl` | 1,796,388 | `65bf843345ae05629b7f71609bab0808004dabfce6cf48ea508a5d4f5419ca74` |
+
+**What it looks like if you skip this.** The build fails at the `COPY`, and
+the error names no prerequisite:
+
+```
+ERROR: failed to build: failed to solve: failed to compute cache key:
+failed to calculate checksum of ref <id>::<id>:
+"/torch-2.7.1+cpu-cp312-cp312-manylinux_2_28_x86_64.whl": not found
+```
+
+That reads as a broken Dockerfile rather than a missing input, and the
+filename appears nowhere in git history to search for -- which is why this
+section exists rather than only the comment at the `COPY` lines.
+
+**How to get them.** They come from PyTorch's CPU index, not PyPI:
+
+```bash
+pip download --no-deps --only-binary=:all: \
+    --python-version 3.12 --platform manylinux_2_28_x86_64 \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+```
+
+or fetch them directly (resumable, which is why the original was done this
+way -- these are large and the transfer has failed here before):
+
+```bash
+curl -L -C- -O https://download.pytorch.org/whl/cpu/torch-2.7.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
+```
+
+Then verify -- `sha256sum` against the table above. The three files currently
+in the tree were checked against the upstream index on 2026-09-10 and match
+byte for byte, so they are reproducible: **it does not matter who originally
+downloaded them.**
+
+**Why pre-fetched rather than `pip install` during the build.** The CPU
+wheels are 175.8 MB against roughly 821 MB for the default CUDA bundle, and
+`requirements.txt` pins `torch==2.7.1` without an index, so an in-build
+`pip install` would pull the CUDA build from PyPI and inflate the image.
+Installing the wheels first makes the pinned requirement already satisfied.
+(CI enforces the same property from the other direction -- see the "Assert
+the CUDA stack was not pulled in" step in `.github/workflows/pytest.yml`.)
+
+**Do not add these to `.dockerignore`.** They are ignored by *git* and
+required by the *build context*; those are opposite requirements on the same
+files, and excluding them would break every build.
+
+---
+
 ## Quick start
 
 ```bash
@@ -31,7 +93,7 @@ docker compose build
 ```
 
 ```bash
-# Run Bij AI standalone against an existing VCF
+# Run GEPER standalone against an existing VCF
 docker run --rm -it \
   -e GEPER_NCBI_EMAIL=you@example.com \
   -e GEPER_NCBI_API_KEY=your_key_here \
@@ -64,7 +126,7 @@ one-page-style summary companion).
 image. Full reasoning is in the Dockerfile's own header comment; short
 version:
 
-- Bij AI's own `requirements.txt` forces Python 3.11 or 3.12 exactly
+- GEPER's own `requirements.txt` forces Python 3.11 or 3.12 exactly
   (evo2's PyPI metadata). `python:3.12-slim` gives that by construction.
 - `bwa`/`samtools`/`bcftools`/`tabix` are all plain Debian apt packages;
   only `freebayes` needs a source build (Debian/Ubuntu don't package a
@@ -107,8 +169,8 @@ assumed):
 
 | Package | Version | Declared `transformers` requirement |
 |---|---|---|
-| `geper/requirements.txt` (committed) | — | `>=5.12.1,<6.0.0` |
-| `geper/GEPER_Colab.ipynb` (committed) | — | `>=5.12.1,<6.0.0` |
+| `geper/requirements.txt` (committed) | — | `>=5.12.1,<6.0.0` at the time; `==4.56.2` since 2026-09-11 |
+| `geper/GEPER_Colab.ipynb` (committed) | — | `>=5.12.1,<6.0.0` at the time; `==4.56.2` since 2026-09-11 |
 | `enformer-pytorch` | 0.8.12 (latest) | `==4.56.2` **exactly** |
 | `borzoi-pytorch` | 0.5.1 (latest) | `>=4.57.6,<5.0.0` |
 
@@ -136,7 +198,12 @@ declares support for.**
    *other* conflict listed there is new and worth investigating.
 
 **Action needed from you, not resolved here:**
-- `geper/requirements.txt` and `geper/GEPER_Colab.ipynb` should probably
+- RESOLVED 2026-09-11 (human ruling: "Bring the requirement in line with
+  the image"): both now pin `transformers==4.56.2`, and
+  `geper/tests/test_transformers_pin_matches_image.py` fails if they,
+  `verify_environment.py` or the README matrix drift from the Dockerfile's
+  pin again. Original note, kept as history:
+  `geper/requirements.txt` and `geper/GEPER_Colab.ipynb` should probably
   be updated to `transformers==4.56.2` (or a compatible range) to match
   reality — left untouched in this pass since it's a substantive,
   debatable change outside "containerize with Docker."
@@ -170,7 +237,7 @@ declares support for.**
 
 They're large (Enformer alone is 1.9GB; `plugin_model_cache/` totals
 ~3.1GB; the AlphaMissense catalogue is multi-GB on its own) and
-Bij AI's own loaders already handle "auto-download on first use,
+GEPER's own loaders already handle "auto-download on first use,
 idempotent, cached thereafter" — baking them into the image would (a)
 make every `docker pull`/`docker build` multiple times larger for
 every user, even ones who only need a subset of models, and (b) still
@@ -180,6 +247,25 @@ download already handles for free. A named Docker volume (see
 property without either cost — you pay the download once, on first
 real run, and never again across container restarts/recreations as
 long as the volume isn't deleted.
+
+**Named plainly (2026-09-11, human ruling, option C): this section
+describes the DEFAULT image — the one `docker build` actually produces
+from this repo's `Dockerfile` (confirmed: zero hits for
+`model_cache_seed`, `COPY.*model`, or `ARG.*seed` in it). It needs live
+network access on first real use, full stop.** That is a real
+requirement gap against `docs/BIJ_AI_CAPABILITY_AUDIT.md`'s own
+"standing on-premise packaging requirement" (a no-internet deployment
+must ship the weights baked in) — this section's own reasoning for why
+weights are a volume here does not resolve that gap, it explains why
+*this* image chose not to close it. The next section describes the
+*other*, offline-capable image (`geper:bridge-ready`) this design
+tradeoff does not apply to — but that image has no build path in this
+repository (see below): a 4.6 GB artefact that exists on one machine
+only. Building a repo-buildable, weights-baked variant is tracked as an
+open deliverable, not started by this note (see
+PACKAGING-offline-sites-shipped-image-must-contain-model-weights-
+huggingface-acquisition-is-not-an-install-path) — this is a
+documentation correction, not authorization to build one.
 
 ### The offline model-cache seed (`model_cache_seed/`) -- where it lives and how to rebuild it
 
@@ -250,6 +336,12 @@ models load with no network. The floor's measured figures for that
 image: **~36 s to load all four from the seed, against ~47 minutes and
 a live network without it.** That ratio is the reason this procedure
 is written down rather than reconstructed later.
+
+**Before rebuilding this image, read
+`docs/BRIDGE_READY_REQUIREMENTS.md`** -- seven conditions a future
+`bridge-ready` Dockerfile must satisfy, each with the evidence that it
+bites and what a violating build looks like. Two of them are not about
+symlinks and bite first, and one of them the shipped image violates.
 
 **How the image actually consumes it** -- read from `docker history`,
 not from the `Dockerfile.bridge-ready*` variants, **none of which built
@@ -533,7 +625,7 @@ discovered wrong only after the seed is already lost):
 ### One shared venv, not the `--kim-python`/`--geper-python` split
 
 `README_INTEGRATION.md` documents the bridge as supporting two
-*separate* Python environments because Bij AI's heavier PyTorch/AI stack
+*separate* Python environments because GEPER's heavier PyTorch/AI stack
 was assumed to conflict with Kim's lighter toolchain. Checked by hand
 against both `requirements.txt` files (not assumed): they don't
 actually conflict today. Every package they share (`pydantic`,
@@ -558,7 +650,7 @@ flags already support a two-venv split with zero other code changes.
 All three are already documented in `README_INTEGRATION.md`; here's the
 Docker form of each.
 
-### 1. Bij AI standalone (VCF already in hand)
+### 1. GEPER standalone (VCF already in hand)
 
 ```bash
 docker run --rm -it \
@@ -608,6 +700,47 @@ wired up in `docker-compose.yml`.
 
 ---
 
+## Service tiers that exist in this repo but nothing starts
+
+Two things in this codebase run a real, maintained server (not dead
+code, not a placeholder) and are nonetheless started by nothing: no
+`command:` in `docker-compose.yml`, no CI docker step, no systemd
+unit, no Procfile, no other launcher of any kind anywhere in the
+repository. If you came here looking for how to deploy either one,
+the honest answer is that this repository does not currently do so —
+deploying either is a separate decision with its own operational
+design (a supervisor for multiple processes, restart policy, and for
+`geper/api/`, a companion Postgres service and DSN wiring), not a
+one-line fix.
+
+- **`geper/api/`** — the FastAPI structural-annotation app
+  (`api/main.py`) and its two queue workers (`submission_worker.py`,
+  `exception_retry_worker.py`). The root `Dockerfile`'s `CMD
+  ["/bin/bash"]` is a deliberate toolbox choice, not an oversight (see
+  that line's own comment), and `docker-compose.yml`'s one `geper`
+  service inherits it with no `command:` override — so this tier is
+  never reachable through the image or compose as they stand today.
+  Both workers already fail closed without `CLINICAL_DSN` configured
+  (confirmed by `tests/test_worker_clinical_dsn_fail_closed.py`), so
+  the unlaunched state costs nothing if someone runs one by hand.
+- **`clinical/Dockerfile`** — the clinical service image (session
+  auth, exceptions worklist, `/readyz` against a bootstrapped
+  Postgres). Deliberately its own file, for the reasons in its own
+  header comment. It is real and already verified working by actually
+  starting the container and probing it (commit `1b895b3`), but
+  nothing else in this repository — no compose service, no CI job, no
+  other Dockerfile — references it. `docker-compose.yml` also
+  provisions no Postgres service at all, so wiring this in needs a
+  companion database and bootstrap step, not just one compose block.
+
+Ruled 2026-09-11 (human, via god): document this as an unstarted
+toolbox rather than add a launcher — "designing a launcher for
+something nobody starts is building a product decision into
+infrastructure." If either tier is later deployed, that deployment is
+its own decision with its own card, not an extension of this one.
+
+---
+
 ## Environment variables
 
 ### Required for real use
@@ -621,7 +754,7 @@ wired up in `docker-compose.yml`.
 
 | Variable | What it's for |
 |---|---|
-| `GEPER_BLAST_DATABASE` | Path to a pre-built local BLAST database (mount it in, point this at it) instead of falling back to remote NCBI BLAST or Bij AI auto-building one from `GEPER_BLAST_REFERENCE_FASTA`. |
+| `GEPER_BLAST_DATABASE` | Path to a pre-built local BLAST database (mount it in, point this at it) instead of falling back to remote NCBI BLAST or GEPER auto-building one from `GEPER_BLAST_REFERENCE_FASTA`. |
 | `GEPER_ALPHAMISSENSE_HG38_LOCAL` / `GEPER_ALPHAMISSENSE_HG19_LOCAL` | Path to a pre-downloaded AlphaMissense catalogue file, to skip the multi-GB GCS download on first use. |
 | `GEPER_ASSEMBLY`, `GEPER_ENABLE_*`, every other `GEPER_*` variable `geper/config.py` defines | Passed through normally — this image doesn't restrict or override any of them beyond the `transformers` pin above. |
 
@@ -646,7 +779,7 @@ GEPER_NCBI_API_KEY=your_key_here
 - **Output**: `geper/main.py --output-dir` / `--geper-output-dir`
   pointed at a path under `/data` lands directly back in `./data/` on
   the host — no `docker cp` needed. `docker-compose.yml` additionally
-  bind-mounts `./output` straight to `/app/geper/geper_output` (Bij AI's
+  bind-mounts `./output` straight to `/app/geper/geper_output` (GEPER's
   own default output directory) for the case where you don't pass
   `--output-dir` explicitly.
 - **Model weight caches**: named Docker volumes (`geper_model_cache`,
@@ -713,7 +846,7 @@ avoid — deliberately not started).
   directory out at all.
 - Every system-binary dependency this Dockerfile installs — found by
   grepping every `subprocess` call to an external binary across
-  `pipeline/models/`, `models/`, and `database/` in the actual Bij AI
+  `pipeline/models/`, `models/`, and `database/` in the actual GEPER
   source, not assumed from documentation alone (this is how the
   `git`/`git-lfs`/`r-base-core` requirements were found — none of them
   were in this task's original required-tool list).

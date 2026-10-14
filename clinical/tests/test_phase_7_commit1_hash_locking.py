@@ -100,6 +100,21 @@ def _admin_session(dao, conn, org_id, email):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
     conn.commit()
     return dao.login(email, org_id, "password")
 
@@ -216,20 +231,31 @@ def interp_b(dao, conn, session_b):
     return _make_interpretation(dao, conn, session_b)
 
 
-def _add_claim(dao, session, interp_id, actor_id, reason="Independently re-derived the same classification."):
-    return dao._record_accept(session, interpretation_id=interp_id, actor_id=actor_id, reason=reason)
+def _add_claim(
+    dao, session, interp_id, report_id, actor_id, reason="Independently re-derived the same classification."
+):
+    return dao._record_accept(
+        session, interpretation_id=interp_id, report_id=report_id, actor_id=actor_id, reason=reason
+    )
 
 
 def _approved_report(dao, conn, session, interpreter, approver, interp_id):
-    """Full workflow: create -> submit_for_review (needs >=1 claim) -> approve. Returns report_id."""
-    _add_claim(dao, session, interp_id, interpreter.user_id)
+    """
+    Full workflow: create -> claim -> submit_for_review (needs >=1 claim OF
+    THIS REPORT) -> approve. Returns report_id.
+
+    The report is created BEFORE the claim, which is the ordering
+    reviewer_claims.report_id NOT NULL imposes: a claim is recorded against a
+    report that exists (R9, human ruling 2026-09-13).
+    """
     report_id = dao.create_report(session, interp_id)
+    _add_claim(dao, session, interp_id, report_id, interpreter.user_id)
     dao.submit_for_review(interpreter, report_id)
     dao._approve_report(approver, report_id, actor_id=approver.user_id)
     return report_id
 
 
-def _expected_hash(conn, interp_id):
+def _expected_hash(conn, interp_id, report_id):
     """Recompute the expected hash independently of DataAccess, from raw rows, for a cross-check."""
     with conn.cursor() as cur:
         cur.execute("SELECT run_document FROM interpretations WHERE id = %s", (interp_id,))
@@ -239,8 +265,8 @@ def _expected_hash(conn, interp_id):
         cur.execute(
             'SELECT claim_type, variant_key, classification, reason, actor_id, "timestamp", '
             "evidence_json, supersedes "
-            'FROM reviewer_claims WHERE interpretation_id = %s ORDER BY "timestamp", id',
-            (interp_id,),
+            'FROM reviewer_claims WHERE report_id = %s ORDER BY "timestamp", id',
+            (report_id,),
         )
         claims = []
         for row in cur.fetchall():
@@ -274,7 +300,7 @@ class TestApprovalHashCoversReviewerClaims:
             cur.execute("SELECT content_hash FROM reports WHERE id = %s", (report_id,))
             stored = cur.fetchone()[0]
 
-        assert stored == _expected_hash(conn, interp_a)
+        assert stored == _expected_hash(conn, interp_a, report_id)
 
     def test_hash_differs_when_claim_content_differs(self, dao, conn, session_a, interpreter_a, approver_a):
         """
@@ -286,13 +312,13 @@ class TestApprovalHashCoversReviewerClaims:
         interp_1 = _make_interpretation(dao, conn, session_a, run_document={"variants": []})
         interp_2 = _make_interpretation(dao, conn, session_a, run_document={"variants": []})
 
-        _add_claim(dao, session_a, interp_1, interpreter_a.user_id, reason="Reason A.")
         report_1 = dao.create_report(session_a, interp_1)
+        _add_claim(dao, session_a, interp_1, report_1, interpreter_a.user_id, reason="Reason A.")
         dao.submit_for_review(interpreter_a, report_1)
         dao._approve_report(approver_a, report_1, actor_id=approver_a.user_id)
 
-        _add_claim(dao, session_a, interp_2, interpreter_a.user_id, reason="Reason B, completely different.")
         report_2 = dao.create_report(session_a, interp_2)
+        _add_claim(dao, session_a, interp_2, report_2, interpreter_a.user_id, reason="Reason B, completely different.")
         dao.submit_for_review(interpreter_a, report_2)
         dao._approve_report(approver_a, report_2, actor_id=approver_a.user_id)
 
@@ -313,7 +339,7 @@ class TestApprovalHashCoversReviewerClaims:
             cur.execute("SELECT content_hash FROM reports WHERE id = %s", (report_id,))
             hash_before = cur.fetchone()[0]
 
-        _add_claim(dao, session_a, interp_a, interpreter_a.user_id, reason="A later, second claim.")
+        _add_claim(dao, session_a, interp_a, report_id, interpreter_a.user_id, reason="A later, second claim.")
 
         with conn.cursor() as cur:
             cur.execute("SELECT content_hash FROM reports WHERE id = %s", (report_id,))
@@ -390,11 +416,24 @@ class TestVerifyReportIntegrityDetectsTampering:
     # test_detects_evidence_json_tampered_after_approval below.
 
     def test_detects_claim_added_after_approval(self, dao, conn, session_a, interpreter_a, approver_a, interp_a):
-        """A new claim, not just an edited one, is also a change the hash must catch."""
+        """
+        A new claim, not just an edited one, is also a change the hash must catch.
+
+        THIS TEST IS WHY reviewer_claims GREW A report_id RATHER THAN THE
+        HASH GROWING AN approved_at CUTOFF (R9, human ruling 2026-09-13).
+        The cutoff was the cheaper fix for the amendment false alarm and
+        needed no schema change -- and it would have had to retire this
+        test, because a claim added after approval has a timestamp past the
+        cutoff and would simply drop out of the recomputed hash. A claim
+        INJECTED after approval is precisely what an integrity check exists
+        to catch. Scoping the claim to a report keeps this detection intact:
+        the claim below names THIS report, so it changes THIS report's hash,
+        exactly as it always did.
+        """
         report_id = _approved_report(dao, conn, session_a, interpreter_a, approver_a, interp_a)
         assert dao.verify_report_integrity(approver_a, report_id) is True
 
-        _add_claim(dao, session_a, interp_a, interpreter_a.user_id, reason="Added after the fact.")
+        _add_claim(dao, session_a, interp_a, report_id, interpreter_a.user_id, reason="Added after the fact.")
 
         assert dao.verify_report_integrity(approver_a, report_id) is False
 
@@ -434,11 +473,15 @@ class TestVerifyReportIntegrityDetectsTampering:
         an exception to explain later. Two claims are needed so the second
         can legitimately point at the first before the tamper.
         """
-        first_claim = _add_claim(dao, session_a, interp_a, interpreter_a.user_id, reason="Original claim.")
-        second_claim = dao._record_accept(
-            session_a, interpretation_id=interp_a, actor_id=interpreter_a.user_id, reason="A second, unrelated claim."
-        )
         report_id = dao.create_report(session_a, interp_a)
+        first_claim = _add_claim(dao, session_a, interp_a, report_id, interpreter_a.user_id, reason="Original claim.")
+        second_claim = dao._record_accept(
+            session_a,
+            interpretation_id=interp_a,
+            report_id=report_id,
+            actor_id=interpreter_a.user_id,
+            reason="A second, unrelated claim.",
+        )
         dao.submit_for_review(interpreter_a, report_id)
         dao._approve_report(approver_a, report_id, actor_id=approver_a.user_id)
         assert dao.verify_report_integrity(approver_a, report_id) is True
@@ -470,7 +513,19 @@ class TestVerifyReportIntegrityDetectsTampering:
 
 
 class TestLineageColumn:
-    """interpretations.parent_interpretation_id: column only, no methods in this commit."""
+    """interpretations.parent_interpretation_id: column only, no methods in this commit.
+
+    This is the class that actually exercises `fk_interp_parent`, the
+    composite FK on this column (confirmed 2026-09-11 by dropping the
+    constraint and re-running: `test_rejects_a_cross_org_parent`/
+    `test_rejects_an_unknown_parent` below both went red instantly,
+    since raw SQL here bypasses `create_reanalysis()` entirely). See
+    `test_phase_7_commit3_reanalysis.py::
+    TestCreateReanalysisRejectsAnInvalidParentViaItsOwnPrecheck` for
+    the sibling tests that go through `create_reanalysis()` itself --
+    those two test the DAO's own pre-check, not this constraint; the
+    same mutation left them green.
+    """
 
     def test_defaults_to_null(self, conn, interp_a):
         with conn.cursor() as cur:

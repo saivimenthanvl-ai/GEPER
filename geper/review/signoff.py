@@ -79,6 +79,28 @@ and does NOT cover):
     cheap now -- there is exactly one caller today; that window closes
     the moment a second one exists.
 
+LINKED RUNS (2026-09-13, w117) -- the one place this module is no longer
+filesystem-only. A run that `api/submission_worker.py` recorded as a
+clinical interpretation carries a `clinical_link.json` in its
+`--output-dir`. `approve` and `override` now read it, and on such a run
+ALSO write to the clinical record: a `sole_signatory` claim, submission
+and approval by the one authenticated person who signed (`approve`), or
+a `disagree` claim (`override` before approval; an override AFTER
+approval is refused and pointed at the amendment path). A run with no
+`clinical_link.json` is untouched by all of it -- no credentials, no
+database, no import of the clinical package. See the "clinical link"
+section below for the ruling, the claim-kind reasoning and why the
+clinical writes come before the file writes.
+
+`withdraw` joined that set in w119 (2026-09-13) and is the one member of
+it whose clinical side is a REFUSAL rather than a write: the clinical
+layer has no operation that retracts an approval, and its schema forbids
+walking an approved report's state back, so a withdrawal on a run whose
+clinical report is already `approved`/`released` is refused before any
+file changes instead of leaving the record saying `approved` behind a
+retracted sign-off. See `withdraw`'s docstring for the evidence and for
+the linked-but-not-yet-approved case, which withdraws normally.
+
 THE GATING RULE (spelled out, not left implicit, since the whole point
 of extracting `require_reviewed` was to give future callers one place
 to find it): any code path that hands a run's data to a CONSUMER --
@@ -141,10 +163,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
-from pipeline.provenance import VersionStatus
+from component_identity import SHORT_NAME
+from pipeline.provenance import HashVerification, VersionStatus
 from report.clinical_report_builder import candidate_interpretation_of
 from report.models import compute_content_hash, verify_content_hash
 from report.report_generator import ReportGenerator
@@ -162,6 +187,17 @@ MARKDOWN_REPORT_FILENAME = "geper_report.md"
 PATIENT_META_FILENAME = "geper_patient_meta.json"
 MANIFEST_FILENAME = "geper_signoff_manifest.json"
 AUDIT_LOG_FILENAME = "geper_signoff_audit.log"
+
+# Written by api/submission_worker.py once a run has been recorded as a
+# clinical interpretation: which organisation, order, sample, interpretation,
+# report and VCF this output directory's files became. Its PRESENCE is what
+# makes a run "linked" for everything below. Named here as a literal rather
+# than imported from api/submission_worker.py deliberately: this module is
+# filesystem-only and must not acquire an import edge onto the API worker
+# (which pulls in the submission store, psycopg and the whole clinical
+# package) just to learn one filename. The two constants are asserted equal
+# by api/tests/test_signoff_clinical_link.py, so a rename cannot drift.
+CLINICAL_LINK_FILENAME = "clinical_link.json"
 
 # Same three severities `pipeline/acmg_rules.py`'s Conflict Resolution
 # Engine (Phase 6) already reports via `clinical_report["conflict_resolution"]
@@ -196,11 +232,95 @@ def _require_results(output_dir: str) -> str:
     results_path = _results_path(output_dir)
     if not os.path.exists(results_path):
         raise SignoffError(
-            f"No '{RESULTS_FILENAME}' found in '{output_dir}'. This directory must be a Bij AI "
+            f"No '{RESULTS_FILENAME}' found in '{output_dir}'. This directory must be a {SHORT_NAME} "
             f"--output-dir from a completed run (python main.py --vcf ... --output-dir '{output_dir}') "
             f"before it can be reviewed."
         )
     return results_path
+
+
+def _check_no_model_hash_mismatch(document: Dict[str, Any]) -> None:
+    """
+    Refuses `approve()` before it writes anything if this run recorded a
+    model-weight hash MISMATCH for any model -- human-ruled 2026-09-10:
+    "a signer approving a report without visibility into a mismatch is
+    signing something they cannot vouch for; the signature becomes
+    decorative." `hash_verification: MISMATCH` is written into
+    `geper_results.json` at run time
+    (`pipeline/orchestrator.py::run`, opt-in via
+    `CONFIG.VERIFY_MODEL_ARTIFACT_HASHES`/`GEPER_VERIFY_MODEL_HASHES`) but
+    nothing downstream reads it -- not `approve()` before this change, not
+    the rendered Markdown (`report/report_generator.py::_render_provenance`)
+    or PDF (`report/summary.py`), both of which show only
+    identifier/status/reason from each `model_checkpoints` entry. That is
+    not missing information, it is suppression, however unintentional: the
+    fact is already on disk and the signer is the one party not told. This
+    function is the fix -- called from `approve()` immediately after the
+    document loads and before any write (patient_meta, the JSON rewrite,
+    PDF regeneration, the manifest), so a refusal here leaves nothing on
+    disk changed.
+
+    NO BYPASS OF ANY KIND EXISTS FOR THIS CHECK, DELIBERATELY: no flag, no
+    env var, no "force". A mismatch means the cached weights this run used
+    do not match what the cache claims to hold -- corrupted or substituted
+    -- and the only correct response is fixing the cache and re-running,
+    never signing off on unknown weights. Consistent with
+    `require_reviewed()`'s own content-hash check just below, which has
+    never had an override either.
+
+    WHAT THE MESSAGE NAMES: the model, the EXPECTED sha256 the cache
+    declared (`cache_declared_sha256`), and -- as of this change -- the
+    ACTUAL observed hash (`observed_sha256`), now persisted by
+    `pipeline/provenance.py::verify_model_artifact` via
+    `WeightCache.verify_checksum_detailed`, which returns the bytes-on-disk
+    hash it computed rather than discarding it after only logging it. A
+    record written before this change (or one where `hash_verification`
+    reached MISMATCH some other way this function does not anticipate) may
+    still lack `observed_sha256`; that case is named explicitly below
+    rather than silently printing `None`.
+    """
+    checkpoints = document.get("model_checkpoints") or {}
+    mismatches: List[Dict[str, Any]] = []
+    for name, value in checkpoints.items():
+        if not isinstance(value, dict):
+            continue
+        artifact = value.get("loaded_artifact")
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("hash_verification") == HashVerification.MISMATCH.value:
+            mismatches.append(
+                {
+                    "name": name,
+                    "expected_sha256": artifact.get("cache_declared_sha256"),
+                    "observed_sha256": artifact.get("observed_sha256"),
+                    "resolved_path": artifact.get("resolved_path"),
+                }
+            )
+    if not mismatches:
+        return
+
+    lines = [
+        "Approval refused: model-weight hash MISMATCH recorded for this run -- signing off would "
+        "attest to findings produced by weights that do not match what the model cache declares.",
+    ]
+    for m in mismatches:
+        if m["observed_sha256"]:
+            observed_clause = f"actual observed sha256 = {m['observed_sha256']!r}"
+        else:
+            # Named, not silently printed as None -- a record written before
+            # `observed_sha256` existed, or one that reached MISMATCH by a
+            # path this function does not anticipate.
+            observed_clause = "actual observed hash is not present in this record"
+        lines.append(
+            f"  - {m['name']}: expected sha256 (declared by the cache) = {m['expected_sha256']!r}; "
+            f"{observed_clause} (cache file: {m['resolved_path']!r})."
+        )
+    lines.append(
+        "This means the cached weights are corrupted or were substituted after this run recorded "
+        "them -- re-verify or re-download the model cache for the model(s) named above and re-run "
+        "this sample, then approve the fresh run. There is no override for this check."
+    )
+    raise SignoffError("\n".join(lines))
 
 
 def require_reviewed(document: Dict[str, Any], consumer: str = "This system", output_dir: Optional[str] = None) -> None:
@@ -498,11 +618,582 @@ def _load_existing_patient_meta_raw(path: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The signing clinician's identity (R10)
+# ---------------------------------------------------------------------------
+
+_IDENTITY_FIELDS = ("full_name", "registration_number", "hospital")
+
+
+@dataclass(frozen=True)
+class ClinicianIdentity:
+    """
+    The three values a signed report shows -- name, registration number,
+    hospital -- AS HELD BY THE USER RECORD OF THE ACCOUNT THAT SIGNED, rather
+    than as typed at sign-off time.
+
+    R10, human ruling 2026-09-13. Until this existed, `approve()` took all
+    three as free text and printed whatever it was given: the report could
+    name a clinician who never signed it, or a registration number belonging
+    to nobody, and no record anywhere could contradict the printed document.
+    That is the gap this class closes, on the rendering side; the storage side
+    is `clinical/schema.sql`'s users.full_name/registration_number/hospital
+    and `clinical/data_access.py::get_signing_identity`.
+
+    DELIBERATELY NOT AN IMPORT FROM `clinical`. This package is the
+    filesystem-only pipeline and renders reports in deployments that have no
+    clinical database at all (see this module's own "filesystem-only"
+    docstring); importing the data-access layer here would make the renderer
+    depend on Postgres to print a PDF. `from_user_record` takes the plain dict
+    `get_signing_identity` returns instead, so the two halves meet at a data
+    shape rather than at an import.
+
+    `user_id` is carried purely so the manifest can record WHICH account the
+    identity came from -- the audit question "who signed" wants an account,
+    not just a printed name. It is optional because the typed-in path (below)
+    has no account behind it, and saying so is more honest than inventing one.
+    """
+
+    full_name: str
+    registration_number: str
+    hospital: str
+    user_id: Optional[str] = None
+
+    @classmethod
+    def from_user_record(cls, record: Mapping[str, Any]) -> "ClinicianIdentity":
+        """
+        Build an identity from `clinical/data_access.py::get_signing_identity`'s
+        dict, REFUSING anything incomplete and naming every field that is
+        missing.
+
+        The check is repeated here rather than trusted from the database side
+        on purpose: this is the last point before the values reach a rendered
+        PDF, and it is reachable from callers that never went through
+        `get_signing_identity` at all (a test, a future second source of user
+        records, a deployment that reads its own directory service). A
+        guarantee that only holds when the caller remembered to use one
+        specific function is not a guarantee.
+
+        Whitespace-only counts as missing. `"  "` is not falsy, satisfies any
+        NOT NULL constraint, and renders as nothing -- a signature block with
+        a blank credential, which is precisely the document this ruling
+        exists to prevent.
+        """
+        missing = [field for field in _IDENTITY_FIELDS if not str(record.get(field) or "").strip()]
+        if missing:
+            raise SignoffError(
+                "Cannot sign a report with this user record: it is missing "
+                f"{', '.join(missing)}. A clinical report shows the signing clinician's name, "
+                "registration number and hospital (R10), so no report is produced with any of "
+                "them absent. Record them on the user account first."
+            )
+        user_id = record.get("user_id")
+        return cls(
+            full_name=str(record["full_name"]).strip(),
+            registration_number=str(record["registration_number"]).strip(),
+            hospital=str(record["hospital"]).strip(),
+            user_id=str(user_id) if user_id is not None else None,
+        )
+
+    def physician_string(self) -> str:
+        """
+        The one rendered form, e.g. "Dr. A. Sharma, Reg. No. 12345, ABC
+        Diagnostics" -- byte-identical to what `approve()` has always folded
+        into `patient_meta["physician"]`, so nothing downstream
+        (`report/summary.py`'s footer, the identity block, the LIMS export)
+        changes shape because the values now come from a record.
+        """
+        return f"{self.full_name}, Reg. No. {self.registration_number}, {self.hospital}"
+
+
+def _resolve_signing_identity(
+    clinician_name: Optional[str],
+    reg_number: Optional[str],
+    hospital: Optional[str],
+    identity: Optional[ClinicianIdentity],
+) -> Tuple[ClinicianIdentity, str]:
+    """
+    Decide which identity a sign-off prints, and return it with the source it
+    came from ("user_record" or "typed_in").
+
+    THE RULE, and it is the whole point of R10: a report must not be able to
+    show an identity that CONTRADICTS the user record. So when an `identity`
+    is supplied, any typed-in value that disagrees with it is refused -- not
+    silently overridden, and not silently preferred. Overriding would print
+    the right thing while leaving the caller believing it printed theirs;
+    preferring the typed value would reopen the exact gap this closes. A
+    refusal names the field that disagreed, because the disagreement is
+    either a caller bug or an attempt to sign as somebody else, and both need
+    to be seen.
+
+    Typed-in values that AGREE are accepted rather than rejected as
+    redundant: `review/cli.py` and every existing caller pass all three
+    positionally, and a caller that also resolves the account should not have
+    to choose between the two.
+
+    With no `identity`, all three typed values are required -- and, as of
+    R10, actually CHECKED. They were declared required by the CLI's argparse
+    and by nothing else, so a programmatic caller passing None for one of
+    them signed a report reading "Dr. X, Reg. No. None, AIIMS Delhi". A
+    missing registration number is refused here for the same reason
+    `from_user_record` refuses one: the report shows it, so there is no
+    report to produce without it.
+    """
+    if identity is not None:
+        supplied = {
+            "clinician_name": (clinician_name, identity.full_name),
+            "reg_number": (reg_number, identity.registration_number),
+            "hospital": (hospital, identity.hospital),
+        }
+        conflicts = [
+            f"{field} (given {given!r}, user record holds {held!r})"
+            for field, (given, held) in supplied.items()
+            if given is not None and given.strip() != held
+        ]
+        if conflicts:
+            raise SignoffError(
+                "Refusing to sign: the values supplied disagree with the signing user's own record -- "
+                + "; ".join(conflicts)
+                + ". A report must not show an identity that contradicts the user record (R10). "
+                "Correct the user record if it is wrong, or drop the supplied value to use the record's."
+            )
+        return identity, "user_record"
+
+    missing = [
+        field
+        for field, value in (
+            ("clinician_name", clinician_name),
+            ("reg_number", reg_number),
+            ("hospital", hospital),
+        )
+        if not (value or "").strip()
+    ]
+    if missing:
+        raise SignoffError(
+            f"Cannot sign a report: {', '.join(missing)} not supplied. A clinical report shows the "
+            "signing clinician's name, registration number and hospital (R10). Pass all three, or "
+            "pass identity=ClinicianIdentity.from_user_record(...) to take them from the signing "
+            "user's own record."
+        )
+    return (
+        ClinicianIdentity(
+            full_name=cast(str, clinician_name).strip(),
+            registration_number=cast(str, reg_number).strip(),
+            hospital=cast(str, hospital).strip(),
+        ),
+        "typed_in",
+    )
+
+
+# ---------------------------------------------------------------------------
+# The clinical link (w117, 2026-09-13)
+#
+# A run that api/submission_worker.py recorded as a clinical interpretation
+# leaves a `clinical_link.json` in its output directory. Until this change
+# nothing read it: a clinician could `approve()` such a run, get a signed PDF
+# with their name on every page, and leave the CLINICAL RECORD -- the thing an
+# inspector, a LIMS and the amendment machinery all read -- still saying
+# `draft`, with no reviewer claim, no approver_id, no approved_at and no
+# content_hash. Two records of one act, disagreeing, with the authoritative
+# one wrong.
+#
+# THIS IS ONE-PERSON SIGN-OFF AND STAYS ONE-PERSON SIGN-OFF (human ruling,
+# 2026-09-13). Nothing here starts requiring a second clinician. What it does
+# is make the clinical record SAY that one person signed, using the claim kind
+# that means exactly that -- `sole_signatory` (commit 5) -- rather than
+# `accept`, which the clinical schema defines as an independent concurrence by
+# a SECOND clinician and which a same-person sign-off would therefore make a
+# false statement. Whether this product should move to two-person sign-off is
+# a separate, carded decision; this change deliberately does not make it, and
+# deliberately makes the historical record able to answer it.
+#
+# WRITE ORDER IS LOAD-BEARING AND IS CLINICAL-FIRST. The clinical writes
+# happen BEFORE the JSON rewrite, the PDF regeneration and the manifest. If
+# the clinical side refuses (wrong role, a report already approved, a bad
+# password, the database down), nothing on disk has changed and there is no
+# signed PDF anywhere. The opposite order would allow the one state this
+# module must never produce: A SIGNED PDF EXISTING WHILE THE CLINICAL RECORD
+# STILL SAYS DRAFT. The reverse residue -- a clinical record that says
+# approved while the PDF regeneration then fails -- is the survivable one: it
+# blocks delivery (the report is approved but the artefacts are stale and the
+# manifest absent, so list_pending still reports DRAFT) rather than releasing
+# something unapproved.
+#
+# AN UNLINKED RUN IS UNTOUCHED. No `clinical_link.json` means no clinical
+# record exists to keep in step, and `approve`/`override` behave exactly as
+# they did before this change -- no credentials required, no database
+# consulted, no import of the clinical package attempted.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClinicalCredentials:
+    """
+    The authenticated person performing a sign-off on a LINKED run.
+
+    A separate object rather than three more parameters on `approve`, because
+    these three travel together and never apply to an unlinked run.
+
+    `--clinician-name`/`--reg-number`/`--hospital` remain what they always
+    were: UNVALIDATED FREE TEXT for attribution on the rendered artefacts (see
+    this module's docstring on human trust). These are different in kind --
+    they are checked against the clinical platform's own identity store, and
+    the user_id they resolve to is what gets written as the claim's actor and
+    the report's approver. The two are deliberately not merged: one is a name
+    printed on a page, the other is an authenticated principal.
+    """
+
+    email: str
+    password: str
+    totp_code: Optional[str] = None
+
+
+def _clinical_link_path(output_dir: str) -> str:
+    return os.path.join(output_dir, CLINICAL_LINK_FILENAME)
+
+
+def read_clinical_link(output_dir: str) -> Optional[Dict[str, Any]]:
+    """
+    The run's `clinical_link.json` as a dict, or None when the run is not
+    linked to a clinical record.
+
+    RAISES on a link file that exists but cannot be read or parsed, rather
+    than falling back to None. The fallback would be the worse bug by far: a
+    corrupt link file would silently demote a LINKED run to the unlinked path,
+    and the unlinked path signs off without touching the clinical record at
+    all. "I could not read it" and "there is nothing to read" are different
+    answers and only one of them is safe to proceed on.
+    """
+    path = _clinical_link_path(output_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            link = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise SignoffError(
+            f"Could not read/parse '{path}': {exc}. This run IS linked to a clinical record "
+            "(the file exists), so it must not be signed off through the filesystem-only path "
+            "-- that would leave the clinical record saying 'draft' behind a signed PDF. Fix or "
+            "restore the file, then retry."
+        ) from exc
+    if not isinstance(link, dict):
+        raise SignoffError(f"'{path}' does not contain a JSON object: {link!r}.")
+    return cast(Dict[str, Any], link)
+
+
+def _link_ids(link: Dict[str, Any]) -> Tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """
+    (org_id, interpretation_id, report_id) as UUIDs.
+
+    `report_id` is nullable in the link file -- the worker writes None when the
+    record it created carried no report -- and a missing one is refused here
+    rather than worked around. Every clinical write below is scoped to a
+    report: the claim names one, submission moves one, approval signs one.
+    There is no partial version of this to fall back to.
+    """
+    missing = [k for k in ("org_id", "interpretation_id", "report_id") if not link.get(k)]
+    if missing:
+        raise SignoffError(
+            f"This run's '{CLINICAL_LINK_FILENAME}' does not name {', '.join(missing)}, so its "
+            "sign-off cannot be recorded against the clinical report it belongs to. A run whose "
+            "clinical record has no report cannot be signed off through this path."
+        )
+    try:
+        return (
+            uuid.UUID(str(link["org_id"])),
+            uuid.UUID(str(link["interpretation_id"])),
+            uuid.UUID(str(link["report_id"])),
+        )
+    except (TypeError, ValueError) as exc:
+        raise SignoffError(f"'{CLINICAL_LINK_FILENAME}' contains a malformed identifier: {exc}") from exc
+
+
+def _connect_clinical_data_access() -> Any:
+    """
+    A DataAccess over CLINICAL_DSN -- the same environment variable
+    api/submission_worker.py and api/exception_retry_worker.py already refuse
+    to start without, not a second name for the same thing.
+
+    Imported here rather than at module scope on purpose: `review/signoff.py`
+    is used on runs that have no clinical record at all, and importing
+    `clinical.data_access` (and through it psycopg) at module load would make
+    a database driver a hard requirement of every unlinked sign-off.
+    """
+    dsn = os.getenv("CLINICAL_DSN")
+    if not dsn:
+        raise SignoffError(
+            "This run is linked to a clinical record but CLINICAL_DSN is not set, so the "
+            "sign-off cannot be recorded there. Refusing rather than signing the files alone: "
+            "that would leave the clinical record saying 'draft' behind a signed PDF. Set "
+            "CLINICAL_DSN to the clinical database DSN (the same one the submission worker uses)."
+        )
+    try:
+        import psycopg
+
+        from clinical.data_access import DataAccess
+    except ImportError as exc:  # pragma: no cover -- a broken install, not a code path
+        raise SignoffError(f"This run is linked to a clinical record but the clinical layer is unavailable: {exc}")
+    return DataAccess(psycopg.connect(dsn, autocommit=False))
+
+
+def _clinical_login(
+    link: Dict[str, Any], credentials: Optional[ClinicalCredentials], data_access: Any
+) -> Tuple[Any, Any]:
+    """
+    (data_access, session) for a linked run's sign-off.
+
+    REFUSES WITHOUT CREDENTIALS. A linked run signed off with no authenticated
+    person is precisely the divergence this whole section exists to stop, so
+    the absence is an error and not a quiet fall-through to the file-only path.
+    """
+    if credentials is None:
+        raise SignoffError(
+            f"This run is linked to a clinical record ('{CLINICAL_LINK_FILENAME}' is present), so its "
+            "sign-off must be recorded there by an authenticated person -- the name/registration "
+            "number on the report are attribution text, not an identity. Supply clinical "
+            "credentials (CLI: --clinical-email, and the password in the environment variable named "
+            "by --clinical-password-env). Refusing rather than signing the files alone, which would "
+            "leave the clinical record saying 'draft' behind a signed PDF."
+        )
+    org_id, _interpretation_id, _report_id = _link_ids(link)
+    dao = data_access if data_access is not None else _connect_clinical_data_access()
+    session = dao.login(credentials.email, org_id, credentials.password, credentials.totp_code)
+    return dao, session
+
+
+def _linked_signing_identity(
+    dao: Any,
+    session: Any,
+    identity: Optional[ClinicianIdentity],
+) -> ClinicianIdentity:
+    """
+    THE IDENTITY A LINKED RUN PRINTS COMES FROM THE USER RECORD OF THE ACCOUNT
+    THAT IS SIGNING. Never from the typed-in flags. (The join between w117's
+    linked sign-off and R10's record-backed identity, 2026-09-13.)
+
+    Three reasons, and the third is the one that makes this not merely
+    preferable but required:
+
+    1. R10 kept the typed-in path for exactly one deployment -- the
+       filesystem-only one, which has no user record to read. A LINKED RUN IS
+       BY DEFINITION NOT THAT DEPLOYMENT: `approve()` has just authenticated
+       against the clinical platform and is holding the signing account's own
+       session. The one justification for typed values is absent here.
+
+    2. R10's rule is that a report must not show an identity that CONTRADICTS
+       the user record. Where the record is reachable, reading it is the only
+       way to keep that true without trusting the caller to have typed
+       correctly.
+
+    3. THE LINKED SIGN-OFF ALREADY CREATES A SECOND ANSWER TO "WHO SIGNED".
+       `approve_report` writes `approver_id = session.user_id` on the clinical
+       report, and R10's `signing_identity_for_report(session, report_id)`
+       answers "whose name, registration number and hospital does this report
+       show?" from that very column. So after a linked sign-off there are two
+       renderings of one signature: the PDF's printed string and the clinical
+       layer's answer. Typed-in values would let those two disagree -- the
+       same shape of defect (a signed artefact and the clinical record saying
+       different things about one act) that the linked path exists to close,
+       reintroduced one field over. Reading the record makes them identical by
+       construction rather than by discipline.
+
+    CONTRADICTIONS ARE REFUSED BY R10'S OWN RULE, NOT BY NEW CODE. This
+    function only decides WHERE the identity comes from; the caller hands the
+    result to `_resolve_signing_identity` as `identity=`, which already
+    refuses any typed value that disagrees and accepts ones that agree. There
+    is therefore ONE resolution path and ONE refusal message for both
+    deployments, rather than a second identity path that could drift from it.
+
+    A caller-supplied `identity` object is checked against the record here for
+    the same reason and with the same verdict: on a linked run the record is
+    authoritative, so an identity object that disagrees with it is a caller
+    bug or an attempt to sign as somebody else, and both need to be seen.
+
+    Raises `SignoffError` (from `ClinicianIdentity.from_user_record`) when the
+    signing account carries no complete identity, and `clinical`'s own
+    `IncompleteClinicianIdentityError` from `get_signing_identity` for the
+    same condition detected one layer down. Called BEFORE any clinical write
+    and before any file write, so an account without a recorded identity
+    leaves both records untouched.
+    """
+    record = ClinicianIdentity.from_user_record(dao.get_signing_identity(session, session.user_id))
+    if identity is not None:
+        disagreements = [
+            f"{field} (identity object holds {given!r}, user record holds {held!r})"
+            for field, given, held in (
+                ("full_name", identity.full_name, record.full_name),
+                ("registration_number", identity.registration_number, record.registration_number),
+                ("hospital", identity.hospital, record.hospital),
+            )
+            if given != held
+        ]
+        if disagreements:
+            raise SignoffError(
+                "Refusing to sign: the identity supplied disagrees with the signing account's own "
+                "record -- " + "; ".join(disagreements) + ". This run is linked to a clinical record, "
+                "so the identity it prints is read from the account that signs (R10). Correct the user "
+                "record if it is wrong, or drop the supplied identity to use the record's."
+            )
+    return record
+
+
+def _record_clinical_signoff(
+    dao: Any,
+    session: Any,
+    link: Dict[str, Any],
+    reason: str,
+) -> Dict[str, Any]:
+    """
+    The whole clinical half of `approve()` on a linked run, as ONE
+    authenticated person (human ruling, 2026-09-13):
+
+        login -> sole_signatory claim (with an explicit reason)
+              -> submit_for_review -> approve_report (approver = that person)
+
+    Takes an ALREADY-OPEN `(dao, session)` rather than logging in itself. One
+    login per sign-off, and the session that reads the signing identity is the
+    same one that records the claim and the approval -- so the identity the
+    PDF prints and the `approver_id` the clinical report stores cannot come
+    from two different accounts.
+
+    All four through PUBLIC DataAccess methods. Nothing here reaches into a
+    private one, which is why commit 5 added the wrappers: a delivery path
+    calling `_approve_report` directly is one refactor away from bypassing an
+    enforcement it cannot see.
+
+    THE SIGNATORY MUST HOLD BOTH THE Interpreter AND THE Approver ROLE, and
+    that is a consequence of one person doing both halves rather than a
+    relaxation of anything: `submit_for_review` has always required
+    Interpreter and `_approve_report` has always required Approver, on the
+    session and on the recorded approver both. Those checks are untouched;
+    with one person they simply land on one identity. A signatory holding only
+    one of the two is refused, by the same code that refused them before.
+
+    `reason` is required and is the signatory's stated grounds, recorded on
+    the claim. A concurrence with no grounds is not evidence -- the clinical
+    layer requires it of every claim kind and this path does not invent an
+    exception.
+
+    Returns the identifiers actually written, for the manifest and the audit
+    log, so the filesystem record can be matched to the clinical one later.
+    """
+    org_id, interpretation_id, report_id = _link_ids(link)
+
+    claim_id = dao.record_sole_signatory_claim(
+        session,
+        interpretation_id=interpretation_id,
+        report_id=report_id,
+        reason=reason,
+    )
+    dao.submit_for_review(session, report_id)
+    dao.approve_report(session, report_id)
+
+    return {
+        "org_id": str(org_id),
+        "interpretation_id": str(interpretation_id),
+        "report_id": str(report_id),
+        "claim_id": str(claim_id),
+        "claim_type": "sole_signatory",
+        "approver_user_id": str(session.user_id),
+    }
+
+
+def _record_clinical_disagreement(
+    link: Dict[str, Any],
+    credentials: Optional[ClinicalCredentials],
+    variant_key: str,
+    new_classification: str,
+    reason: str,
+    data_access: Any = None,
+) -> Dict[str, Any]:
+    """
+    The clinical half of `override()` on a linked run.
+
+    AN OVERRIDE BEFORE APPROVAL is a DISAGREEMENT CLAIM by the same person,
+    plus this module's existing file change. It is not an edit of the
+    interpretation and the clinical layer does not treat it as one: the
+    pipeline's own classification stays exactly where it was and the claim is
+    appended beside it, which is the whole reason spec 13.2 made disagreement
+    a claim.
+
+    AN OVERRIDE AFTER APPROVAL IS REFUSED, and the refusal points at the
+    amendment CONCEPT while saying plainly that the path is NOT YET AVAILABLE
+    from this tool. It used to name `clinical.data_access::create_amendment`,
+    which no command reaches: a refusal naming something a user cannot run is a
+    false claim in user-facing text, and it arrives exactly when somebody is
+    trying to act (human ruling, w119). An approved report has a content_hash over exactly what was
+    approved, and `verify_report_integrity` exists to detect content that
+    changed underneath it; quietly appending a claim to an approved report
+    would trip that as a nonconformance, and quietly rewriting the run
+    document behind it would be the nonconformance. An approved report is
+    changed by AMENDING it (a second report on the same interpretation, which
+    the clinical layer already models), never by editing the signed one.
+    Refused BEFORE any write, so a refusal leaves the directory untouched.
+
+    VARIANT KEY FORM: the clinical layer identifies a variant by the engine's
+    own `chrom-pos-ref-alt` key (reviewer_claims.variant_key's schema comment
+    says so). This module's CLI speaks `chrom:pos:ref>alt`. The conversion
+    happens here, once, from the parsed components -- not by string-munging
+    the CLI value -- so the two vocabularies meet in exactly one place.
+    """
+    org_id, interpretation_id, report_id = _link_ids(link)
+    dao, session = _clinical_login(link, credentials, data_access)
+
+    report = dao.get_report(session, report_id)
+    if report is None:
+        raise SignoffError(
+            f"This run's clinical report {report_id} was not found in organisation {org_id}. "
+            "Refusing to change the files of a run whose clinical record cannot be reached."
+        )
+    state = report.get("state")
+    if state in ("approved", "released"):
+        raise SignoffError(
+            f"Refusing to override: this run's clinical report {report_id} is already '{state}'. "
+            "An approved report is not edited -- its content_hash attests to exactly what was "
+            "approved, and changing the content behind it is the nonconformance ISO 15189 7.5 "
+            "asks to be detected, not a workflow. The remedy is an AMENDMENT -- a second report on "
+            "the same interpretation, recording the change as a new document rather than silently "
+            "altering a signed one -- and THAT PATH IS NOT YET AVAILABLE from this tool: there is "
+            "no command here that issues one. Raise it with the clinical platform's owners. "
+            "Nothing on disk has been changed."
+        )
+
+    chrom, pos, ref, alt = parse_variant_key(variant_key)
+    clinical_variant_key = f"{chrom}-{pos}-{ref}-{alt}"
+    claim_id = dao.record_disagreement_claim(
+        session,
+        interpretation_id=interpretation_id,
+        report_id=report_id,
+        variant_key=clinical_variant_key,
+        new_classification=new_classification,
+        reason=reason,
+    )
+    return {
+        "org_id": str(org_id),
+        "interpretation_id": str(interpretation_id),
+        "report_id": str(report_id),
+        "claim_id": str(claim_id),
+        "claim_type": "disagree",
+        "variant_key": clinical_variant_key,
+        "actor_user_id": str(session.user_id),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Command 1: approve
 # ---------------------------------------------------------------------------
 
 
-def approve(output_dir: str, clinician_name: str, reg_number: str, hospital: str) -> Dict[str, Any]:
+def approve(
+    output_dir: str,
+    clinician_name: Optional[str] = None,
+    reg_number: Optional[str] = None,
+    hospital: Optional[str] = None,
+    identity: Optional[ClinicianIdentity] = None,
+    clinical_credentials: Optional[ClinicalCredentials] = None,
+    clinical_reason: Optional[str] = None,
+    clinical_data_access: Any = None,
+) -> Dict[str, Any]:
     """
     Moves the run in `output_dir` from DRAFT to REVIEWED: sets
     `review_status`/`reviewed_by`/`reviewed_at` on `geper_results.json`
@@ -544,14 +1235,104 @@ def approve(output_dir: str, clinician_name: str, reg_number: str, hospital: str
     overridden) content, exactly like re-approving after any other
     change to `geper_results.json`.
 
+    WHERE THE THREE IDENTITY VALUES COME FROM (R10, human-ruled
+    2026-09-13). Preferred: `identity=ClinicianIdentity.from_user_record(...)`
+    -- the name, registration number and hospital held by the account that
+    signed, so the printed identity cannot contradict the record. Still
+    supported: the three as free text, for the filesystem-only deployment
+    that has no user record to read (`review/cli.py`). Supplying BOTH is
+    allowed only while they agree; a disagreement is refused by
+    `_resolve_signing_identity` before anything is written. The typed-in path
+    now actually enforces that all three are present -- previously only
+    argparse required them, so a programmatic caller could sign a report
+    reading "Reg. No. None".
+
     Returns the manifest dict that was also written to
-    `geper_signoff_manifest.json`. Raises `SignoffError` if `output_dir`
-    has no `geper_results.json` (nothing to approve).
+    `geper_signoff_manifest.json`. Raises `SignoffError` if the identity is
+    incomplete or contradicts the user record (checked FIRST, before the
+    directory is even read, so nothing is written), if `output_dir`
+    has no `geper_results.json` (nothing to approve), OR if this run
+    recorded a model-weight hash MISMATCH for any model (see
+    `_check_no_model_hash_mismatch`, human-ruled 2026-09-10) -- checked
+    immediately below, before any write, so a refusal here leaves the
+    directory exactly as it was.
+
+    LINKED RUNS (w117, 2026-09-13). If the output directory carries a
+    `clinical_link.json`, this run is already a clinical interpretation with a
+    clinical report, and signing only the files would leave that report saying
+    `draft` behind a signed PDF. So the sign-off is ALSO recorded through the
+    clinical layer, as ONE authenticated person: login, a `sole_signatory`
+    claim carrying `clinical_reason`, `submit_for_review`, then `approve_report`
+    with that same person as approver. See the "clinical link" section above
+    for why the claim kind is `sole_signatory` and not `accept`, and why the
+    clinical writes come FIRST.
+
+    `clinical_credentials` and `clinical_reason` are REQUIRED for a linked run
+    and IGNORED for an unlinked one, which is the only shape that leaves
+    today's behaviour untouched where there is no clinical record to keep in
+    step with. `clinical_data_access` is an injection point for tests and for
+    a caller that already holds a connection; when it is None a linked run
+    connects using CLINICAL_DSN.
+
+    ON A LINKED RUN THE THREE IDENTITY VALUES COME FROM THE SIGNING ACCOUNT'S
+    USER RECORD, NOT FROM `clinician_name`/`reg_number`/`hospital` (the join
+    between this path and R10). `identity_source` is therefore always
+    "user_record" for a linked sign-off. Typed-in values are still accepted
+    while they AGREE with the record and refused when they contradict it --
+    by `_resolve_signing_identity`, R10's own rule, rather than by a second
+    identity path that could drift from it. See `_linked_signing_identity` for
+    why: chiefly that `approve_report` writes `approver_id` on the clinical
+    report and R10's `signing_identity_for_report` reads the printed identity
+    back out of that same column, so a typed identity here would let the PDF
+    and the clinical record name different people. An account carrying no
+    recorded identity refuses before the claim, the submission, the approval
+    and every file write.
+
+    Raises `SignoffError`, before any write, when a linked run is missing
+    credentials or a reason, and propagates the clinical layer's own refusals
+    (a wrong password, a signatory without the Interpreter or Approver role, a
+    report not in `draft`) unchanged -- all of them leave the directory exactly
+    as it was.
     """
+    link = read_clinical_link(output_dir)
+
+    # UNLINKED: R10's ordering exactly as it was -- the identity is resolved
+    # before the directory is read, so an incomplete or contradicting identity
+    # refuses without anything on disk having been touched.
+    if link is None:
+        signer, identity_source = _resolve_signing_identity(clinician_name, reg_number, hospital, identity)
+
     results_path = _require_results(output_dir)
     document = _load_document(results_path)
+    _check_no_model_hash_mismatch(document)
 
-    physician = f"{clinician_name}, Reg. No. {reg_number}, {hospital}"
+    # LINKED: identity from the signing account's own record, then the clinical
+    # writes -- both before a single byte on disk changes. See the "clinical
+    # link" section's note on write order (the state this forbids is a signed
+    # PDF existing while the clinical record still says draft) and
+    # _linked_signing_identity's docstring for why the identity is read rather
+    # than typed.
+    clinical_record: Optional[Dict[str, Any]] = None
+    if link is not None:
+        if clinical_reason is None or not str(clinical_reason).strip():
+            raise SignoffError(
+                "This run is linked to a clinical record, so its sign-off is recorded there as a "
+                "'sole_signatory' claim -- and a claim requires the signatory's stated grounds. "
+                "Supply a reason (CLI: --reason). Nothing has been changed."
+            )
+        dao, session = _clinical_login(link, clinical_credentials, clinical_data_access)
+        # Read the identity BEFORE the claim, the submission and the approval:
+        # an account with no recorded identity must leave the clinical record
+        # untouched too, not approve a report it then cannot print.
+        signer, identity_source = _resolve_signing_identity(
+            clinician_name,
+            reg_number,
+            hospital,
+            _linked_signing_identity(dao, session, identity),
+        )
+        clinical_record = _record_clinical_signoff(dao, session, link, str(clinical_reason))
+
+    physician = signer.physician_string()
     patient_meta_path = _patient_meta_path(output_dir)
     patient_meta_raw = _load_existing_patient_meta_raw(patient_meta_path)
     patient_meta_raw["physician"] = physician
@@ -581,11 +1362,25 @@ def approve(output_dir: str, clinician_name: str, reg_number: str, hospital: str
         "short_pdf_sha256": _sha256_file(short_pdf_path),
         "results_json_sha256": _sha256_file(results_path),
         "content_hash": document.get("content_hash"),  # Phase 6: Clinical content hash
-        "clinician_name": clinician_name,
-        "reg_number": reg_number,
-        "hospital": hospital,
+        "clinician_name": signer.full_name,
+        "reg_number": signer.registration_number,
+        "hospital": signer.hospital,
+        # R10: WHERE the printed identity came from, recorded rather than
+        # inferred. "user_record" means it was read from the signing account
+        # and could not contradict it; "typed_in" means a human typed it at
+        # sign-off with no account behind it (the filesystem-only CLI path).
+        # An auditor reading an old manifest must be able to tell the two
+        # apart -- without this key every manifest looks equally attested,
+        # including the ones that are not.
+        "identity_source": identity_source,
+        "clinician_user_id": signer.user_id,
         "approved_at": approved_at,
         "variants": [_variant_manifest_entry(vr) for vr in document.get("variants", [])],
+        # Present only on a linked run, and the key is omitted rather than set
+        # to None on an unlinked one: "there is no clinical record" and "there
+        # is one and we did not record it" must not read the same in a manifest
+        # a forensic audit is holding.
+        **({"clinical": clinical_record} if clinical_record else {}),
     }
     with open(_manifest_path(output_dir), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
@@ -595,8 +1390,11 @@ def approve(output_dir: str, clinician_name: str, reg_number: str, hospital: str
         {
             "action": "approved",
             "output_dir": os.path.abspath(output_dir),
-            "clinician": clinician_name,
+            "clinician": signer.full_name,
+            "clinician_user_id": signer.user_id,
+            "identity_source": identity_source,
             "timestamp": approved_at,
+            **({"clinical": clinical_record} if clinical_record else {}),
         },
     )
 
@@ -618,6 +1416,8 @@ def override(
     new_classification: str,
     reason: str,
     clinician_id: str,
+    clinical_credentials: Optional[ClinicalCredentials] = None,
+    clinical_data_access: Any = None,
 ) -> Dict[str, Any]:
     """
     Layers a clinician's classification override on top of the matching
@@ -710,6 +1510,24 @@ def override(
     `variant_key` doesn't parse, no variant matches it, or the matched
     variant has no `clinical_report` (interpretation failed for it, so
     there is no classification to override).
+
+    LINKED RUNS (w117, 2026-09-13). On a run carrying `clinical_link.json`:
+
+      - BEFORE the clinical report is approved, an override is ALSO a
+        DISAGREEMENT CLAIM by the same authenticated person, recorded first,
+        followed by the file change exactly as before. The claim is appended
+        beside the pipeline's own classification, never over it.
+      - AFTER the clinical report is approved (or released), an override is
+        REFUSED and the refusal names the amendment path. A signed report's
+        content_hash attests to exactly what was approved; changing what sits
+        underneath it is the ISO 15189 7.5 nonconformance the platform exists
+        to detect, not a workflow. The refusal happens before any write, so
+        nothing on disk changes.
+
+    `clinical_credentials` is required for a linked run and ignored for an
+    unlinked one. `reason` is already required by this command and is reused as
+    the claim's stated grounds -- deliberately the same sentence, so the two
+    records cannot disagree about why.
     """
     results_path = _require_results(output_dir)
     chrom, pos, ref, alt = parse_variant_key(variant_key)
@@ -726,6 +1544,21 @@ def override(
             f"nothing to override."
         )
 
+    # Clinical side first, for the same reason approve() does it first: an
+    # approved clinical report must refuse BEFORE the run document, the PDFs
+    # and the Markdown have been rewritten underneath it.
+    link = read_clinical_link(output_dir)
+    clinical_claim: Optional[Dict[str, Any]] = None
+    if link is not None:
+        clinical_claim = _record_clinical_disagreement(
+            link,
+            clinical_credentials,
+            variant_key,
+            new_classification,
+            reason,
+            data_access=clinical_data_access,
+        )
+
     acmg = clinical_report.setdefault("acmg_classification", {})
     original_classification = acmg.get("classification") or "Not classified"
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -736,6 +1569,8 @@ def override(
         "reason": reason,
         "clinician_id": clinician_id,
         "timestamp": timestamp,
+        # Omitted entirely on an unlinked run -- see approve()'s manifest note.
+        **({"clinical": clinical_claim} if clinical_claim else {}),
     }
     variant_result.setdefault("overrides", []).append(record)
     acmg["clinician_override"] = record
@@ -785,6 +1620,7 @@ def override(
             "reason": reason,
             "clinician_id": clinician_id,
             "timestamp": timestamp,
+            **({"clinical": clinical_claim} if clinical_claim else {}),
         },
     )
 
@@ -886,7 +1722,13 @@ def list_pending(search_root: str, show_all: bool = False) -> List[Dict[str, Any
 # ---------------------------------------------------------------------------
 
 
-def withdraw(output_dir: str, reason: str, actor: str) -> Dict[str, Any]:
+def withdraw(
+    output_dir: str,
+    reason: str,
+    actor: str,
+    clinical_credentials: Optional[ClinicalCredentials] = None,
+    clinical_data_access: Any = None,
+) -> Dict[str, Any]:
     """
     Explicitly retracts a standing sign-off: removes
     `geper_signoff_manifest.json` (see `_withdraw_manifest`) and, if
@@ -922,6 +1764,65 @@ def withdraw(output_dir: str, reason: str, actor: str) -> Dict[str, Any]:
     Raises `SignoffError` if `output_dir` has no `geper_results.json`,
     or no manifest currently exists (nothing to withdraw -- this run
     was never approved, or a prior withdrawal already removed it).
+
+    LINKED RUNS (w119, 2026-09-13). `approve()` and `override()` already
+    read `clinical_link.json` and keep the clinical record in step; this
+    function did not, and it has no path to the clinical record in its
+    signature at all. On a LINKED run that meant a withdrawal removed the
+    manifest and reset `review_status` to `draft` WHILE THE CLINICAL REPORT
+    -- what an inspector, a LIMS and the amendment machinery read -- still
+    said `approved`. The human's ruling on why that is worse than the
+    routine divergence w117 closed: a withdrawal is a DELIBERATE SAFETY
+    ACT, so a record that still says `approved` afterwards contradicts a
+    clinician's explicit decision rather than merely lagging a change.
+
+    THE CLINICAL LAYER HAS NO OPERATION THAT RETRACTS AN APPROVAL, AND THIS
+    FUNCTION DOES NOT INVENT ONE. Established by reading the layer, not
+    assumed:
+
+      - `clinical/data_access.py` has no unapprove/retract/rescind method.
+        Its only public verbs past approval are `_release_report` (forward)
+        and `create_amendment` (a NEW report beside the signed one).
+      - `reports.approver_id`/`approved_at`/`content_hash` are write-once:
+        `enforce_content_immutability()` (clinical/schema.sql) raises on any
+        attempt to change them once set.
+      - The same trigger refuses to WALK STATE BACK: `IF OLD.state IN
+        ('approved','released') AND NEW.state IS DISTINCT FROM OLD.state`
+        is an exception unless it is exactly `approved -> released`. So
+        `approved -> draft` is not merely unimplemented, it is FORBIDDEN AT
+        THE DATABASE, deliberately (that comment names walking an approved
+        report back as "effectively withdrawn from the record" and refuses
+        it).
+      - `reviewer_claims.claim_type` is a closed CHECK -- 'accept',
+        'disagree', 'variant_added', 'variant_not_relevant',
+        'sole_signatory'. None of them means "the sign-off is retracted",
+        and writing one that does not mean that is how w117's own
+        `sole_signatory` ruling says a record becomes false.
+
+    SO THE CLINICAL SIDE OF A WITHDRAWAL ON AN APPROVED REPORT IS A
+    REFUSAL, which is exactly the shape `override()` already uses for the
+    same collision (see `_record_clinical_disagreement`): refuse rather
+    than half-do it, before a single byte on disk changes. The divergence
+    is closed by never creating it -- the files keep saying `reviewed`, the
+    clinical record keeps saying `approved`, and the two still agree --
+    rather than by a state transition the schema does not support. Giving
+    the clinical layer a real retraction is a schema and governance
+    question and is NOT decided here.
+
+    A LINKED RUN WHOSE CLINICAL REPORT IS NOT YET APPROVED (`draft`,
+    `under_review`, `returned`) IS WITHDRAWN NORMALLY: there is no approval
+    on the clinical side to contradict, so the file-side retraction leaves
+    the two records agreeing. That case is reachable -- `approve()` stops
+    at `under_review` when the signatory lacks the Approver role, and a
+    link file can be added to a directory that was signed off before it
+    existed.
+
+    Credentials are REQUIRED on a linked run and IGNORED on an unlinked
+    one, same rule and same reason as `approve()`: reading the report's
+    state is an authenticated act, and "I could not look" must not read the
+    same as "there was nothing to look at". `clinical_data_access` is the
+    same test/caller injection point `approve()` takes; when it is None a
+    linked run connects using CLINICAL_DSN.
     """
     results_path = _require_results(output_dir)
     manifest_path = _manifest_path(output_dir)
@@ -930,6 +1831,38 @@ def withdraw(output_dir: str, reason: str, actor: str) -> Dict[str, Any]:
             f"No '{MANIFEST_FILENAME}' found in '{output_dir}' -- nothing to withdraw (this run has "
             f"never been through approve(), or a prior withdrawal already removed it)."
         )
+
+    # LINKED: before any file change, exactly like approve(). See the
+    # docstring for why the clinical side of a withdrawal is a refusal and
+    # not a write.
+    link = read_clinical_link(output_dir)
+    clinical_state: Optional[str] = None
+    if link is not None:
+        _org_id, _interpretation_id, report_id = _link_ids(link)
+        dao, session = _clinical_login(link, clinical_credentials, clinical_data_access)
+        report = dao.get_report(session, report_id)
+        if report is None:
+            raise SignoffError(
+                f"This run's clinical report {report_id} was not found in organisation {_org_id}. "
+                "Refusing to withdraw the sign-off on the files of a run whose clinical record "
+                "cannot be reached -- that would leave the clinical record standing behind a "
+                "withdrawal nobody can see. Nothing on disk has been changed."
+            )
+        clinical_state = report.get("state")
+        if clinical_state in ("approved", "released"):
+            raise SignoffError(
+                f"Refusing to withdraw: this run's clinical report {report_id} is already "
+                f"'{clinical_state}', and the clinical record has no way to retract an approval. "
+                "An approved report's approver, approval time and content_hash are write-once and "
+                "its state cannot be walked back -- the database itself refuses it, because a "
+                "report walked back from 'approved' would be withdrawn from the record, which ISO "
+                "15189 does not permit. Withdrawing only the files would therefore leave the "
+                "clinical record saying 'approved' behind a retracted sign-off, which is the "
+                "contradiction this refusal exists to prevent. An approved report is corrected by "
+                "AMENDMENT -- a second report on the same interpretation, recording the change as a "
+                "new document -- and that path is NOT YET AVAILABLE from this tool; raise it with "
+                "the clinical platform's owners. Nothing on disk has been changed."
+            )
 
     document = _load_document(results_path)
     previous_status = document.get("review_status")
@@ -956,6 +1889,11 @@ def withdraw(output_dir: str, reason: str, actor: str) -> Dict[str, Any]:
             "reason": reason,
             "actor": actor,
             "timestamp": timestamp,
+            # Only on a linked run, and omitted rather than None on an
+            # unlinked one -- same rule as approve()'s manifest: "there is no
+            # clinical record" and "there is one and we did not look" must not
+            # read the same in an audit log.
+            **({"clinical_report_state": clinical_state} if link is not None else {}),
         },
     )
     logger.info(f"Withdrew sign-off for '{output_dir}' (was {previous_status!r}).")
@@ -965,4 +1903,5 @@ def withdraw(output_dir: str, reason: str, actor: str) -> Dict[str, Any]:
         "reason": reason,
         "actor": actor,
         "timestamp": timestamp,
+        **({"clinical_report_state": clinical_state} if link is not None else {}),
     }

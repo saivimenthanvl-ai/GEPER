@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from utils.logger import get_logger
-from report.clinical_report_builder import RESEARCH_USE_DISCLAIMER, build_clinical_report
+from report.clinical_report_builder import RESEARCH_USE_DISCLAIMER, build_clinical_report, normalize_report_revision
 from pipeline.provenance import get_stale_fallbacks
 from pipeline.stage_schemas import build_raw_evidence_bundle, validate_interpretation_result_for_report
 
@@ -26,6 +26,7 @@ class JSONResultBuilder:
         self,
         input_vcf_path: str,
         assembly: str = None,
+        assembly_note: Optional[str] = None,
         vcf_samples: List[str] = None,
         provenance_collector: Any = None,
         code_version: str = None,
@@ -33,6 +34,7 @@ class JSONResultBuilder:
         patient_consent: Optional[Dict[str, Any]] = None,
         qc_metrics: Optional[Dict[str, Any]] = None,
         service_health_registry: Any = None,
+        report_revision: Optional[Dict[str, Any]] = None,
     ):
         self.input_vcf_path = input_vcf_path
         # Genome reference build resolved by the orchestrator's assembly
@@ -44,6 +46,13 @@ class JSONResultBuilder:
         # specified" rather than a fabricated default downstream (see
         # `report/summary.py`), never guessed as "GRCh38".
         self.assembly = assembly
+        # Why there is no build, when there legitimately is none (card #15,
+        # the all-mitochondrial exception -- see
+        # pipeline/assembly_validator.py::MITO_ONLY_NOTE). Kept SEPARATE from
+        # `assembly` on purpose: `assembly` is a build token that Ensembl
+        # lookups and the LIMS export consume, and a sentence there would
+        # break them. The renderers show this in the build's place.
+        self.assembly_note = assembly_note
         # The VCF's own genotype sample column names (`VCFParser.samples`,
         # from its header line), if any -- also previously computed but
         # never surfaced. Used by `report/summary.py` to derive a real
@@ -94,6 +103,15 @@ class JSONResultBuilder:
         # bare `.get("run_complete", True)`/truthiness-assumed default,
         # so a pre-round-17 file (no `run_complete` key at all) reads as
         # incomplete rather than silently claiming completeness.
+        #
+        # Adjacent fragility, named not fixed: the `or {}` above only
+        # preserves the shared reference `self.model_checkpoints.update(...)`
+        # (orchestrator.py:922) depends on when the passed-in dict is
+        # already non-empty. If `get_model_checkpoint_identifiers()` ever
+        # returned `{}`, `or {}` would bind this attribute to a NEW dict
+        # object instead of the caller's, and the later `.update()` would
+        # enrich a dict this builder no longer shares -- silently, at
+        # construction time, before the mutation even runs.
         self.run_complete = False
         # DPDP Act 2023 consent metadata (minimal, capture-only -- see
         # report/summary.py::_parse_consent's docstring for exactly
@@ -138,6 +156,15 @@ class JSONResultBuilder:
         # falls back to the live registry rather than treating it as
         # "nothing failed".
         self.service_health_registry = service_health_registry
+        # Revision traceability (amendment / supersession / re-analysis) --
+        # see `report/clinical_report_builder.py::normalize_report_revision`.
+        # Validated HERE, at construction, so malformed facts fail before a
+        # run writes anything rather than at render time. `None` (the
+        # default, and every plain pipeline run) is written as an explicit
+        # `null`: this process cannot know whether the clinical platform
+        # will store the run as a re-analysis, so it must not claim "not a
+        # re-analysis".
+        self.report_revision = normalize_report_revision(report_revision)
 
     def add_variant_result(self, variant_result: Dict[str, Any]) -> None:
         self.variant_results.append(variant_result)
@@ -222,6 +249,7 @@ class JSONResultBuilder:
             # cwd at build time -- the only place that cwd is still known.
             "input_vcf_absolute_path": os.path.abspath(self.input_vcf_path),
             "assembly": self.assembly,
+            "assembly_note": self.assembly_note,
             "vcf_samples": self.vcf_samples,
             "variant_count": len(self.variant_results),
             "variants": self.variant_results,
@@ -327,6 +355,10 @@ class JSONResultBuilder:
             # fabricated default) whenever no consent object was
             # actually supplied in --patient-meta.
             "patient_consent": self.patient_consent,
+            # Revision-traceability flags + the banner text every surface
+            # prints (card HUMAN-CLINICAL-report-revision-traceability-...).
+            # `null` when no revision facts were supplied -- see __init__.
+            "report_revision": self.report_revision,
         }
 
     def write(self, output_path: str) -> str:
@@ -547,6 +579,24 @@ def build_variant_result(
         # Defaults to None exactly like `orphanet_result` above, so any
         # existing caller that doesn't pass this kwarg still gets a
         # fully backward-compatible result dict.
+        #
+        # DEFECT-a-field-present-by-in-place-mutation-rather-than-
+        # assignment-is-invisible-to-the-grep-everyone-runs, instance 4:
+        # by the time `normalization_result` reaches this function, it
+        # may already carry an `hgvs_c` key that `_run_normalization_stage`
+        # (the function that PRODUCES this dict) never wrote --
+        # `pipeline/orchestrator.py::run()::_process_variant::_attach_hgvs_c`
+        # mutates `normalization_result["hgvs_c"]` in place, called AFTER
+        # `_run_normalization_stage` returns but BEFORE `build_variant_result`
+        # (this function) is called. Unlike instances 2/3, this is
+        # PRE-BUILD, not post-build -- the field is already present and
+        # correct by the time it is emitted here, so the hazard is not
+        # "the document changes after you think it is finished"; it is
+        # that a reader tracing `_run_normalization_stage` alone (the
+        # natural place to look for how this dict is built) would not
+        # know a separate function adds `hgvs_c` to it afterward. This
+        # comment covers only this one instance; the mutation-vs-
+        # assignment class as a whole has no census.
         "normalization": normalization_result if normalization_result is not None else {"skipped": True},
         # New, additive keys (standalone SpliceFormer/SpliceBERT
         # splice-prediction plugins for BP7 -- see pipeline/acmg_rules.py::
@@ -575,6 +625,23 @@ def build_variant_result(
         # used automatically if the caller didn't pass this kwarg
         # explicitly, so orchestrator call sites don't have to thread it
         # through twice.
+        # DEFECT-a-field-present-by-in-place-mutation-rather-than-
+        # assignment-is-invisible-to-the-grep-everyone-runs, instance 2:
+        # `resolved_interpretation_result["priority_rank"]` LOOKS finished
+        # here -- `InterpretationResult.to_dict()` already emits
+        # `"priority_rank": None` -- but `pipeline/orchestrator.py::
+        # run()::_apply_priority_ranks` mutates it in place, AFTER
+        # `JSONResultBuilder.build()` has already returned the assembled
+        # document. A reader tracing only this function sees a real,
+        # already-assigned key and has no reason to suspect it changes
+        # again; an absent key would have invited a search, a present-
+        # but-stale one closes it. Load-bearing, do not convert to an
+        # assignment: the mutation is what keeps this same dict object
+        # in sync with `interpretation["interpretation_result"]` below
+        # (see `_apply_priority_ranks`'s own docstring) without a second
+        # write that could drift from the first. This comment covers only
+        # this key and `case_prioritization` (below); the mutation-vs-
+        # assignment class as a whole has no census.
         "interpretation_result": resolved_interpretation_result,
         # Built entirely from `resolved_interpretation_result` above (the
         # same canonical InterpretationResult dict Phase 2-4 already
@@ -618,25 +685,71 @@ def build_variant_result(
         # `pipeline.models.status.DISPLAY_ORDER`.
         "ai_model_status": ai_model_status if ai_model_status is not None else {},
         "errors": errors,
+        # DEFECT-a-field-present-by-in-place-mutation-rather-than-
+        # assignment-is-invisible-to-the-grep-everyone-runs, instance 3:
+        # this dict does NOT have a `case_prioritization` key -- and never
+        # will from this function. `pipeline/orchestrator.py::run()::
+        # _apply_case_phenotype_ranking` adds it directly to each variant
+        # dict AFTER `JSONResultBuilder.build()` has already returned the
+        # assembled document (only when the run actually supplied
+        # observed HPO terms). Documented at the mutation site
+        # (`_apply_case_phenotype_ranking`'s own docstring: deliberately
+        # a new top-level key, never nested inside `interpretation_result`,
+        # by spec); this note is the missing receiving-side half -- a
+        # reader who only traces this function has no reason to expect a
+        # key it never assigns. Same instance-2 pointer above covers why
+        # this class of post-build mutation is load-bearing and why the
+        # class as a whole has no census -- this is the second of exactly
+        # two known instances, not a complete list.
     }
 
     # AI Splicing/Regulatory Ensemble (Enformer + Borzoi via
     # pipeline/models/ensemble.py::EnsembleManager) -- additive,
     # schema-preserving key. Only added to the result dict when real
     # ensemble evidence exists (i.e. `ai_splicing_ensemble_result` was
-    # actually passed in AND at least one model produced a result).
-    # This means:
+    # actually passed in AND at least one model produced a result OR a
+    # model genuinely crashed -- see below). This means:
     #   - Every existing/legacy caller of `build_variant_result` (which
     #     never passes this kwarg) gets a result dict with EXACTLY the
     #     same set of keys as before this change -- the key is not
     #     merely empty, it is entirely absent, which is the strongest
     #     form of schema backward compatibility.
     #   - A caller that wires the ensemble in but for a variant where
-    #     both Enformer and Borzoi were unavailable also gets no key
-    #     here (there is nothing to report), matching the Markdown
-    #     renderer's "hide the section entirely" behavior for the same
-    #     case -- see report/report_generator.py::_render_ai_splicing_ensemble.
-    if ai_splicing_ensemble_result and ai_splicing_ensemble_result.get("models_used"):
+    #     both Enformer and Borzoi were CLEANLY disabled/unavailable
+    #     also gets no key here (there is genuinely nothing to report),
+    #     matching the Markdown renderer's "hide the section entirely"
+    #     behavior for that same case -- see report/report_generator.py
+    #     ::_render_ai_splicing_ensemble.
+    #
+    # `or ai_splicing_ensemble_result.get("error") is not None` (2026-09-11
+    # fix, third surface of the same defect the Markdown renderer and
+    # EnsembleManager.evaluate() were already fixed for): `error` is set
+    # by `EnsembleManager.evaluate()` ONLY on a genuine model crash,
+    # never on a clean disable, so this does not change the clean-disable
+    # case above at all -- it only stops a genuine crash from being
+    # indistinguishable, in the JSON, from a stage that was never
+    # attempted. Before this, the Markdown said "_Failed: ..._" and the
+    # JSON said NOTHING -- no key, as if nothing had ever been tried,
+    # which is a STRONGER fabricated absence than the Markdown one: a
+    # missing key is not a claim a downstream JSON consumer can be
+    # suspicious of, and JSON is the format most likely to be read by
+    # another SYSTEM rather than a person who might notice a missing
+    # section. Every OTHER additive key in this function (gnomad,
+    # clingen, uniprot, mmsplice, etc., all immediately above) already
+    # follows this exact principle -- pass through whatever real result
+    # was actually given, including any `error` it carries, and only
+    # substitute a placeholder when nothing was given at all -- this key
+    # was the one exception, checking internal content (`models_used`)
+    # rather than mere presence. There is no other stage in this
+    # function that ALSO conditionally omits its key on content (every
+    # sibling's condition is `is not None`, never a content check), so
+    # this is not copying a second precedent for the omission shape
+    # itself -- it is bringing this one key in line with the universal
+    # "never let a genuine attempt collapse into a placeholder" principle
+    # every sibling key already follows.
+    if ai_splicing_ensemble_result and (
+        ai_splicing_ensemble_result.get("models_used") or ai_splicing_ensemble_result.get("error") is not None
+    ):
         result["ai_splicing_ensemble"] = ai_splicing_ensemble_result
 
     return result

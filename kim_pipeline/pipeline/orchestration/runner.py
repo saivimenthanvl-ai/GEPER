@@ -45,6 +45,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +118,19 @@ def _load_checkpoint(work_dir: Path) -> dict[str, Any]:
 
 def _save_checkpoint(work_dir: Path, data: dict[str, Any]) -> None:
     _checkpoint_path(work_dir).write_text(json.dumps(data, indent=2))
+
+
+def _ensure_analysis_started_at(checkpoint: dict[str, Any]) -> str:
+    """Set `checkpoint["analysis_started_at"]` once, on the FIRST run of
+    this sample, and return it. A resume must keep the ORIGINAL start
+    time from the loaded checkpoint, not overwrite it with the resume
+    moment -- the reporting stage's "Generated" field reads this value,
+    and stamping resume time there answers a question nobody asked
+    (DEFECT-kim-reporting-stage-658).
+    """
+    if "analysis_started_at" not in checkpoint:
+        checkpoint["analysis_started_at"] = datetime.now(timezone.utc).isoformat()
+    return checkpoint["analysis_started_at"]
 
 
 def _collect_reference_versions(cfg: dict, reference_fasta: str) -> dict[str, str]:
@@ -394,6 +408,12 @@ class PipelineRunner:
         checkpoint = _load_checkpoint(work_dir) if self._resume else {}
         completed_stages = set(checkpoint.get("completed_stages", []))
 
+        # Saved immediately (not deferred to the next stage's own
+        # _save_checkpoint call) so a crash before stage 1 completes
+        # doesn't lose it -- see _ensure_analysis_started_at's docstring.
+        _ensure_analysis_started_at(checkpoint)
+        _save_checkpoint(work_dir, checkpoint)
+
         logger.info(
             "=== PipelineRunner START [%s] resume=%s completed=%s ===",
             sample_id,
@@ -631,6 +651,29 @@ class PipelineRunner:
                 result.stopped_after = "variant_calling"
                 result.success = True
                 return result
+
+            # ── Preflight: VCF vs GFF3 genome build ───────────────────────
+            # Deliberately placed AFTER the vcf_only early return above,
+            # not with the VCF build detection before it. In vcf_only
+            # mode kim never loads the GFF3 -- annotation and reporting
+            # do not run -- so a build disagreement between the VCF and a
+            # configured-but-unused GFF3 is not a defect of that run, and
+            # blocking it here would refuse bridge runs for a file they
+            # never open. From this point on the GFF3's transcript model
+            # IS used, to build every HGVS c. position.
+            #
+            # Raises ConfigValidationError on a definite disagreement;
+            # deliberately NOT wrapped in a try/except, unlike the
+            # detection above -- that block swallows failures to keep an
+            # advisory warning advisory, and swallowing this one would
+            # reinstate exactly the silence this check exists to end.
+            _gff_for_build_check = (self._cfg.get("annotation", {}) or {}).get("refseq_gff") or (
+                self._cfg.get("rna_analysis", {}) or {}
+            ).get("refseq_gff")
+            if _gff_for_build_check:
+                from pipeline.utils.genome_build import check_vcf_gff3_build_consistency
+
+                check_vcf_gff3_build_consistency(filtered_vcf, _gff_for_build_check)
 
             # ── Stage 2b: VEP Annotation ──────────────────────────────────
             vep_out = str(work_dir / "vep_annotation")
@@ -1003,6 +1046,7 @@ class PipelineRunner:
                     acmg_results=acmg_results,
                     ancestry_result=ancestry_result,
                     reference_versions=result.reference_versions,  # FIX 14
+                    analysis_started_at=checkpoint.get("analysis_started_at"),
                 )
                 result.report = report_result.to_dict()
                 completed_stages.add("reporting")
@@ -1060,9 +1104,13 @@ class PipelineRunner:
 def _build_cli_parser():
     import argparse
 
+    from pipeline.reporting.component_identity import PIPELINE_VERSION
+
+    # ASCII "->", not U+2192: this help must print on a default Windows
+    # (cp1252) console, which cannot encode the arrow (human ruling 2026-09-11).
     p = argparse.ArgumentParser(
-        description="Bij AI genomic pipeline: FASTQ → QC → Alignment → Variant Calling "
-        "→ Annotation → Report",
+        description=f"{PIPELINE_VERSION}: FASTQ -> QC -> Alignment -> Variant Calling "
+        "-> Annotation -> Report",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--r1", required=True, metavar="FASTQ", help="R1 FASTQ path (plain or .gz)")
@@ -1086,7 +1134,8 @@ def _build_cli_parser():
             "'vcf_only' stops after Variant Calling and returns "
             "filtered_variants.vcf, skipping Kim's own annotation/ACMG/"
             "ancestry/reporting stages — used when Kim is feeding "
-            "another interpretation pipeline (e.g. Bij AI)."
+            "another interpretation pipeline (e.g. the Bij AI "
+            "variant-interpretation component (GEPER))."
         ),
     )
     p.add_argument(

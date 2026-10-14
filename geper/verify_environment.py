@@ -1,4 +1,26 @@
 #!/usr/bin/env python3
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: GEPER environment / dependency checker
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 GEPER environment / dependency checker.
 
@@ -11,7 +33,10 @@ or `tensorflow`.
 Usage:
     python verify_environment.py
     python verify_environment.py --json          # machine-readable
-    python verify_environment.py --strict         # exit 1 on any FAIL
+
+Exit status: 1 if any check FAILs, else 0 (warnings alone exit 0). This is
+the default; `--strict`, which used to be required for it, is deprecated and
+has no effect.
 
 This script is READ-ONLY: it never installs, upgrades, or downgrades
 anything. `utils/auto_install.py` (used by the pipeline itself) is the
@@ -37,6 +62,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from component_identity import COMPONENT_NAME, SHORT_NAME
+
 # --- version-compatibility ground truth ------------------------------------
 # Kept in exactly one place (here) and mirrored by the short summary in
 # requirements.txt's header comment / README.md's "Compatibility matrix"
@@ -47,8 +74,9 @@ EXPECTED = {
     "torch": "2.7.1",
     "torchvision": "0.22.1",
     "torchaudio": "2.7.1",
-    "transformers_min": "5.12.1",
-    "transformers_max_exclusive": "6.0.0",
+    # Exact, not a range: the version the shipped image runs (Dockerfile's
+    # last-wins pin; requirements.txt matches it -- human ruling 2026-09-11).
+    "transformers": "4.56.2",
     "accelerate_min": "1.14.0",
     "accelerate_max_exclusive": "2.0.0",
     "tensorflow_min": "2.16.0",
@@ -133,7 +161,7 @@ def check_python() -> CheckResult:
     return CheckResult(
         "Python",
         "FAIL",
-        f"Python {platform.python_version()} detected; Bij AI requires "
+        f"Python {platform.python_version()} detected; {SHORT_NAME} requires "
         f"{lo[0]}.{lo[1]} <= python < {hi[0]}.{hi[1]} (evo2's own published "
         f"metadata is the binding constraint; torch/transformers/rna-fm "
         f"all separately accept a wider range).",
@@ -160,7 +188,7 @@ def check_torch() -> CheckResult:
     else:
         status = "WARN"
         detail = (
-            f"torch {torch.__version__} detected; Bij AI is pinned/tested against "
+            f"torch {torch.__version__} detected; {SHORT_NAME} is pinned/tested against "
             f"exactly {EXPECTED['torch']} because Evo2's flash-attn dependency is "
             f"compiled from source against a specific torch+CUDA ABI. A different "
             f"torch version may still work for HyenaDNA/RNA-FM/ESM2/"
@@ -191,7 +219,7 @@ def check_torchvision() -> CheckResult:
     return CheckResult(
         "torchvision",
         "WARN",
-        f"torchvision {torchvision.__version__} detected; Bij AI pins "
+        f"torchvision {torchvision.__version__} detected; {SHORT_NAME} pins "
         f"{EXPECTED['torchvision']} (PyTorch's own compatibility matrix pairing "
         f"for torch {EXPECTED['torch']}). A mismatched torch/torchvision pair is "
         f"the single most common cause of a cryptic 'undefined symbol' import "
@@ -219,7 +247,7 @@ def check_torchaudio() -> CheckResult:
         return CheckResult(
             "torchaudio",
             "WARN",
-            "torchaudio is not installed. Bij AI itself never imports it, but leaving "
+            f"torchaudio is not installed. {SHORT_NAME} itself never imports it, but leaving "
             "it absent/unpinned in a shared environment (e.g. Colab, which ships its "
             "own pre-installed torchaudio build) is exactly how a mismatched version "
             "gets pulled in later and crashes an unrelated import "
@@ -233,7 +261,7 @@ def check_torchaudio() -> CheckResult:
     return CheckResult(
         "torchaudio",
         "FAIL",
-        f"torchaudio {torchaudio.__version__} detected; Bij AI pins "
+        f"torchaudio {torchaudio.__version__} detected; {SHORT_NAME} pins "
         f"{EXPECTED['torchaudio']} (PyTorch's own compatibility matrix pairing for "
         f"torch {EXPECTED['torch']}). A mismatched torch/torchaudio pair fails with "
         f"`OSError: undefined symbol: torch_library_impl` the moment torchaudio is "
@@ -250,18 +278,19 @@ def check_transformers() -> CheckResult:
             "transformers",
             "FAIL",
             "transformers is not installed.",
-            fix=f"pip install 'transformers>={EXPECTED['transformers_min']},<{EXPECTED['transformers_max_exclusive']}'",
+            fix=f"pip install transformers=={EXPECTED['transformers']}",
         )
     import transformers  # noqa: WPS433
 
-    if _in_range(transformers.__version__, EXPECTED["transformers_min"], EXPECTED["transformers_max_exclusive"]):
+    if transformers.__version__.split("+")[0] == EXPECTED["transformers"]:
         return CheckResult("transformers", "PASS", f"transformers {transformers.__version__} detected.")
     return CheckResult(
         "transformers",
         "FAIL",
-        f"transformers {transformers.__version__} detected; Bij AI requires "
-        f">={EXPECTED['transformers_min']},<{EXPECTED['transformers_max_exclusive']}.",
-        fix=f"pip install 'transformers>={EXPECTED['transformers_min']},<{EXPECTED['transformers_max_exclusive']}'",
+        f"transformers {transformers.__version__} detected; {SHORT_NAME} pins "
+        f"{EXPECTED['transformers']} -- the version the shipped image runs "
+        f"(see requirements.txt for why).",
+        fix=f"pip install transformers=={EXPECTED['transformers']}",
     )
 
 
@@ -280,7 +309,7 @@ def check_accelerate() -> CheckResult:
     return CheckResult(
         "accelerate",
         "WARN",
-        f"accelerate {accelerate.__version__} detected; Bij AI requires "
+        f"accelerate {accelerate.__version__} detected; {SHORT_NAME} requires "
         f">={EXPECTED['accelerate_min']},<{EXPECTED['accelerate_max_exclusive']}.",
         fix=f"pip install 'accelerate>={EXPECTED['accelerate_min']},<{EXPECTED['accelerate_max_exclusive']}'",
     )
@@ -302,7 +331,7 @@ def check_tensorflow() -> CheckResult:
     return CheckResult(
         "tensorflow",
         "WARN",
-        f"tensorflow {tf.__version__} detected; Bij AI requires "
+        f"tensorflow {tf.__version__} detected; {SHORT_NAME} requires "
         f">={EXPECTED['tensorflow_min']},<{EXPECTED['tensorflow_max_exclusive']}.",
         fix=f"pip install 'tensorflow>={EXPECTED['tensorflow_min']},<{EXPECTED['tensorflow_max_exclusive']}'",
     )
@@ -531,7 +560,7 @@ def check_tabix() -> CheckResult:
         "WARN",
         "No 'tabix' binary on PATH. AlphaMissense and any locally-indexed "
         "gnomAD catalogue lookups are unavailable and will be skipped gracefully "
-        "until this is installed (Bij AI auto-installs it via apt-get on Debian/"
+        f"until this is installed ({SHORT_NAME} auto-installs it via apt-get on Debian/"
         "Ubuntu the first time it's needed).",
         fix="apt-get install tabix  (or: conda install -c bioconda htslib)",
     )
@@ -766,7 +795,7 @@ def run_all() -> Report:
 
 def print_human(report: Report) -> None:
     print("=" * 78)
-    print("Bij AI Environment Verification")
+    print(f"{COMPONENT_NAME} Environment Verification")
     print("=" * 78)
     for r in report.results:
         icon = _STATUS_ICON.get(r.status, "?")
@@ -791,7 +820,22 @@ def print_human(report: Report) -> None:
 
 
 def main() -> int:
-    strict = "--strict" in sys.argv
+    """Exit 1 when the verdict is FAIL, 0 otherwise (PASS, or WARN/SKIP only).
+
+    By default -- not only under --strict. Until 2026-09-12 this returned 0
+    on `overall: FAIL` unless --strict was passed, so anything gating on the
+    exit code was told a failing environment was fine. Human: "a check whose
+    failure exits success is a check nothing can act on."
+
+    --strict is RETIRED: still accepted, so existing commands keep working,
+    but it changes nothing (FAIL already exits 1) and says so on stderr. A
+    caller that deliberately wants the report without the gate must now say
+    so itself (e.g. `|| true`), where a reader can see it.
+    """
+    if "--strict" in sys.argv:
+        sys.stderr.write(
+            "verify_environment.py: --strict is deprecated and has no effect: a FAIL verdict now exits 1 by default.\n"
+        )
     as_json = "--json" in sys.argv
 
     report = run_all()
@@ -801,9 +845,7 @@ def main() -> int:
     else:
         print_human(report)
 
-    if strict and report.has_failures():
-        return 1
-    return 0
+    return 1 if report.has_failures() else 0
 
 
 if __name__ == "__main__":

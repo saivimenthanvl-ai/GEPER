@@ -60,19 +60,33 @@ def _assert_attribution_present(testcase: unittest.TestCase, text: str, where: s
     testcase.assertEqual(missing, [], f"{where} is missing required AlphaFold attribution substrings: {missing}")
 
 
-class TestReferencesUnconditional(unittest.TestCase):
-    """`_references()` itself: AlphaFold must appear regardless of `evidence_sources`."""
+class TestAttributionUnconditional(unittest.TestCase):
+    """
+    AlphaFold must be attributed regardless of `evidence_sources`.
+
+    REPLACES TestReferencesUnconditional, which asserted this on
+    `_references()`. Ruling (A) on the references-list card (human via god,
+    2026-09-11) split that one list: `_references()` is now only the sources
+    this run used, and the unconditional licence notices -- AlphaFold among
+    them -- are the separate `data_attribution` block. The attribution
+    guarantee these tests exist for is unchanged; only where it lives moved.
+    """
 
     def test_present_with_empty_evidence_sources(self):
-        refs = _references({"evidence_sources": []})
-        self.assertIn(_ALPHAFOLD_REFERENCE, refs)
+        cr = build_clinical_report({"evidence_sources": []}, raw_evidence={})
+        self.assertIn(_ALPHAFOLD_REFERENCE, cr["data_attribution"])
 
     def test_present_even_when_evidence_sources_never_names_alphafold(self):
         # AlphaFold never contributes ACMG evidence, so "AlphaFold DB"
         # never legitimately appears in evidence_sources -- the citation
         # must not depend on it appearing there.
-        refs = _references({"evidence_sources": ["ClinVar", "gnomAD"]})
-        self.assertIn(_ALPHAFOLD_REFERENCE, refs)
+        cr = build_clinical_report({"evidence_sources": ["ClinVar", "gnomAD"]}, raw_evidence={})
+        self.assertIn(_ALPHAFOLD_REFERENCE, cr["data_attribution"])
+
+    def test_never_listed_as_a_source_this_run_used(self):
+        # The other half of the ruling: attribution is not a claim that the
+        # run consulted AlphaFold, so it must not sit in the gated list.
+        self.assertNotIn(_ALPHAFOLD_REFERENCE, _references({"evidence_sources": ["ClinVar", "gnomAD"]}))
 
 
 def _document_with_alphafold_variant():
@@ -132,32 +146,28 @@ class TestRenderedReportsCiteAlphaFold(unittest.TestCase):
         _assert_attribution_present(self, text, "Full PDF (summary.py)")
 
     @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")
-    def test_short_pdf_has_no_references_section_at_all(self):
+    def test_short_pdf_now_cites_alphafold(self):
         """
-        NOT a regression test for the AlphaFold fix -- a documented,
-        pre-existing scope boundary. `report/summary_short.py` never
-        reads `clinical["references"]` at all (grepped: zero hits) and
-        never renders a References section for ANY source, AlphaFold or
-        otherwise (Orphanet's own unconditional citation is equally
-        absent here). It also never surfaces a distinguishable AlphaFold
-        confidence band, model version, or 3D-viewer URL -- only an
-        aggregate confidence label (`_confidence_text`) that is
-        mathematically influenced by many categories including but not
-        naming AlphaFold. Recorded here as a known, current fact rather
-        than asserted as a defect: whether CC-BY-4.0 requires attribution
-        on a summary view that never names or shows the licensed content
-        directly is a judgment call for whoever owns that decision, not
-        this test. If the short PDF is ever changed to surface AlphaFold
-        content directly (a band, version, or link), this test should be
-        replaced with one requiring attribution there too.
+        SUPERSEDES test_short_pdf_has_no_references_section_at_all, per its
+        own docstring: "If the short PDF is ever changed to surface
+        AlphaFold content directly... this test should be replaced with one
+        requiring attribution there too." That change is this one -- ruling
+        on AM-04-attribution-condition-unresolved, item 2 (human via god,
+        2026-09-11): "YES, THE SHORT PDF NEEDS A REFERENCES SECTION. A
+        sign-off document with zero source attribution is wrong independent
+        of what CC BY 4.0 requires... a clinician signing should be able to
+        see what the conclusion rests on." `report/summary_short.py` now
+        renders the same two blocks the full PDF and Markdown render
+        (ruling (A), 2026-09-11: "Evidence sources used in this run" and
+        "Data attribution"; AlphaFold is in the second, unconditionally --
+        see `_ALPHAFOLD_REFERENCE`'s own comment), so the short PDF must
+        carry the same required attribution substrings.
         """
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "short.pdf")
             generate_short_pdf(_document_with_alphafold_variant(), out)
             text = "\n".join(p.extract_text() for p in PdfReader(out).pages)
-        normalized = _normalize(text)
-        self.assertNotIn("References", normalized)
-        self.assertFalse(any(s in normalized for s in _REQUIRED_SUBSTRINGS))
+        _assert_attribution_present(self, text, "Short PDF (summary_short.py)")
 
 
 if __name__ == "__main__":

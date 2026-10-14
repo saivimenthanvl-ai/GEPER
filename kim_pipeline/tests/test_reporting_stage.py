@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pipeline.reporting.stage import ReportingStage
+from pipeline.reporting.stage import ReportingStage, _acmg_to_html_table, _variants_to_html_table
 
 
 def _fake_qc() -> dict:
@@ -170,7 +170,9 @@ class TestIssue3ClinicalReportOverhaul:
         html = Path(result.html_path).read_text()
         assert "report-footer" in html
         assert "GRCh38 (test)" in html
-        assert "Bij AI v8" in html
+        # Was "Bij AI v8" -- the whole-product name, superseded 2026-09-11
+        # (Option B): the version names the component, as the scope line does.
+        assert "Bij AI sequencing-analysis component v8" in html
         assert "Generated:" in html
 
     def test_signature_block_not_rendered(self, tmp_path):
@@ -394,3 +396,175 @@ class TestFix1ReportingPathRegression:
         assert Path(result.html_path).exists(), (
             f"ReportResult.html_path={result.html_path!r} does not exist on disk"
         )
+
+
+class TestAcmgCrashRowDoesNotFabricate:
+    """A per-variant result whose classification stage raised (shared.py's
+    per-variant Exception handler appends {..., "error": ...} with no
+    classification/clinvar_unavailable_reason/gnomad_unavailable_reason keys,
+    by construction) must render as a failure, never as a normal-looking
+    Uncertain_Significance / Found / Found row.
+    """
+
+    def _crashed_item(self):
+        return {
+            "chrom": "17",
+            "pos": 41244936,
+            "ref": "A",
+            "alt": "G",
+            "gene": "BRCA1",
+            "error": "IndexError: list index out of range",
+            "disclaimer": "Exploratory only.",
+        }
+
+    def _normal_item(self):
+        return {
+            "chrom": "13",
+            "pos": 32340000,
+            "ref": "C",
+            "alt": "T",
+            "gene": "BRCA2",
+            "classification": "Pathogenic",
+            "score": "8.5",
+            "criteria_met": ["PS1", "PM2"],
+            "criteria_unknown": [],
+            "clinvar_unavailable_reason": None,
+            "gnomad_af": 0.0001,
+            "gnomad_af_popmax": 0.0002,
+            "final_tier": "Tier1",
+            "composite_score": "0.95",
+            "disclaimer": "Exploratory only.",
+        }
+
+    def test_crashed_row_does_not_render_fabricated_defaults(self):
+        html = _acmg_to_html_table([self._crashed_item()])
+        assert "Uncertain_Significance" not in html, (
+            "a crashed variant must not render the real ACMG category "
+            "'Uncertain_Significance' as if it were a genuine classification"
+        )
+        assert ">Found<" not in html, (
+            "a crashed variant must not render a bare 'Found' for ClinVar/gnomAD "
+            "-- evidence gathering never ran"
+        )
+        assert "Found (frequency not available)" not in html, (
+            "a crashed variant must not render gnomAD's genuine-but-empty-AF "
+            "fallback text -- gnomAD was never queried"
+        )
+
+    def test_crashed_row_renders_the_captured_error(self):
+        html = _acmg_to_html_table([self._crashed_item()])
+        assert "Classification failed" in html
+        assert "IndexError: list index out of range" in html
+
+    def test_normal_row_unaffected_by_the_error_branch(self):
+        """Control: a variant with no `error` key renders exactly as before."""
+        html = _acmg_to_html_table([self._normal_item()])
+        assert "Pathogenic" in html
+        assert "Found" in html
+        assert "AF: 1.00e-04 (popmax: 2.00e-04)" in html
+        assert "Classification failed" not in html
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECT-zygosity-collapses-absent-and-malformed: caller wiring
+# ══════════════════════════════════════════════════════════════════════════════
+# `ZygosityExtractor` now distinguishes a malformed GT token from a valid
+# genotype of the same shape via `ZygosityResult.malformed` (see
+# tests/test_zygosity.py). This section proves the two named callers
+# actually surface it: `_variants_to_html_table` must not render a
+# malformed-derived category as a plain confident value, must not blank the
+# cell either (a blank cell reads as "nothing found" -- the fabricated-
+# absence defect this floor has spent the day removing), and must NOT
+# annotate a genuine no_call, which is a legitimate absence, not a failure.
+
+
+def _variant_row(**overrides) -> dict:
+    row = {
+        "chrom": "chr1",
+        "pos": 100,
+        "ref": "A",
+        "alt": "G",
+        "qual": 99,
+        "gene_name": "BRCA1",
+        "transcript_id": "ENST1",
+        "hgvs": "c.1A>G",
+        "consequence": "missense_variant",
+        "zygosity": "Hemizygous",
+        "gt": "1",
+        "dp": "30",
+        "ad": "0,30",
+        "zygosity_malformed": False,
+    }
+    row.update(overrides)
+    return row
+
+
+class TestZygosityMalformedDisclosure:
+    def test_valid_zygosity_renders_plain_value(self):
+        html = _variants_to_html_table([_variant_row()])
+        assert "<td>Hemizygous</td>" in html
+        assert "unreliable" not in html
+
+    def test_no_call_not_flagged_as_a_failure(self):
+        """The case that matters most: a legitimate absence must not start
+        looking like a failure just because malformed disclosure exists."""
+        html = _variants_to_html_table(
+            [_variant_row(zygosity="No_call", gt="./.", zygosity_malformed=False)]
+        )
+        assert "<td>No_call</td>" in html
+        assert "unreliable" not in html
+
+    def test_malformed_zygosity_discloses_value_and_reason_not_a_blank_cell(self):
+        html = _variants_to_html_table(
+            [_variant_row(zygosity="Hemizygous", gt="BAD", zygosity_malformed=True)]
+        )
+        # The category is still shown (not suppressed into a blank cell --
+        # that would read as "nothing found", the mirror defect).
+        assert "Hemizygous" in html
+        # And it says untrustworthy AND why, not just "do not trust".
+        assert "unreliable" in html
+        assert "GT field unparseable" in html
+        # It must not render as the same bare cell as the valid case.
+        assert "<td>Hemizygous</td>" not in html
+
+
+class TestZygosityMalformedWiredOntoAnnotatedVariant:
+    def test_malformed_gt_sets_zygosity_malformed_true(self):
+        from pipeline.annotation.stage import _iter_vcf
+        import tempfile
+        import os
+
+        vcf = (
+            "##fileformat=VCFv4.2\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS01\n"
+            "chr1\t100\t.\tA\tG\t99\tPASS\t.\tGT\tBAD\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".vcf")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(vcf)
+            variants = list(_iter_vcf(path))
+        finally:
+            os.unlink(path)
+        assert len(variants) == 1
+        assert variants[0].zygosity_malformed is True
+
+    def test_valid_gt_leaves_zygosity_malformed_false(self):
+        from pipeline.annotation.stage import _iter_vcf
+        import tempfile
+        import os
+
+        vcf = (
+            "##fileformat=VCFv4.2\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS01\n"
+            "chr1\t100\t.\tA\tG\t99\tPASS\t.\tGT\t0/1\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".vcf")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(vcf)
+            variants = list(_iter_vcf(path))
+        finally:
+            os.unlink(path)
+        assert len(variants) == 1
+        assert variants[0].zygosity_malformed is False

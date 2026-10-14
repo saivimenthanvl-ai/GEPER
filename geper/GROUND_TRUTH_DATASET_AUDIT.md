@@ -85,7 +85,9 @@ ClinVar entry, so a concordance check against ClinVar risks measuring
 **What is actually true, independently verified in the source (not taken on
 the framing I was handed -- see "How verified" below):**
 
-- **PP5 never fires, for any variant.** `geper/pipeline/acmg_rules.py:923-926`
+- **PP5 never fires, for any variant.** **[VERIFIED-IN-REPO @ 3c550297]**
+  `geper/pipeline/acmg_rules.py:969-974` (was `:923-926`/`:915-932`, moved
+  ~46-54 lines by unrelated work; re-verified 2026-09-10)
   sets it unconditionally `_not_evaluated`, with its own stated reason:
   "recommended against by ClinGen's SVI Working Group (Biesecker & Harrison
   2018) as circular with respect to an independent ACMG/AMP evaluation; not
@@ -99,7 +101,9 @@ the framing I was handed -- see "How verified" below):**
   the source, so it is corrected here rather than left stale.) There is
   no code path in which PP5 contributes anything, so it cannot be a
   circularity channel -- it is not a channel at all.
-- **BP6 fires but cannot move a classification.** `acmg_rules.py:3509-3522`'s
+- **BP6 fires but cannot move a classification.** **[VERIFIED-IN-REPO @ 3c550297]**
+  `acmg_rules.py:3770-3778` (was `:3509-3522`/`:3495-3528`, moved ~265-275
+  lines by unrelated work; re-verified 2026-09-10)'s
   point-combining loop explicitly skips it (`if code == "BP6": ... continue`),
   and the comment immediately above that line **names this exact
   circularity by citation**: "it would let ClinVar's own classification move
@@ -107,15 +111,21 @@ the framing I was handed -- see "How verified" below):**
   deprecation warns against." BP6 still reaches the rendered evidence
   *text* (`trace`) for transparency, but is excluded from `pathogenic_points`/
   `benign_points` -- i.e. from anything that decides the output classification.
-- **`_clinvar_crossref` (`acmg_rules.py:3419-3428`) is descriptive-only** --
+- **`_clinvar_crossref` is descriptive-only** -- **[VERIFIED-IN-REPO @
+  3c550297]** `acmg_rules.py:3675-3689` (was `:3419-3428`, moved ~248-257
+  lines by unrelated work; re-verified 2026-09-10) --
   it is not part of the combining rules at all, so it was never a channel
   either.
-- **PS1/PM5 are the only channel that actually reaches the classification**
-  (`acmg_rules.py:1116-1170`'s `_ps1`/`_pm5`, combined normally through the
-  point tally, unlike BP6). But the residual circularity here is narrower
+- **PS1/PM5 are the only channel that actually reaches the classification**,
+  combined normally through the point tally, unlike BP6 -- **[VERIFIED-IN-REPO
+  @ 3c550297]** `acmg_rules.py:1221-1245`'s `_ps1`
+  (was `:1116-1170`/`:1116-1141`, moved ~80-105 lines by unrelated work;
+  re-verified 2026-09-10). But the residual circularity here is narrower
   and subtler than "the variant's own ClinVar entry": PS1/PM5 consume
   *other* ClinVar records at the *same codon*, with the query variant's own
-  record explicitly excluded (`pipeline/ps1_pm5/decision.py:137`, "excluding
+  record explicitly excluded -- **[VERIFIED-IN-REPO @ 3c550297]**
+  `pipeline/ps1_pm5/decision.py:137` (unchanged since 2026-08-21, no
+  drift; re-verified 2026-09-10), "excluding
   this variant's own record" -- also surfaced in the user-facing trace text,
   so this exclusion is not just an internal detail but a stated, auditable
   fact of the method).
@@ -130,6 +140,39 @@ comment), `acmg_rules.py:3419-3428` (`_clinvar_crossref`'s own docstring),
 self-exclusion). This was independent verification of what I was told, not
 a restatement of it -- the same sourcing standard the rest of this document
 holds every other row to.
+
+**Re-verified 2026-09-10 (Angela, conv-angela-phase), badge convention
+copied verbatim from `VALIDATION_STUDY_DESIGN.md`'s `[VERIFIED-IN-REPO @
+<sha>]` pin, per god's dispatch after four of these five citations were
+found to have drifted 46-275 lines by an unrelated audit pass.** All five
+re-checked against `3c550297c14e46acbb2a06bc6f938ad337cef925`
+(`git rev-parse HEAD`), not against a moving branch. **Substance intact on
+all five, unchanged from what this addendum originally established --
+this pass corrects stale pointers, not a stale or wrong claim.** PP5 is
+still unconditionally `_not_evaluated` with the identical quoted reason
+text; BP6 is still excluded from `pathogenic_points`/`benign_points` by
+the identical named citation; `_clinvar_crossref` is still outside the
+combining loop; `_ps1` still returns a normally-combined `CriterionResult`;
+`pipeline/ps1_pm5/decision.py:137`'s self-exclusion text is byte-identical
+and had not drifted at all -- the one citation of five that held without
+correction. Four of five had moved (see each bullet above for the specific
+before/after ranges and approximate line delta); none had changed in
+meaning.
+
+**What this pin does and does not fix, stated per the dispatch's own
+condition, not left implicit:** the sha anchors each citation to a
+specific commit, so a future reader can run `git diff --stat 3c550297 HEAD
+-- geper/pipeline/acmg_rules.py geper/pipeline/ps1_pm5/` to see in seconds
+whether anything cited here has moved since -- it converts "is this still
+true?" into an answerable question, the same conversion
+`VALIDATION_STUDY_DESIGN.md` §0.2a describes. It does **not** make the
+citations self-verifying: a line can move again without anyone re-running
+that diff, and a pinned sha with a quoted value can still describe
+something that is subtly mischaracterised even while the quote itself
+stays exact -- the pin catches drift once someone checks for it; it does
+not check itself. `VALIDATION_STUDY_DESIGN.md`'s own PP5 row is the
+worked example of exactly that failure surviving through an identically
+diligent-looking badge for weeks.
 
 **Why this makes the original flag *stronger*, not weaker, which is the
 part worth leading with:** the record-level circularity (a variant's own
@@ -231,7 +274,7 @@ decision rather than assumed solvable by more searching.
 
 | | |
 |---|---|
-| **What it covers** | The authoritative star-allele nomenclature database for pharmacogenes (CYP2D6, CYP2C19, etc.) -- relevant specifically to kim_pipeline's PGx stage as potential ground truth for star-allele/diplotype calling, not to geper's ACMG classification. |
+| **What it covers** | The authoritative star-allele nomenclature database for pharmacogenes (CYP2D6, CYP2C19, etc.). **[CORRECTED 2026-09-10 (angela-mszpsmyw): this row originally read "relevant specifically to kim_pipeline's PGx stage as potential ground truth for star-allele/diplotype calling, not to geper's ACMG classification." `kim_pipeline/pipeline/pgx/` was deleted 2026-09-10 (merge `51320e1`, the human's ruling to remove pharmacogenomics from the clinical report) -- there is no PGx stage left for this dataset to be ground truth for, in either tree. The dataset's own facts (coverage, licensing below) are unaffected by the deletion; only the "relevant to X" framing was stale. Left in this document as a historical/reference entry rather than removed outright, since the licensing research itself remains valid if PGx work is ever reintroduced.]** |
 | **License** | **Creative Commons Attribution-NonCommercial-NoDerivs.** Explicitly non-commercial; distribution permitted only with attribution, unmodified, and not for commercial use. |
 | **Commercial-use verdict** | **Not usable.** No paid tier or licensing contact found (unlike HGMD, this is not a "buy your way in" case) -- a clean reject for a commercial product's ground truth, same shape as the OMIM/PharmVar-style research-only terms already seen twice in this codebase's history. |
 
@@ -251,7 +294,7 @@ decision rather than assumed solvable by more searching.
 
 | | |
 |---|---|
-| **What it covers** | Curated gene-drug interaction and phenotype-outcome annotations -- relevant to kim_pipeline's PGx stage as a possible evidentiary/ground-truth reference for drug-response phenotype prediction, distinct from PharmVar's star-allele nomenclature role above. |
+| **What it covers** | Curated gene-drug interaction and phenotype-outcome annotations, distinct from PharmVar's star-allele nomenclature role above. **[CORRECTED 2026-09-10 (angela-mszpsmyw): this row originally read "relevant to kim_pipeline's PGx stage as a possible evidentiary/ground-truth reference for drug-response phenotype prediction." `kim_pipeline/pipeline/pgx/` was deleted 2026-09-10 (merge `51320e1`) -- same correction and same reasoning as PharmVar's row above.]** |
 | **License, verbatim** | Fetched directly (`blog.clinpgx.org/changes-to-pharmgkb-data-licensing/`, the platform's own licensing-change announcement): **"All of PharmGKB, including these files, are now licensed under the Creative Commons Attribution-ShareAlike 4.0 International License."** Immediately followed by an added restriction beyond the CC-BY-SA baseline: **"Under no circumstances can PharmGKB data be sold for other's private or commercial use."** ShareAlike also obligates: "if you alter, amend, reuse or otherwise change PharmGKB data... all recipients shall first agree to be subject to this license" if the changed product is distributed. |
 | **Commercial-use verdict** | **Conditional -- usable, with the condition named**: base CC-BY-SA 4.0 permits commercial use of the data/derivatives, but PharmGKB's own added term blocks *reselling* the data itself. Same shape as MaveDB's CC-BY-SA score sets already handled elsewhere in this codebase (`LICENSE_AUDIT.md`'s MaveDB section) -- reading PharmGKB as an evidence reference (never redistributing its underlying database as a standalone product) avoids the resale restriction; any redistributed *derivative* would need to carry the same CC-BY-SA license forward, per ShareAlike. |
 

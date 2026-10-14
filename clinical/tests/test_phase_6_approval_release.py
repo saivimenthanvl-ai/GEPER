@@ -16,6 +16,16 @@ consumer inserts a second row rather than being refused.
 
 require_release is the gate every delivery path must call before handing
 report content to a consumer. It is a hard stop: an unapproved report refuses.
+
+w129 phase B: release, the release gate and amendment now require the
+Approver role the way approval always has. The release and require_release
+tests below previously drove those calls from `session_a` -- an
+ADMINISTRATOR session -- while passing `approver_a.user_id` as the recorded
+releaser. That combination is exactly the gap item 5 closed: the recorded
+identity was qualified and the acting session was not. They now act as
+`approver_a`. Nothing about what they assert changed; only who performs the
+release, and the file keeps `session_a` wherever the subject really is an
+administrator (creating reports, building fixtures).
 """
 
 from __future__ import annotations
@@ -83,6 +93,21 @@ def _admin_session(dao, conn, org_id, email):
         cur.execute(
             "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
             "VALUES (%s, %s, 'Administrator', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
             (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
         )
     conn.commit()
@@ -315,7 +340,7 @@ class TestReleaseReport:
     def test_release_inserts_event_and_sets_released_state(self, dao, conn, session_a, approver_a, interp_a):
         report_id = self._approved_report(dao, conn, session_a, approver_a, interp_a)
 
-        release_id = dao._release_report(session_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
+        release_id = dao._release_report(approver_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
 
         with conn.cursor() as cur:
             cur.execute(
@@ -339,8 +364,8 @@ class TestReleaseReport:
     def test_release_allows_multiple_consumers(self, dao, conn, session_a, approver_a, interp_a):
         report_id = self._approved_report(dao, conn, session_a, approver_a, interp_a)
 
-        dao._release_report(session_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
-        dao._release_report(session_a, report_id, consumer="Clinician portal", actor_id=approver_a.user_id)
+        dao._release_report(approver_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
+        dao._release_report(approver_a, report_id, consumer="Clinician portal", actor_id=approver_a.user_id)
 
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM release_events WHERE report_id = %s", (report_id,))
@@ -353,25 +378,25 @@ class TestReleaseReport:
     def test_release_rejects_draft_report(self, dao, session_a, approver_a, interp_a):
         report_id = dao.create_report(session_a, interp_a)
         with pytest.raises(ValueError, match="draft"):
-            dao._release_report(session_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
+            dao._release_report(approver_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
 
     def test_release_rejects_under_review_report(self, dao, session_a, approver_a, report_under_review_a):
         with pytest.raises(ValueError, match="under_review"):
-            dao._release_report(session_a, report_under_review_a, consumer="LIMS", actor_id=approver_a.user_id)
+            dao._release_report(approver_a, report_under_review_a, consumer="LIMS", actor_id=approver_a.user_id)
 
     def test_release_requires_consumer_named(self, dao, conn, session_a, approver_a, interp_a):
         report_id = self._approved_report(dao, conn, session_a, approver_a, interp_a)
         with pytest.raises(ValueError, match="consumer"):
-            dao._release_report(session_a, report_id, consumer="", actor_id=approver_a.user_id)
+            dao._release_report(approver_a, report_id, consumer="", actor_id=approver_a.user_id)
 
     def test_release_unknown_report_rejected(self, dao, session_a, approver_a):
         with pytest.raises(NotFoundError):
-            dao._release_report(session_a, uuid.uuid4(), consumer="LIMS", actor_id=approver_a.user_id)
+            dao._release_report(approver_a, uuid.uuid4(), consumer="LIMS", actor_id=approver_a.user_id)
 
     def test_release_cross_org_report_rejected(self, dao, conn, session_a, session_b, approver_a, approver_b, interp_b):
         report_id = self._approved_report(dao, conn, session_b, approver_b, interp_b)
         with pytest.raises(NotFoundError):
-            dao._release_report(session_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
+            dao._release_report(approver_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
 
 
 class TestRequireRelease:
@@ -382,29 +407,29 @@ class TestRequireRelease:
         _set_report_state(conn, report_id, "under_review")
         dao._approve_report(approver_a, report_id, actor_id=approver_a.user_id)
 
-        dao.require_release(session_a, report_id)  # must not raise
+        dao.require_release(approver_a, report_id)  # must not raise
 
     def test_passes_for_released_report(self, dao, conn, session_a, approver_a, interp_a):
         report_id = dao.create_report(session_a, interp_a)
         _set_report_state(conn, report_id, "under_review")
         dao._approve_report(approver_a, report_id, actor_id=approver_a.user_id)
-        dao._release_report(session_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
+        dao._release_report(approver_a, report_id, consumer="LIMS", actor_id=approver_a.user_id)
 
-        dao.require_release(session_a, report_id)  # must not raise
+        dao.require_release(approver_a, report_id)  # must not raise
 
-    def test_blocks_draft_report(self, dao, session_a, interp_a):
+    def test_blocks_draft_report(self, dao, session_a, approver_a, interp_a):
         report_id = dao.create_report(session_a, interp_a)
         with pytest.raises(ValueError, match="draft"):
-            dao.require_release(session_a, report_id)
+            dao.require_release(approver_a, report_id)
 
-    def test_blocks_under_review_report(self, dao, session_a, report_under_review_a):
+    def test_blocks_under_review_report(self, dao, session_a, approver_a, report_under_review_a):
         with pytest.raises(ValueError, match="under_review"):
-            dao.require_release(session_a, report_under_review_a)
+            dao.require_release(approver_a, report_under_review_a)
 
-    def test_unknown_report_rejected(self, dao, session_a):
+    def test_unknown_report_rejected(self, dao, session_a, approver_a):
         with pytest.raises(NotFoundError):
-            dao.require_release(session_a, uuid.uuid4())
+            dao.require_release(approver_a, uuid.uuid4())
 
-    def test_cross_org_report_rejected(self, dao, session_a, report_under_review_b):
+    def test_cross_org_report_rejected(self, dao, session_a, approver_a, report_under_review_b):
         with pytest.raises(NotFoundError):
-            dao.require_release(session_a, report_under_review_b)
+            dao.require_release(approver_a, report_under_review_b)

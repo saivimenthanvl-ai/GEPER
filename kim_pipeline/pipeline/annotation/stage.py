@@ -26,7 +26,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .gff_index import GffIndex
 from pipeline.zygosity.extractor import ZygosityExtractor
@@ -215,11 +215,18 @@ def _parse_format_fields(format_str: str, sample_str: str) -> Dict[str, str]:
     return dict(zip(keys, vals))
 
 
-def _extract_genotype(format_str: str, sample_str: str) -> Dict[str, Optional[str]]:
+def _extract_genotype(format_str: str, sample_str: str) -> Dict[str, Any]:
     """Extract GT, AD, DP, Genotype, and Zygosity from a VCF record.
 
     NOTE: preserved for backward compatibility with test imports.
-    The annotation stage now uses ZygosityExtractor internally.
+    The annotation stage now uses ZygosityExtractor internally. This
+    fallback is unreachable in production (ZygosityExtractor.extract()
+    self-guards every conversion and cannot raise -- measured with 1493
+    adversarial trials, 0 exceptions; see DEFECT-zygosity-collapses-
+    absent-and-malformed). Kept anyway per that card's ruling: dead code
+    that is fixed and on the board is safer than dead code that is
+    deleted or left silently collapsing, should it ever be reached again
+    (directly, or via a future regression in ZygosityExtractor).
     """
     fields = _parse_format_fields(format_str, sample_str)
     gt = fields.get("GT", "./.")
@@ -229,12 +236,26 @@ def _extract_genotype(format_str: str, sample_str: str) -> Dict[str, Optional[st
     zygosity = _parse_zygosity(gt)
     genotype = gt
 
+    # DEFECT-zygosity-collapses-absent-and-malformed (fallback pair, Fix B):
+    # a malformed GT token (empty/non-numeric) is still scored by
+    # `_parse_zygosity` into a real category -- computed HERE, not inside
+    # `_parse_zygosity`, whose bare-str return is load-bearing in six
+    # direct unit tests (tests/test_annotation_stage.py::TestZygosity /
+    # ::TestExtractGenotype). Mirrors ZygosityExtractor.malformed
+    # (pipeline/zygosity/extractor.py) without redefining what `Zygosity`
+    # means. NOT wired to AnnotatedVariant or the report -- that decision
+    # is reserved (a second producer behind a report cell whose wording is
+    # still under review).
+    alleles = re.split(r"[/|]", gt)
+    zygosity_malformed = any(a != "." and not a.isdigit() for a in alleles)
+
     return {
         "GT": gt,
         "AD": ad,
         "DP": dp,
         "Genotype": genotype,
         "Zygosity": zygosity,
+        "ZygosityMalformed": zygosity_malformed,
     }
 
 
@@ -365,6 +386,11 @@ class AnnotatedVariant:
     gq: Optional[int] = None
     ab: Optional[float] = None
     phase_set: Optional[str] = None
+    # DEFECT-zygosity-collapses-absent-and-malformed: True when the GT token
+    # this `zygosity` was computed from could not actually be validated as a
+    # real genotype (empty/non-numeric) -- `zygosity` itself is still a
+    # best-effort category, not a discovered fact, when this is True.
+    zygosity_malformed: bool = False
     hemizygous: bool = False
     # Raw INFO
     info: str = ""
@@ -372,6 +398,11 @@ class AnnotatedVariant:
     # These take precedence over the locally-generated hgvs field.
     vep_hgvs_c: str = ""  # VEP HGVSc (e.g. NM_000059.4:c.5266dup)
     vep_hgvs_p: str = ""  # VEP HGVSp (e.g. NP_000050.3:p.Gln1756fs)
+    # F3: VEP's own most-severe CSQ Consequence term, kept alongside (never
+    # overwriting) `consequence` above so the two independent derivations
+    # can be compared -- see `consequence_classes_disagree` near the top
+    # of this file. Detector only; not read by any stage today.
+    vep_consequence: str = ""
     # Annotation scores — populated from INFO field when present
     cadd_phred: Optional[float] = None
     revel_score: Optional[float] = None
@@ -597,6 +628,121 @@ def _extract_csq_hgvs(
     return best_hgvs_c, best_hgvs_p
 
 
+def _extract_csq_consequence(info: str, csq_fields: List[str]) -> str:
+    """VEP's own most-severe Consequence term from the CSQ INFO tag, kept
+    separate from `var.consequence` -- see that field's docstring on
+    `AnnotatedVariant` -- so the two derivations can be compared rather
+    than one silently overwriting the other.
+
+    Returns "" when CSQ is absent, matching `_extract_csq_hgvs`'s empty
+    convention. Reuses the same most-severe-entry selection as
+    `_extract_csq_hgvs` / `_extract_csq_scores` (`_SEVERITY_RANK`) so all
+    three functions pick the identical CSQ row for the same record.
+    """
+    csq_raw = ""
+    for part in info.split(";"):
+        if part.startswith("CSQ="):
+            csq_raw = part[4:]
+            break
+    if not csq_raw or not csq_fields:
+        return ""
+
+    best_rank = len(_SEVERITY_ORDER) + 1
+    best_consequence = ""
+
+    for entry_str in csq_raw.split(","):
+        values = entry_str.split("|")
+        entry: Dict[str, str] = {
+            csq_fields[i]: values[i] for i in range(min(len(csq_fields), len(values)))
+        }
+        raw = entry.get("Consequence", "")
+        consequences = raw.split("&")
+        rank = min(
+            (_SEVERITY_RANK.get(c, len(_SEVERITY_ORDER)) for c in consequences),
+            default=len(_SEVERITY_ORDER),
+        )
+        if rank < best_rank:
+            best_rank = rank
+            best_consequence = raw
+
+    return best_consequence
+
+
+# ─── Cross-derivation consequence check (F3) ─────────────────────────────────
+# kim_pipeline computes a protein consequence TWICE for the same variant:
+# `var.consequence` (this file's own GFF3 + codon_provider derivation, keyed
+# to whichever transcript `GffIndex.lookup()` resolves for this locus) and
+# VEP's own CSQ Consequence (keyed to whichever transcript VEP's own
+# most-severe ranking resolves, independently -- see `_extract_csq_consequence`
+# above). Nothing today reconciles them; `var.consequence` alone feeds the
+# ACMG is_missense/is_lof gates. This is a detector only -- it does not run
+# inside `AnnotationStage.run()` and does not change pipeline behaviour;
+# whether a disagreement should warn, block, or just be visible is a policy
+# call outside this function's scope.
+_LOF_TERMS = {
+    "transcript_ablation",
+    "splice_acceptor_variant",
+    "splice_donor_variant",
+    "stop_gained",
+    "frameshift_variant",
+    "stop_lost",
+    "start_lost",
+}
+_MISSENSE_TERMS = {"missense_variant", "protein_altering_variant"}
+_SILENT_TERMS = {
+    "synonymous_variant",
+    "stop_retained_variant",
+    "start_retained_variant",
+    "coding_sequence_variant",
+}
+_NONCODING_TERMS = {
+    "intron_variant",
+    "intergenic_variant",
+    "5_prime_UTR_variant",
+    "3_prime_UTR_variant",
+    "non_coding_transcript_exon_variant",
+    "non_coding_transcript_variant",
+    "upstream_gene_variant",
+    "downstream_gene_variant",
+    "gene_region_variant",
+    "NMD_transcript_variant",
+}
+
+
+def _consequence_class(term: str) -> str:
+    """Coarse bucket for one SO consequence term: lof / missense / inframe /
+    silent / noncoding / other. Used only to compare two independently
+    derived consequence terms at a tolerant granularity -- exact SO term
+    equality is a stricter, noisier check (e.g. "stop_gained" vs
+    "frameshift_variant" are both LOF but not equal strings)."""
+    if term in _LOF_TERMS:
+        return "lof"
+    if term in _MISSENSE_TERMS:
+        return "missense"
+    if term in ("inframe_insertion", "inframe_deletion"):
+        return "inframe"
+    if term in _SILENT_TERMS:
+        return "silent"
+    if term in _NONCODING_TERMS:
+        return "noncoding"
+    return "other"
+
+
+def consequence_classes_disagree(kim_consequence: str, vep_consequence: str) -> bool:
+    """True when kim_pipeline's own `var.consequence` and VEP's own CSQ
+    Consequence (most-severe entry, possibly "&"-joined) fall into
+    different coarse classes for the same variant -- see the module-level
+    note above `_consequence_class` for why F3 has two independent
+    derivations at all. Either empty string (not yet computed / no CSQ)
+    is not a disagreement -- there is nothing to compare yet."""
+    if not kim_consequence or not vep_consequence:
+        return False
+    vep_terms = vep_consequence.split("&")
+    kim_class = _consequence_class(kim_consequence)
+    vep_classes = {_consequence_class(t) for t in vep_terms}
+    return kim_class not in vep_classes
+
+
 def _iter_vcf(vcf_path: str, skipped: Optional[List[Dict]] = None):
     """Stream-parse a plain or gzip-compressed VCF file, yielding one
     AnnotatedVariant per ALT allele (multi-allelic records expanded).
@@ -669,11 +815,14 @@ def _iter_vcf(vcf_path: str, skipped: Optional[List[Dict]] = None):
                 qual = None
 
             # FIX 1: extract VEP-embedded scores from CSQ tag once per record
-            csq_cadd, csq_revel, csq_spliceai, csq_am = (
+            csq_cadd, csq_revel, _csq_spliceai_closed, csq_am = (
                 _extract_csq_scores(info, csq_fields) if csq_fields else (None, None, None, None)
             )
             # FIX 13: extract VEP HGVSc and HGVSp from CSQ tag
             vep_hgvs_c, vep_hgvs_p = _extract_csq_hgvs(info, csq_fields) if csq_fields else ("", "")
+            # F3: VEP's own most-severe Consequence term, captured alongside
+            # (see `consequence_classes_disagree` module-level note).
+            vep_consequence = _extract_csq_consequence(info, csq_fields) if csq_fields else ""
 
             for allele_idx, alt in enumerate(alt_alleles):
                 alt = alt.strip()
@@ -721,6 +870,7 @@ def _iter_vcf(vcf_path: str, skipped: Optional[List[Dict]] = None):
                     is_inframe_indel=is_inframe_indel,
                     vep_hgvs_c=vep_hgvs_c,
                     vep_hgvs_p=vep_hgvs_p,
+                    vep_consequence=vep_consequence,
                 )
 
                 # FIX 1: populate scores from CSQ (prefer CSQ over plain INFO)
@@ -730,17 +880,21 @@ def _iter_vcf(vcf_path: str, skipped: Optional[List[Dict]] = None):
                 var.revel_score = (
                     csq_revel if csq_revel is not None else _parse_info_float(info, "REVEL")
                 )
-                var.spliceai_score = csq_spliceai
-                if var.spliceai_score is None:
-                    val = _parse_info_float(info, "SpliceAI")
-                    if val is None:
-                        ds_ag = _parse_info_float(info, "DS_AG")
-                        ds_al = _parse_info_float(info, "DS_AL")
-                        ds_dg = _parse_info_float(info, "DS_DG")
-                        ds_dl = _parse_info_float(info, "DS_DL")
-                        sc = [x for x in [ds_ag, ds_al, ds_dg, ds_dl] if x is not None]
-                        val = max(sc) if sc else None
-                    var.spliceai_score = val
+                # SpliceAI INPUT CLOSED (licence). Illumina's pretrained
+                # SpliceAI models are CC BY-NC 4.0, which a commercial
+                # deployment cannot rely on, so no SpliceAI-derived score
+                # may reach an ACMG classification.
+                #
+                # This closes the INPUT, not a route. The 2026-08-22 remedy
+                # removed SpliceAI from VEP's plugin request, which makes
+                # `csq_spliceai` always None -- and the fallback that used
+                # to sit here read `SpliceAI=`/`DS_AG`/`DS_AL`/`DS_DG`/
+                # `DS_DL` straight out of the caller's own INFO column
+                # precisely BECAUSE that value was None. Removing the VEP
+                # route did not narrow the input; it guaranteed the
+                # fallback ran. `spliceai_score` is left at its dataclass
+                # default of None so PP3/BP4 record "not evaluated" rather
+                # than a confirmed benign result.
                 var.alphamissense_score = (
                     csq_am if csq_am is not None else _parse_info_float(info, "AM_PATHOGENICITY")
                 )
@@ -777,6 +931,7 @@ def _iter_vcf(vcf_path: str, skipped: Optional[List[Dict]] = None):
                         var.ab = zy_result.ab
                         var.phase_set = zy_result.phase_set
                         var.hemizygous = zy_result.zygosity == "hemizygous"
+                        var.zygosity_malformed = zy_result.malformed
                     except Exception as exc:
                         logger.warning(
                             "ZygosityExtractor failed for %s:%s: %s — falling back",
@@ -1144,16 +1299,11 @@ class AnnotationStage:
                     var.cadd_phred = _parse_info_float(var.info, "CADD_PHRED")
                 if var.revel_score is None:
                     var.revel_score = _parse_info_float(var.info, "REVEL")
-                if var.spliceai_score is None:
-                    val = _parse_info_float(var.info, "SpliceAI")
-                    if val is None:
-                        val = _parse_info_float(var.info, "DS_AG")
-                        ds_al = _parse_info_float(var.info, "DS_AL")
-                        ds_dg = _parse_info_float(var.info, "DS_DG")
-                        ds_dl = _parse_info_float(var.info, "DS_DL")
-                        scores = [x for x in [val, ds_al, ds_dg, ds_dl] if x is not None]
-                        val = max(scores) if scores else None
-                    var.spliceai_score = val
+                # SpliceAI INPUT CLOSED (licence) -- second of the two
+                # sites. See the note at the first site: this is the
+                # INPUT, not a route, and it is left unread so
+                # `spliceai_score` stays None and PP3/BP4 record
+                # "not evaluated" rather than a confirmed benign result.
                 if var.alphamissense_score is None:
                     var.alphamissense_score = _parse_info_float(var.info, "AM_PATHOGENICITY")
                 # RepeatMasker flag in INFO (e.g. from VEP REPEAT_REGION=1)

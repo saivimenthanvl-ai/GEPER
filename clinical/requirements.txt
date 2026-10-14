@@ -33,14 +33,32 @@ psycopg[binary]
 bcrypt
 
 # ── MFA ──────────────────────────────────────────────────────────────────────
-# Imported lazily by clinical/data_access.py::PyOtpVerifier.verify(), same
-# shape as bcrypt above. Declared preemptively: PyOtpVerifier is dormant
-# today (never instantiated in production; DataAccess's totp_verifier
-# defaults to None), so this dependency is currently unused. Do not delete it
-# as dead weight -- the moment someone wires MFA in, an undeclared pyotp
-# means the first TOTP verification meets a ModuleNotFoundError instead of a
-# code prompt.
+# Imported lazily by clinical/data_access.py::PyOtpVerifier.matching_step(),
+# same shape as bcrypt above.
+#
+# UPDATED w164: THIS IS NO LONGER PREEMPTIVE. The line above used to say
+# PyOtpVerifier was "dormant today (never instantiated in production)" and
+# warned that deleting it would surface as a ModuleNotFoundError the moment
+# somebody wired MFA in. Somebody did. `DataAccess.__init__` now defaults
+# `totp_verifier` to `PyOtpVerifier()`, so every production construction
+# carries one, and the lazy import means an absent pyotp still would not show
+# at startup -- it would show at the first second factor.
 pyotp
+
+# ── MFA: the key that protects the stored secret ──────────────────────────────
+# Imported lazily by clinical/data_access.py::FernetSecretCipher, and ONLY when
+# CLINICAL_TOTP_SECRET_KEYS is set -- a deployment that has not turned MFA on
+# never touches it. Fernet is AES-128-CBC with an HMAC-SHA256 over the
+# ciphertext; the standard library has no AEAD, and the alternative to a
+# maintained implementation is writing a cipher for a clinical product.
+#
+# UNPINNED, matching every other line in this file. THE CI JOB THAT NEEDS IT
+# ALREADY INSTALLS THIS FILE (.github/workflows/pytest.yml, clinical-tests:
+# `pip install -r requirements.txt`). The geper-tests job installs bcrypt only
+# and does NOT need this one: it builds DataAccess without a key configured, so
+# `default_secret_cipher()` returns None and the import is never reached -- the
+# same measurement that job's own comment already records.
+cryptography
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 # httpx is required by starlette's TestClient, which raises RuntimeError --

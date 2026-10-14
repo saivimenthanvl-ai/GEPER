@@ -9,8 +9,11 @@ build-backend = "setuptools.build_meta"
 # which also carried version 12.0.0 against the root's 1.0.0, so any
 # resolution decided by a version number went the same way, silently.
 name = "kim-pipeline"
-version = "12.0.0"
-description = "Bij AI — Genomic Evidence Pipeline with Evidence-based Risk assessment (v8)"
+# Read from Kim's single version source at build time -- see
+# [tool.setuptools.dynamic] below. 12.0.0 was typed here in the first
+# commit (cb79edc) with no basis; nothing ever read it.
+dynamic = ["version"]
+description = "Bij AI sequencing-analysis component v8 — Sequencing analysis from FASTQ: QC, alignment and variant calling, with ACMG classification of the variants called here."
 readme = "docs/INSTALL.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -78,6 +81,10 @@ where = ["."]
 # CONTRIBUTING.md, "Why not just pytest at the repo root".
 include = ["pipeline*", "api*"]
 
+[tool.setuptools.dynamic]
+# Static read (setuptools parses the literal; nothing is imported).
+version = { attr = "pipeline.reporting.component_identity.VERSION" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
@@ -122,7 +129,6 @@ ignore_missing_imports = true
 # HEAD. Genuine tidy candidates, ignored here only to keep an unrelated
 # commit from making unreviewed edits to reviewed files -- NOT because
 # they are right. Worth a pass of their own.
-"pipeline/pgx/stage.py" = ["E402", "F841"]
 # F821 USED TO BE IGNORED HERE AND IS NOT ANY MORE, BECAUSE IT WAS FIXED
 # RATHER THAN TOLERATED. The undefined name was `RnaTranscriptAnalyser` in
 # a return annotation on `_make_analyser`. The class is real
@@ -132,4 +138,10 @@ ignore_missing_imports = true
 # carried the annotation -- a stray, not a typing decision -- so it was
 # removed. An ignore left in place for a resolved error is a false
 # statement in the config: it reads as protection and provides none.
-"tests/test_all_fixes_regression.py" = ["E402", "F841"]
+# THE SAME IS NOW TRUE OF THIS ENTRY'S E402 HALF: verified inert against an
+# isolated config (2026-09-10 per-file-ignore audit) -- zero E402
+# violations remain in this file, only the one F841 below. Narrowed rather
+# than left as a half-dead entry for the same reason F821 was removed
+# above: an ignore for a resolved error reads as protection and provides
+# none.
+"tests/test_all_fixes_regression.py" = ["F841"]

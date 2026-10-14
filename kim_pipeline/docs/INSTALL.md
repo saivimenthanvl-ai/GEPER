@@ -1,4 +1,4 @@
-# Bij AI v8 — Installation Guide
+# Bij AI sequencing-analysis component v8 — Installation Guide
 
 ## System Requirements
 
@@ -12,6 +12,19 @@
 ```bash
 git clone https://github.com/your-org/geper.git
 cd kim_pipeline
+
+# Create and activate a virtual environment before the first `pip install`
+# below. Every `pip install` later in this file -- including
+# `pip install gunicorn` in "Start the API Server" -- must land in this
+# same interpreter, or the gunicorn arbiter can end up with a different
+# dependency set than the app it's serving (a pip-generated console
+# script embeds the absolute path of whichever interpreter ran that
+# install). This file had no existing venv convention, so this is the
+# plain stdlib one.
+python -m venv .venv
+source .venv/bin/activate      # Linux/macOS/WSL2
+# .venv\Scripts\activate       # Windows (PowerShell/cmd), if not using WSL2
+
 pip install -r requirements.txt
 ```
 
@@ -47,7 +60,7 @@ Set in `config/production.yaml`:
 clinvar:
   tsv_gz_path: "/data/clinvar/variant_summary.txt.gz"
 ```
-Without this file, Bij AI falls back to live NCBI Entrez REST queries (requires internet, rate-limited to 3 req/s without API key).
+Without this file, the sequencing-analysis component falls back to live NCBI Entrez REST queries (requires internet, rate-limited to 3 req/s without API key).
 
 ### gnomAD (local — optional)
 ```bash
@@ -59,7 +72,7 @@ for CHR in {1..22} X Y; do
        -O /data/gnomad/gnomad.genomes.v4.1.sites.chr${CHR}.vcf.bgz.tbi
 done
 ```
-Without this, Bij AI uses the gnomAD GraphQL API (live, requires internet).
+Without this, the sequencing-analysis component uses the gnomAD GraphQL API (live, requires internet).
 
 ### OMIM (retired 2026-08-20)
 **OMIM has been removed from kim_pipeline effective 2026-08-20 due to licensing restrictions.** OMIM's terms state: "This resource is intended for purely research purposes" and "Commercial use of the resource would require licensing." GEPER's ratified positioning as a commercial product is what conflicts with OMIM's "purely research purposes" terms, independent of whether it interprets, prioritises, or performs any diagnostic function.
@@ -94,7 +107,7 @@ vim config/production.yaml
 
 ## PDF Report Generation
 
-Bij AI tries WeasyPrint first, then wkhtmltopdf:
+The sequencing-analysis component tries WeasyPrint first, then wkhtmltopdf:
 
 ```bash
 # Option 1: WeasyPrint (recommended)
@@ -133,10 +146,43 @@ gunicorn api.main:app -k uvicorn.workers.UvicornWorker \
 
 # Docker
 docker build -t geper-v8 .
+
+# The image built above has NO default entrypoint that serves anything: its
+# CMD is a bare interactive shell (see the root Dockerfile's own comment on
+# that line -- it deliberately does not force one of GEPER-standalone /
+# Kim-standalone / the combined bridge as THE entrypoint, since hard-coding
+# one would demote the other two). `docker run` with no command override
+# does not start the API -- it starts (and, with no -it flags, immediately
+# exits) a shell. Override the command explicitly to serve it:
 docker run -p 8000:8000 \
   -v /data:/data \
   -e NCBI_API_KEY=your_key \
-  geper-v8
+  -e GEPER_API_KEYS=key1,key2 \
+  -e GEPER_CORS_ORIGINS=https://your-frontend.example.com \
+  geper-v8 \
+  python kim_pipeline/main.py serve --host 0.0.0.0
+
+# GEPER_API_KEYS/GEPER_CORS_ORIGINS are not optional here -- api/main.py
+# refuses to start without them (FIX #3, same gate as the bare-metal
+# examples above); set GEPER_DEV_INSECURE=1 instead for a throwaway local
+# container only. --host 0.0.0.0 is required on this specific invocation
+# even though `main.py serve` itself now defaults to 127.0.0.1 -- a
+# container must bind every interface to be reachable via -p from outside
+# it; that default is correct for a bare-metal/local run and wrong here.
+#
+# NOT VERIFIED BY ACTUALLY RUNNING THIS CONTAINER -- reasoned from reading
+# the Dockerfile and main.py, not confirmed by execution (this session was
+# not authorised to build or run an image; see clinical/Dockerfile's own
+# commit 1b895b3 for what an actually-started-and-probed verification
+# looks like, for contrast). What IS confirmed by reading rather than
+# assumed: fastapi and uvicorn are installed into this image
+# (kim_pipeline/requirements.txt is pip-installed at Dockerfile:243), and
+# `python <script>` sets sys.path[0] to the script's own directory
+# regardless of the process's cwd (standard CPython behaviour, not
+# specific to this image) -- so `api.main:app` should resolve correctly
+# from WORKDIR /app once main.py runs. If this does not work as written,
+# that gap is real and worth reporting, not a reason to fall back to
+# reading this as a shell.
 ```
 
 ## Run Tests

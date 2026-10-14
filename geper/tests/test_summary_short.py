@@ -229,7 +229,7 @@ class TestFlowableBuilders(unittest.TestCase):
     def test_identity_block_shows_deidentified_label_by_default(self):
         from report.summary import _parse_patient_meta
 
-        table = _build_identity_block(_parse_patient_meta(None), "S1", "R1", "GRCh38", 3, _STYLES)
+        table = _build_identity_block(_parse_patient_meta(None), "S1", "R1", "GRCh38", 3, None, _STYLES)
         text = " ".join(cell.text for row in table._cellvalues for cell in row)
         self.assertIn("De-identified", text)
         self.assertIn("S1", text)
@@ -243,7 +243,7 @@ class TestFlowableBuilders(unittest.TestCase):
             "physician": "Dr Who",
             "deidentified": False,
         }
-        table = _build_identity_block(patient, "S1", "R1", "GRCh38", 3, _STYLES)
+        table = _build_identity_block(patient, "S1", "R1", "GRCh38", 3, None, _STYLES)
         text = " ".join(cell.text for row in table._cellvalues for cell in row)
         self.assertIn("Test Patient", text)
         self.assertIn("Date of Birth", text)
@@ -350,6 +350,57 @@ class TestGenerateShortPdf(unittest.TestCase):
             self.assertNotIn("Supporting Evidence", text)
             self.assertNotIn("Mean Coverage Depth", text)
             self.assertNotIn("Very Strong", text)  # criteria-table strength column
+
+    @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")
+    def test_references_appear_when_run_used_that_source(self):
+        # AM-04/#10 ruling: a sign-off document must show what the
+        # classification rests on. `references` is read straight off
+        # `candidate_interpretation` -- the same list
+        # `report/clinical_report_builder.py::_references()` already
+        # gates on `evidence_sources` -- never a static catalogue this
+        # module invents on its own.
+        #
+        # Heading REPLACED per ruling (A) on the references-list card
+        # (2026-09-11): the gated list is now labelled "Evidence sources
+        # used in this run", separate from the "Data attribution" block
+        # of fixed licence notices.
+        alphamissense_ref = (
+            "AlphaMissense -- Cheng et al. 2023, Science (DOI: 10.1126/science.adg7492); "
+            "Copyright (2023) DeepMind Technologies Limited, available under CC-BY-4.0."
+        )
+        clinical = _clinical()
+        clinical["references"] = [alphamissense_ref]
+        doc = {**_document(1)}
+        doc["variants"][0]["candidate_interpretation"] = clinical
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "short.pdf")
+            generate_short_pdf(doc, out)
+            text = "\n".join(p.extract_text() for p in PdfReader(out).pages)
+        self.assertNotIn("References:", text)
+        flat = " ".join(text.split())
+        self.assertIn("Evidence sources used in this run:", flat)
+        self.assertIn("AlphaMissense", flat)
+        self.assertLess(flat.index("Evidence sources used in this run:"), flat.index("AlphaMissense"))
+        self.assertLess(flat.index("AlphaMissense"), flat.index("Data attribution:"))
+
+    @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")
+    def test_references_absent_when_run_never_used_that_source(self):
+        # Same renderer, same document shape, only the upstream-computed
+        # `references` list differs (here: empty, as a run that never
+        # queried AlphaMissense would produce) -- proving this is a
+        # dynamic read of that field, not a fixed bibliography the
+        # short PDF prints regardless of what the run actually did.
+        clinical = _clinical()
+        clinical["references"] = []
+        doc = {**_document(1)}
+        doc["variants"][0]["candidate_interpretation"] = clinical
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "short.pdf")
+            generate_short_pdf(doc, out)
+            text = "\n".join(p.extract_text() for p in PdfReader(out).pages)
+        flat = " ".join(text.split())
+        self.assertIn("Evidence sources used in this run: No evidence sources contributed", flat)
+        self.assertNotIn("AlphaMissense", flat)
 
 
 @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")

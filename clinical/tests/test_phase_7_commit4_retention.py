@@ -114,6 +114,38 @@ def _admin_session(dao, conn, org_id, email):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        # w129 phase B: create_amendment now requires Approver, the way
+        # _approve_report always has. This file's subject is RETENTION and
+        # tombstone cascade, not authority: it needs an amendment and its
+        # notification to exist so it can watch them cascade. This account
+        # does every job in its organisation, so it holds the role for the
+        # work it performs. Roles are additive -- still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at, basis) "
+            "VALUES (%s, %s, 'Approver', %s, %s, %s)",
+            (
+                user_id,
+                org_id,
+                user_id,
+                datetime.datetime(2026, 9, 1, tzinfo=timezone.utc),
+                "w129 test fixture: amends the reports it signs",
+            ),
+        )
     conn.commit()
     return dao.login(email, org_id, "password")
 
@@ -727,7 +759,11 @@ def _full_unit(dao, conn, session, suffix="1", dob=_ADULT_DOB):
     """
     chain = _full_chain(dao, conn, session, suffix=suffix, dob=dob)
     claim_id = dao._record_accept(
-        session, interpretation_id=chain["interp_id"], actor_id=session.user_id, reason="Concur."
+        session,
+        interpretation_id=chain["interp_id"],
+        report_id=chain["report_id"],
+        actor_id=session.user_id,
+        reason="Concur.",
     )
 
     released_at = NOW - timedelta(days=chain["retention_days"] + 1)

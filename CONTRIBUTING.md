@@ -227,6 +227,31 @@ standing the floor already gives `bad-*` and `.triaged` artifacts, for
 the same reason: nobody who didn't create something gets to decide it is
 disposable.
 
+### That container is a **Docker** container, and its running state is not
+
+The port above tells you where it listens. It does not tell you that it is
+a container, that a container is either running or not, or that a reboot
+ends every container on the machine. Before this paragraph the word
+"docker" appeared **zero** times in this file, while the container itself
+was named -- the dependency was documented and its *volatility* was not.
+
+```bash
+docker ps -a --filter name=kelly-clinical-test   # is it there, is it Up
+docker start kelly-clinical-test                 # starting it is safe
+```
+
+**Use `127.0.0.1`, not `localhost`, in `CLINICAL_TEST_DSN`.** Measured: when
+the database is unreachable, `localhost` costs 20s per test rather than 10s,
+because psycopg tries both address families and each waits out the full
+timeout. Against a live database the two are equivalent; against a stopped
+container the documented form is twice the wait.
+
+If it is down and you run the suite anyway, `clinical/tests/conftest.py`
+now stops the session in about three seconds with a message naming the
+address. It used to be ~500 errors reading only `psycopg.errors.
+ConnectionTimeout: connection timeout expired`, which names no host, no
+port and no container, and which arrives immediately after your own edit.
+
 ### Why not just `pytest` at the repo root
 
 It fails collection outright:
@@ -270,7 +295,7 @@ or `shared/`, and the reverse holds too.
 exactly one name, to an absolute path:
 
 ```python
-MAPPING: dict[str, str] = {'shared': 'C:\\Users\\kisla\\GEPER\\shared'}
+MAPPING: dict[str, str] = {"shared": "C:\\Users\\kisla\\GEPER\\shared"}
 ```
 
 That path is **the shared checkout**, not your worktree. From a
@@ -366,13 +391,33 @@ having them) -- it's to re-verify after they run, not just before:**
    hook-reported changes, since the tree is already in the shape the
    hooks want.
 
-The one thing this doesn't solve: there is no CI in this repository
-(no `.github/workflows`) to catch a case where step 3 was skipped, so
-this discipline is presently enforced by habit, not by tooling. A
+**[CORRECTED 2026-09-10 (meredith-msydpy6m): this paragraph previously
+read "The one thing this doesn't solve: there is no CI in this
+repository (no `.github/workflows`) to catch a case where step 3 was
+skipped, so this discipline is presently enforced by habit, not by
+tooling." That has been false since the `pytest` GitHub Actions
+workflow was added (commit `065d0fb`, "CI: run pytest on both geper/
+and kim_pipeline/ on every push") -- eleven days before this section's
+own worked example of the risk it describes. Corrected below, not
+merely re-dated: CI does exist and would catch a skipped step 3, but
+only once the commit is pushed, which is a separate, often-delayed
+decision on this project.]**
+
+CI runs the full test suite -- `geper/`, `kim_pipeline/`, `clinical/`,
+and `shared/`, plus the same mypy scope as the hook above but over its
+whole configured file list rather than only the files a given commit
+touches -- on every `push` and `pull_request`, on a fresh checkout
+independent of anyone's local machine or `pre-commit install` state. A
+skipped step 3 that broke something *will* surface there.
+
+**What this does not close: CI runs on push, and a commit can sit
+local, unpushed, for as long as its author chooses.** A mistake made at
+step 3 is invisible until the next push, which may not be soon. A
 `pre-commit run --files <changed files>` invoked manually *before* your
 first `git commit` attempt (rather than discovering the mutation via a
-blocked commit) surfaces the same rewrite earlier and is worth doing
-for any change you're not prepared to re-verify twice.
+blocked commit) surfaces the same rewrite immediately and locally, and
+is worth doing for any change you're not prepared to re-verify twice
+before it leaves your machine.
 
 To run all hooks against the whole repo on demand (not just staged
 files) -- useful right after first installing, or before a large PR:

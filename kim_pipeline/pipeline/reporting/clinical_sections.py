@@ -22,6 +22,16 @@ from typing import Any, Dict, List, Optional
 from pipeline.annotation.stage import CONSEQUENCE_NOT_DETERMINED
 
 
+# ─── What this report is ───────────────────────────────────────────────────────
+
+# Ratified wording (2026-09-11, Option B): names THIS tree as a component of
+# Bij AI rather than as the whole product. One constant, rendered by both the
+# HTML report (stage.py) and the ReportLab PDF (pdf_report.py), so the two
+# cannot drift -- defined in the import-free component_identity.py (so
+# main.py --help can print it too) and re-exported here.
+from pipeline.reporting.component_identity import SCOPE_LINE  # noqa: E402,F401
+
+
 # ─── Patient metadata ───────────────────────────────────────────────────────────
 
 _DEIDENTIFIED_LABEL = "De-identified / Research Sample"

@@ -1,7 +1,7 @@
 """
 api/main.py
 ────────────
-GEPER production FastAPI application.
+Bij AI sequencing-analysis component (Kim) production FastAPI application.
 
 Endpoints
 ---------
@@ -66,6 +66,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from pipeline.orchestration.runner import PipelineRunner
+from pipeline.reporting.component_identity import COMPONENT_NAME, VERSION
 from shared.process_control import request_termination_async
 from api.run_store import RunStore
 
@@ -194,15 +195,21 @@ async def _require_api_key(x_api_key: str = Header(default="")) -> None:
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Bij AI Genomics Pipeline API",
+    # Scoped 2026-09-11: this app imports only Kim's PipelineRunner and
+    # serves only FASTQ/FASTA upload and Kim pipeline runs. The DISCLAIMER
+    # sentence below names the PRODUCT (ratified intended-use text) and is
+    # deliberately left as it is.
+    title=f"{COMPONENT_NAME} API",
     description=(
-        "Production API for the Bij AI clinical genomics pipeline. "
+        f"Production API for the {COMPONENT_NAME} (Kim). "
         "Accepts FASTQ inputs and returns annotated variant reports. "
         "DISCLAIMER: Bij AI assists qualified clinicians and pathologists; it produces a draft "
         "classification requiring qualified human review and final sign-off before any clinical "
         "use, and does not independently provide final clinical interpretation."
     ),
-    version="8.0.0",
+    # Kim's single version source (component_identity.VERSION); also what
+    # /health returns via app.version.
+    version=VERSION,
     contact={"name": "Geper Team"},
     license_info={"name": "Proprietary"},
     openapi_tags=[
@@ -517,11 +524,11 @@ _CONFIG_ALLOWLIST: Dict[str, Any] = {
         "pm2_af_max": True,
         "pp3_cadd_phred": True,
         "pp3_revel": True,
-        "pp3_spliceai": True,
         "pp3_alphamissense": True,
         "bp4_cadd_phred": True,
         "bp4_revel": True,
-        "bp4_spliceai": True,
+        # pp3_spliceai / bp4_spliceai removed 2026-09-11: dead thresholds,
+        # see config/default.yaml.
     },
     "evidence_engine": {
         "weight_acmg": True,
@@ -657,7 +664,7 @@ async def _save_upload(file: UploadFile, allowed_suffixes: tuple) -> str:
                 )
             out.write(chunk)
 
-    logger.info("Uploaded file: %s → %s (%d bytes)", file.filename, dest.name, written)
+    logger.info("Uploaded file: %s -> %s (%d bytes)", file.filename, dest.name, written)
     return str(dest)
 
 
@@ -865,6 +872,23 @@ def _get_run(run_id: str) -> Dict:
     return run
 
 
+def _snapshot_run(run: Dict) -> Dict:
+    """Shallow-copy `run` -- the shared `_RUNS[run_id]` object also written by
+    `_run_pipeline_sync` (a background thread) and `_on_done` (its
+    done-callback) with zero locking. `dict(run)` is a single call that never
+    releases the GIL back to another Python-level thread mid-copy, so the
+    result is a self-consistent view of every key as of one instant, even
+    though nothing here prevents a writer from continuing to mutate `run`
+    itself afterward. Ruled 2026-09-11: "a lock around three unsynchronised
+    contexts invites a fourth that forgets it. Snapshot makes the read atomic
+    by construction rather than by everyone's discipline." A caller must
+    build its response from THIS return value, never from `run` again --
+    reading `run` after taking the snapshot reintroduces the exact torn read
+    this exists to close.
+    """
+    return dict(run)
+
+
 @app.get(
     "/api/v1/pipeline/{run_id}/status",
     tags=["pipeline"],
@@ -880,7 +904,10 @@ async def pipeline_status(
     if run["status"] == "running":
         _refresh_progress_from_checkpoint(run_id, run)
 
-    return RunStatusResponse(**{k: run[k] for k in RunStatusResponse.model_fields if k in run})
+    snapshot = _snapshot_run(run)
+    return RunStatusResponse(
+        **{k: snapshot[k] for k in RunStatusResponse.model_fields if k in snapshot}
+    )
 
 
 @app.get(
@@ -893,11 +920,12 @@ async def pipeline_progress(run_id: str, _auth: None = Depends(_require_api_key)
     run = _get_run(run_id)
     if run["status"] == "running":
         _refresh_progress_from_checkpoint(run_id, run)
+    snapshot = _snapshot_run(run)
     return {
         "run_id": run_id,
-        "status": run["status"],
-        "stage": run.get("stage"),
-        "progress_pct": run["progress_pct"],
+        "status": snapshot["status"],
+        "stage": snapshot.get("stage"),
+        "progress_pct": snapshot["progress_pct"],
     }
 
 

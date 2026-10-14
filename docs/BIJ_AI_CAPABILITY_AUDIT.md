@@ -64,10 +64,16 @@ audit's subject.
 - **Genome build**: `detect_vcf_assembly` (pipeline/assembly_validator.py:
   54-79) scans VCF header markers, falls back to contig-length
   fingerprinting (GRCh37 249,250,621 vs GRCh38 248,956,422).
-  `validate_assembly` (:92-131): undetermined → warns, proceeds (never
-  blocks). Detected build vs. `--assembly` disagreement → raises
-  `AssemblyMismatchError` (:119-129), halts before any variant is
-  processed.
+  `validate_assembly`: undetermined AND no `--assembly` → raises
+  `AssemblyMismatchError`, halting the run (changed 2026-09-10; it
+  previously warned and proceeded, which let Ensembl's default build
+  silently become the answer). Undetermined but `--assembly` given →
+  warns and proceeds, because the caller has established the build.
+  Detected build vs. `--assembly` disagreement → raises
+  `AssemblyMismatchError`, halts before any variant is processed.
+  Cited by function name rather than line number: the previous version
+  of this entry carried `:92-131` and `:119-129`, both of which had
+  moved.
 - **Outputs**, all confirmed as actual file-write calls in
   `GeperPipeline.run` (pipeline/orchestrator.py): `geper_results.json`
   (:883,953), `geper_report.md` (:954), `geper_report_full.pdf` (:963-971,
@@ -98,17 +104,32 @@ audit's subject.
   (pipeline/utils/genome_build.py:36). `detect_genome_build` (:54-119):
   header → contig-length lookup → weak chr-prefix guess; never raises.
   `warn_if_unsupported_build` (:122-155): **non-blocking**, logs only,
-  never halts. `runner.py:601-614` runs this post-variant-calling,
-  non-fatally. `config_validator.py` has **no** genome-build validation
-  section at all.
+  never halts. `runner.py` runs this post-variant-calling, non-fatally.
+  **UPDATED 2026-09-10**: this entry previously ended "`config_validator.py`
+  has **no** genome-build validation section at all", which is no longer
+  the whole picture. `genome_build.py::check_vcf_gff3_build_consistency`
+  now compares the input VCF against the transcript GFF3 and RAISES
+  `ConfigValidationError` on a definite disagreement -- the first
+  blocking genome-build check in kim. It is called from `runner.py`
+  AFTER the vcf_only early return, so it applies to standalone runs
+  (`--mode full`, the default), which are the runs that build HGVS `c.`
+  positions from the GFF3; a bridge run never loads that file.
+  `config_validator.py` itself still has no build section -- the check
+  lives with the other build logic and reuses that module's exception.
 - **Outputs, vcf_only mode**: `qc_report.json`/`.html`, `aligned.markdup.bam`
   +`.bai`+`alignment_metrics.json`, `variants.vcf` (raw FreeBayes),
   `variants.norm.vcf` (if bcftools available), `filtered_variants.vcf`
   (the vcf_only terminal output — confirmed by the early-return at
   `runner.py:624-633`), `checkpoint.json`, `pipeline.log`.
 - **Outputs, full mode**: everything above, plus `vep_annotation/`,
-  `annotation/annotation.json`, ACMG/evidence results, `pgx/`, `ancestry/`,
+  `annotation/annotation.json`, ACMG/evidence results, `ancestry/`,
   `reporting/report.json`+`report.html`+`report.pdf` (see §2).
+  **[CORRECTED 2026-09-10 (angela-mszpsmyw), dated: this bullet originally
+  also listed `pgx/` as a full-mode output directory. `kim_pipeline/pipeline/pgx/`
+  was deleted 2026-09-10 (merge `51320e1`, the human's ruling to remove
+  pharmacogenomics from the clinical report) -- no `pgx/` output exists any
+  longer. Removed rather than struck through, since the claim is no longer
+  even conditionally true.]**
 - **Limits**: API upload size `_MAX_UPLOAD_MB` env, default 2048MB,
   enforced by streaming chunk check (api/main.py:640-658), HTTP 413 on
   exceed. QC memory guards (not pipeline-halting): `max_dup_sample=100_000`,
@@ -229,9 +250,26 @@ substitute**, raises if missing) → `bcftools norm` (best-effort) →
 `runner.py:624-633` if `stop_after=="variant_calling"` — confirmed exactly
 matching README_INTEGRATION.md's vcf_only claim.
 
-### kim_pipeline/ own annotation/AI/ACMG/PGx/ancestry/report stack (requires kim_pipeline, `full` mode)
+### kim_pipeline/ own annotation/AI/ACMG/ancestry/report stack (requires kim_pipeline, `full` mode)
 This is a **separate, independently-implemented** stack from geper/'s —
 not the same code, not shared.
+
+> **DATED AMENDMENT, 2026-09-10 (angela-mszpsmyw).** This section's heading
+> originally read "...annotation/AI/ACMG/PGx/ancestry/report stack", and the
+> bullet immediately below described PGx as a real, working stage,
+> verbatim: *"**PGx** (pipeline/pgx/) and **Ancestry** (pipeline/ancestry/)
+> — real, working stages with **no equivalent in geper/ at all**:
+> star-allele calling for 10 pharmacogenes with CPIC drug implications,
+> and population-ancestry estimation from a 101-marker AIM panel. Both
+> disclose real limitations in their own code (PGx: no independent
+> ground-truth validation, PharmVar licensing; ancestry: presence/absence
+> marker matching, not true genotype dosage)."* That was accurate when
+> written. **`kim_pipeline/pipeline/pgx/` was deleted 2026-09-10 (merge
+> `51320e1`), the human's ruling to remove pharmacogenomics from the
+> clinical report and delete the computation.** The heading and bullet
+> below are corrected to describe only what remains (Ancestry); this is
+> a documentation-currency fix, not a re-litigation of the deletion
+> itself, which is the human's ruling and stands.
 
 - **AI models**: only **two** — DNABERT-2 and ESM-2
   (pipeline/ai/engine.py:173,310) — both real inference (thinner than
@@ -240,21 +278,18 @@ not the same code, not shared.
   criteria with real logic; PS4 and BS2 are permanently
   `STATUS_NOT_EVALUATED` (automated-mode data unavailability, :457-470,
   993-1004).
-- **PGx** (pipeline/pgx/) and **Ancestry** (pipeline/ancestry/) — real,
-  working stages with **no equivalent in geper/ at all**: star-allele
-  calling for 10 pharmacogenes with CPIC drug implications, and
-  population-ancestry estimation from a 101-marker AIM panel. Both
-  disclose real limitations in their own code (PGx: no independent
-  ground-truth validation, PharmVar licensing; ancestry: presence/absence
-  marker matching, not true genotype dosage).
+- **Ancestry** (pipeline/ancestry/) — a real, working stage with **no
+  equivalent in geper/ at all**: population-ancestry estimation from a
+  101-marker AIM panel, disclosing a real limitation in its own code
+  (presence/absence marker matching, not true genotype dosage).
 - **Evidence aggregation** (pipeline/evidence/aggregator.py) is explicitly
   disclosed as exploratory-only and double-counting relative to the ACMG
   score (:14-38,146-161) — never a second independent clinical score.
 - **Reporting**: one `report.json`/`.html`/`.pdf` triple per sample
   (ReportLab → WeasyPrint → wkhtmltopdf fallback chain) — a **different
   output shape** from geper/'s four files (no split short/full PDF, no
-  Markdown, but includes PGx and ancestry sections geper/ has no
-  equivalent for). kim_pipeline's own report disclaimer text independently
+  Markdown, but includes an ancestry section geper/ has no equivalent
+  for). kim_pipeline's own report disclaimer text independently
   requires "qualified human review and final sign-off" — **not verified
   whether this is unified with or fully independent from
   geper/review/signoff.py's gate**; flagged as unconfirmed.
@@ -352,7 +387,8 @@ which, do not assume either").
   support the classification derived from it. BP6 is evaluated (can be
   flagged "triggered") but explicitly excluded from the point-combining
   loop, so it contributes zero regardless.
-- kim_pipeline/ (pipeline/acmg/classifier.py:872-933,1230-1269): PP5 and
+- kim_pipeline/ (`pipeline/acmg/classifier.py:867-931,1223-1263` at
+  `ff9e5ae`; re-measured 2026-09-10, the file shortened by six lines): PP5 and
   BP6 both **ON by default** (`disable_pp5_bp6=False`). The classifier's
   own docstring (:887-889) **names the same SVI recommendation and
   declines to follow it** — stated reason: "to preserve existing behavior
@@ -376,18 +412,49 @@ which, do not assume either").
   PP3 nor BP4 triggers. Docstring states this was a considered choice,
   citing ACMG/AMP 2015 and Pejaver et al. 2022, and explicitly rejecting
   majority voting.
-- kim_pipeline/ (classifier.py:796-840,1160-1197) does **strict-majority
+- kim_pipeline/ (`pipeline/acmg/classifier.py:793-836,1155-1191` at
+  `ff9e5ae`; re-measured 2026-09-10) does **strict-majority
   voting** instead (`n_dam >= max(1, len(votes)//2+1)`).
 - **Additional finding, not in CROSS_TREE_DIVERGENCES.md**: kim_pipeline's
   in-silico ensemble for this vote is effectively **three** predictors in
   current deployment (CADD, REVEL, AlphaMissense), not four — SpliceAI was
   removed 2026-08-22 for CC BY-NC 4.0 licensing (pipeline/vep/stage.py
-  docstring:13-25), but the PP3/BP4 vote-counting code still references it
-  as a source; it simply always contributes `None` now (each append
-  guarded `is not None`, `classifier.py:814-815,1171-1172` — the removal
-  degrades silently rather than raising). **This is not a cosmetic
-  change: the majority threshold at `classifier.py:831`
-  (`met = n_dam >= max(1, len(votes)//2+1)`, symmetric BP4 site :1188)
+  docstring:13-25).
+  **CORRECTED 2026-09-10 (third movement on this claim, same day).** The
+  rest of this sentence read, and was true when written:
+
+      "but the PP3/BP4 vote-counting code still references it as a
+       source; it always contributes `None` now (each append guarded
+       `is not None` — the removal degrades silently rather than
+       raising)."
+
+  It is false at `ff9e5ae`, which removed the PP3 and BP4 SpliceAI **vote
+  branches themselves** — not the input path — together with both
+  threshold defaults (`pp3_spliceai`, `bp4_spliceai`) and both validator
+  ranges. The vote-counting code no longer references SpliceAI at all: at
+  `ff9e5ae` each of `_pp3` and `_bp4` contains exactly three
+  `votes.append(...)` calls (CADD, REVEL, AlphaMissense), and a
+  whole-file search of `pipeline/acmg/classifier.py` for "spliceai"
+  returns nothing. The clause about `is not None` guards is still true
+  **of the three predictors that remain**; it is no longer true of
+  SpliceAI, because there is nothing left to guard.
+  **PROVENANCE OF THAT SENTENCE, 2026-09-10, because it is currently
+  true for a reason its author did not have**: as written it was
+  FALSE. The 2026-08-22 VEP removal it cites did not make the score
+  always-`None` — it made a separate, un-fixed INFO fallback
+  unconditionally true, which is precisely the correction recorded in
+  the CANNOT DO TODAY entry below. The sentence became true only when
+  the merge `b394bfa` closed that input outright, for licence reasons,
+  weeks later and for unrelated purposes. It is now guarded by
+  `kim_pipeline/tests/test_spliceai_input_is_closed.py`, which asserts
+  on ACMG outcomes rather than on parsing. **Recorded rather than
+  silently left standing: a claim that is right by accident is not the
+  same as a claim that was right, and this document has been wrong on
+  this exact point before.** **This is not a cosmetic
+  change: the majority threshold
+  (`met = n_dam >= max(1, len(votes)//2+1)`, `classifier.py:826` at
+  `ff9e5ae`, symmetric BP4 site `:1181` — re-measured 2026-09-10, these
+  previously read `:831`/`:1188`)
   fell from 3-of-4 damaging calls required to 2-of-3 — a licensing
   decision silently lowered the evidence bar for a pathogenicity
   criterion.** See §1 (CANNOT DO TODAY, the expanded SpliceAI entry) for
@@ -396,6 +463,21 @@ which, do not assume either").
   `kelly-pp3-bp4-invariance-vs-single-predictor-incompatibility`, both
   waiting) and referred out to the unfilled clinical-expert role, not
   overlooked or newly discovered here.
+  **ADDED 2026-09-11 -- "both threshold defaults" above was true and
+  incomplete.** `ff9e5ae` removed the classifier's **in-code** defaults
+  (`classifier.py`'s `_t` dict), the two vote branches and the validator
+  ranges. It did **not** touch three other surfaces, which kept both keys
+  alive as dead config: `config/default.yaml` still set
+  `pp3_spliceai: 0.2` / `bp4_spliceai: 0.1`, `api/main.py`'s
+  `_CONFIG_ALLOWLIST` still returned both from `GET /config`, and
+  `analyze --spliceai` still wrote both. A reader of "both threshold
+  defaults" would reasonably include the file named `default.yaml`. All
+  three were removed on branch `ryan-spliceai-dead-keys`; the evidence is
+  `kim_pipeline/tests/test_spliceai_dead_threshold_keys_removed.py`, which
+  also proves the keys governed no verdict **before** they were removed.
+  The two `spliceai_score` dataclass fields are **not** removed and must
+  not be: `orchestration/shared.py::synonymous_or_intronic` reads the
+  field and deliberately distinguishes ABSENT from CONFIRMED-LOW.
 - **My finding**: CROSS_TREE_DIVERGENCES.md itself already states this one
   is "unresolved by design, referred to clinical expert review" on both
   sides — I found nothing in either engine's code that changes that
@@ -449,7 +531,31 @@ which, do not assume either").
   evidence for the standing on-premise packaging requirement (a
   deployment with no internet access must ship the model weights baked
   into the image; a deployment that lets each model download on first use
-  cannot function without network access at all, let alone quickly):
+  cannot function without network access at all, let alone quickly).
+
+  **Named plainly (2026-09-11, human ruling on
+  AUDIT-GAP-first-run-model-acquisition-cost, option C): the "Baked
+  image (offline)" column below is `geper:bridge-ready`
+  (`sha256:a8a5fe67...`), a DIFFERENT image from the one the repo's own
+  `Dockerfile` actually builds by default. The default build produces
+  the "First run" column's image — weights are a runtime-downloaded
+  volume (DOCKER.md:215-244's own deliberate design), and `grep -niE
+  "model_cache_seed|COPY.*model|ARG.*seed" Dockerfile` returns zero. The
+  4.6 GB `model_cache_seed/` tree that makes `bridge-ready` offline-
+  capable exists on one machine only, in **no repository**, with no
+  build path that reproduces it (DOCKER.md's own "offline model-cache
+  seed" section). So: THIS REQUIREMENT IS CURRENTLY UNMET BY THE IMAGE
+  THIS REPOSITORY ACTUALLY SHIPS. Ruled (human, via god, 2026-09-11):
+  "softening the audit to match reality is how a requirement disappears
+  without anyone deciding to drop it" — the requirement stands, stated
+  as an OPEN, UNDELIVERED DELIVERABLE, not as already met and not
+  weakened to describe only what exists today. A no-internet site
+  cannot run the default shipped image: ~4.12 GB and ~47 minutes of
+  live network access would be required on first run (see the byte
+  table below), and there is currently no repository-buildable image
+  that avoids this. Building one is a separate, not-yet-authorized
+  piece of work — see PACKAGING-offline-sites-shipped-image-must-
+  contain-model-weights-huggingface-acquisition-is-not-an-install-path.**
 
   | Model    | First run (acquisition-dominated) | Baked image (offline) | Ratio |
   |----------|-----------------------------------:|-----------------------:|------:|
@@ -491,6 +597,33 @@ which, do not assume either").
   nothing about per-variant annotation throughput once models are
   already loaded, which remains NOT BENCHMARKED (see §5's NEEDS
   BENCHMARKS TO KNOW).
+
+  **Bytes, not just time (added 2026-09-11, derived, not measured —
+  no download performed for this addition):** the table above times the
+  fetch but never sizes it. The bytes and their provenance already exist
+  in-repo, in DOCKER.md, and are cross-referenced here rather than
+  re-measured:
+
+  | Model    | Bytes                                    | Pin |
+  |----------|-------------------------------------------|-----|
+  | RNA-FM   | 1.19 GB (`RNA-FM_pretrained.pth`)          | **unpinned** — no revision in either fetch path (DOCKER.md:564) |
+  | ESM2     | 2,609,506,392 bytes (~2.61 GB) safetensors blob | revision-pinned, `_ESM2_REVISION` (DOCKER.md:363–370) |
+  | HyenaDNA | 316 MB (incl. `.git/lfs`)                  | revision-pinned per model; loader refuses an unpinned checkpoint (DOCKER.md:565) |
+  | MMSplice | 0 bytes at runtime                         | ships inside the pip package's site-packages already in the image, not fetched (DOCKER.md:571–575) |
+
+  **Total first-run download, these four: ~4.12 GB** (1.19 + 0.316 +
+  2.61; MMSplice contributes nothing).
+
+  Two caveats the table above is worse without: **RNA-FM's 1.19 GB is
+  "what is on disk today," not a guaranteed constant** — it is the one
+  model of the four pinned by nothing, sourced from two different hosts
+  (an HF mirror, then an academic endpoint) rather than a fixed revision
+  (DOCKER.md:585–590 names hashing a fresh fetch against the current
+  file as what would settle byte-reproducibility; not attempted here).
+  And **MMSplice's zero is not an oversight** — it is the same fact
+  that produces its ~1× ratio above: there is nothing to acquire on
+  first run because the weights are already in the image's
+  site-packages, not the cache.
 
 ### kim_pipeline/
 - **No read/file-size/variant-count limit** anywhere in
@@ -555,10 +688,13 @@ which, do not assume either").
   real gene/transcript/HGVS pipeline, score variants with two real AI
   models (DNABERT-2, ESM-2), classify 26 of 28 ACMG criteria (with
   PP5/BP6 on by default and PP3/BP4 via strict-majority voting — see §3
-  for how these differ from geper/'s defaults), call pharmacogenomic
-  star-alleles/phenotypes for 10 genes, estimate ancestry from a
+  for how these differ from geper/'s defaults), estimate ancestry from a
   101-marker panel, and produce its own JSON/HTML/PDF report.
-  [pipeline/{annotation,ai,acmg,pgx,ancestry,reporting}/*.py]
+  [pipeline/{annotation,ai,acmg,ancestry,reporting}/*.py]
+  **[CORRECTED 2026-09-10 (angela-mszpsmyw): originally also listed
+  "call pharmacogenomic star-alleles/phenotypes for 10 genes" and
+  included `pgx` in the module-path list. `pipeline/pgx/` was deleted
+  2026-09-10 (merge `51320e1`) -- see §2's dated amendment.]**
 
 *Requires kim_pipeline + geper/ + bridge/ deployed together:*
 - Run one command (`bridge/run_combined.py`) and get FASTQ → clinical
@@ -567,6 +703,19 @@ which, do not assume either").
   and geper/ produces the interpretation (subprocess). This is a real,
   working entry point today. [bridge/run_combined.py:44-85;
   bridge/combined_pipeline.py:283-566]
+  **This bullet is silent on what running that one command actually
+  requires of the host — deliberately not duplicated here.** See
+  [DOCKER.md](../DOCKER.md): "Before you build" (:22-79, the three
+  pre-fetched torch wheels a fresh clone does not contain — the same
+  files this repository's `.gitignore:124-126` excludes and
+  `Dockerfile:237-239` `COPY`s by exact name), "What's baked into the
+  image vs. what's still a first-run cost" (:215-228, the invoked
+  system binaries and the volume-vs-baked-in model weights), "One
+  shared venv, not the `--kim-python`/`--geper-python` split" (:594-613,
+  the bridge's two-interpreter flags currently point at one merged
+  environment), and "Verified vs. not yet verified" (:726-734, **this
+  combined image has never actually been built or run** — only
+  statically reviewed, per that section's own words).
 
 ### CANNOT DO TODAY
 - geper/ alone cannot ingest FASTQ/BAM/CRAM — confirmed by the repo's own
@@ -575,45 +724,143 @@ which, do not assume either").
 - Neither engine evaluates PS4 (case/control cohort frequency) or BS2/
   (kim's naming) healthy-adult-observation data — both explicitly and
   permanently `not_evaluated` in automated mode on both sides.
-  [geper: acmg_rules.py:291; kim: classifier.py:457-470,993-1004]
-- **CORRECTED 2026-09-10** (this row previously said the SpliceAI score
-  "is always `None`", citing only a code comment as evidence -- it is not
-  always `None`, and the corrected claim below cites the code that proves
-  it). kim_pipeline's VEP-CSQ path for SpliceAI was deliberately fixed to
-  permanently return `None` (2026-08-22, licence) -- but that fix is what
-  makes a SEPARATE, un-fixed fallback guard (`if var.spliceai_score is
-  None:`) unconditionally true, and that fallback reads `SpliceAI=` /
-  `DS_AG` / `DS_AL` / `DS_DG` / `DS_DL` straight out of the input VCF's
-  own INFO field and takes the max.
-  [kim_pipeline/pipeline/annotation/stage.py:733-743, :1145-1157 --
-  CODE, not the vep/stage.py:13-25 module comment this entry previously
-  cited, which asserts the same "always `None`" mistake]. Scope:
-  kim_pipeline only (not geper/, which never integrated SpliceAI at all).
-  On any input VCF the caller has already run through Illumina's SpliceAI
-  tool upstream (a standard splicing-analysis step, independent of VEP),
-  this fallback fires and produces a real, non-`None` `spliceai_score`
-  that reaches PP3/BP4 exactly like any other predictor. Evidence, not
-  just a reading of the code: `kim_pipeline/tests/
-  test_undetermined_aa_guard.py:388-389` (added 2026-08-28) documents and
-  exercises exactly this path, and currently PASSES.
-  **Consequence, not just absence**: PP3/BP4's majority-vote threshold
-  (`classifier.py:831`, symmetric BP4 site `classifier.py:1188`) is
-  `met = n_dam >= max(1, len(votes) // 2 + 1)` — a threshold computed over
-  however many voters are actually present (each vote append is guarded
-  `is not None`, so a missing predictor degrades silently rather than
-  raising, `classifier.py:814-815,1171-1172`). With SpliceAI present that
-  was 3-of-4 damaging calls required; with it absent (the VEP-CSQ path,
-  unannotated input), it is 2-of-3. **Given the 2026-09-10 correction
-  above, "absent" is not the universal case**: on input the caller has
-  pre-annotated with SpliceAI upstream, the fallback restores the vote
-  and the threshold reverts to 3-of-4 for that variant. So the actual
-  consequence is an evidence bar that silently VARIES per-input (2-of-3
-  or 3-of-4, depending on what the caller's VCF happens to carry) rather
-  than a single, permanently-lowered 2-of-3 — an inconsistency, not just
-  a reduction. **A licensing decision silently changed the evidence bar
-  for a pathogenicity criterion** — nobody chose that as a clinical
-  position, it is a side effect of removing one voter from a
-  majority-of-present formula.
+  [geper: acmg_rules.py:291; kim: `classifier.py:454-469,988-999` at
+  `ff9e5ae` -- re-measured 2026-09-10, this previously read
+  `:457-470,993-1004`]
+- **CORRECTED AGAIN 2026-09-10 (second correction, same row, same day).**
+  This row was corrected in the morning and the corrected text went stale
+  in the afternoon, under its own author, when the code changed. Both the
+  claim AND the evidence it cited went stale together. The corrected text
+  read, and was true when written:
+
+      "kim_pipeline's VEP-CSQ path for SpliceAI was deliberately fixed to
+       permanently return `None` (2026-08-22, licence) -- but that fix is
+       what makes a SEPARATE, un-fixed fallback guard (`if
+       var.spliceai_score is None:`) unconditionally true, and that
+       fallback reads `SpliceAI=` / `DS_AG` / `DS_AL` / `DS_DG` /
+       `DS_DL` straight out of the input VCF's own INFO field and takes
+       the max. ... On any input VCF the caller has already run through
+       Illumina's SpliceAI tool upstream (a standard splicing-analysis
+       step, independent of VEP), this fallback fires and produces a
+       real, non-`None` `spliceai_score` that reaches PP3/BP4 exactly
+       like any other predictor. Evidence, not just a reading of the
+       code: `kim_pipeline/tests/test_undetermined_aa_guard.py:388-389`
+       (added 2026-08-28) documents and exercises exactly this path, and
+       currently PASSES."
+
+  **CURRENT STATE: BOTH INFO FALLBACKS ARE GONE.** The merge `b394bfa`
+  ("close the SpliceAI INPUT, not another route") removed both sites, for
+  the same CC BY-NC 4.0 licence reason the VEP path was removed. Closing
+  the VEP route had not narrowed the input -- it guaranteed the fallback
+  ran -- so the input itself was closed instead. No caller-annotated VCF
+  can put a SpliceAI score on a variant any more, and `spliceai_score` is
+  now genuinely always `None` in kim_pipeline. Scope: kim_pipeline only
+  (geper/ never integrated SpliceAI at all).
+  **Still true for exactly the reason stated, and now ALSO true for a
+  second, independent one (added 2026-09-10):** `ff9e5ae` removed the
+  PP3/BP4 SpliceAI vote branches, so even a score that somehow reached a
+  variant would no longer reach those two criteria. `b394bfa` closed the
+  input; `ff9e5ae` removed the consumer. Neither supersedes the other and
+  the attribution above is unchanged.
+
+  **Guarded by** `kim_pipeline/tests/test_spliceai_input_is_closed.py`
+  (12 tests, 4 subtests at `ff9e5ae`, measured 2026-09-10; it was 9 when
+  this row was written, and `ff9e5ae` converted three more into it), which
+  asserts on **ACMG classification
+  outcomes** rather than on parsing -- a test that only showed the fields
+  were unread would go green on a rename while the vote it feeds carried
+  on moving.
+
+  **The evidence this row previously cited went stale with it**:
+  `test_undetermined_aa_guard.py`'s docstring asserted the same
+  reachability in different words, and is corrected in the same commit as
+  this row. Its test still passes and is unchanged -- it builds
+  `VariantEvidence` directly, so closing the VCF-side input never reached
+  it -- but the argument for carrying a SpliceAI score in it has gone,
+  and that open question is recorded there rather than resolved here.
+  **`ff9e5ae` did NOT close that question, and it is worth saying why
+  (checked 2026-09-10 rather than assumed):** the score that test carries
+  feeds BP7's gate via `orchestration/shared.py::synonymous_or_intronic`,
+  where an ABSENT score and a CONFIRMED-LOW score are deliberately
+  distinguished. That consumer is live, and `ff9e5ae` left it alone on
+  purpose — it removed the PP3/BP4 votes only. So the structure this test
+  exercises has NOT lost its consumer; what it lost, back at `b394bfa`,
+  was the reachability argument its docstring gives for the score. The
+  question stays open, and stays where it is recorded.
+
+  **CITED BY COMMIT AND TEST NAME, NOT BY LINE NUMBER, DELIBERATELY.**
+  Both this row and the test docstring previously carried undated
+  coordinates (`stage.py:733-743`/`:1145-1157` here, `:719-729`/
+  `:1124-1133` there) and every one of them now points at unrelated
+  code. A line number pinned to a revision is a durable fact; an undated
+  one silently claims to be about HEAD forever.
+  **Consequence, not just absence — REWRITTEN 2026-09-10 AT `ff9e5ae`,
+  AND DELIBERATELY NOT BY RESTORING WHAT THIS PASSAGE REPLACED.**
+  PP3/BP4's majority-vote threshold is
+  `met = n_dam >= max(1, len(votes) // 2 + 1)` (`classifier.py:826` at
+  `ff9e5ae`, symmetric BP4 site `:1181`), computed over however many
+  voters are actually present. The text here read, and was true when it
+  was written earlier the same day:
+
+      "(each vote append is guarded `is not None`, so a missing
+       predictor degrades silently rather than raising,
+       `classifier.py:814-815,1171-1172`). With SpliceAI present that
+       was 3-of-4 damaging calls required; with it absent (the VEP-CSQ
+       path, unannotated input), it is 2-of-3. **Given the 2026-09-10
+       correction above, "absent" is not the universal case**: on input
+       the caller has pre-annotated with SpliceAI upstream, the fallback
+       restores the vote and the threshold reverts to 3-of-4 for that
+       variant. So the actual consequence is an evidence bar that
+       silently VARIES per-input (2-of-3 or 3-of-4, depending on what
+       the caller's VCF happens to carry) rather than a single,
+       permanently-lowered 2-of-3 — an inconsistency, not just a
+       reduction."
+
+  Two things are wrong with that at `ff9e5ae`, and they are **not the
+  same kind of wrong**.
+
+  **(a) A dead citation inside a sentence that is still true.**
+  `classifier.py:814-815,1171-1172` was cited as the guarded vote
+  appends. Those were the SpliceAI appends and `ff9e5ae` deleted them; at
+  `ff9e5ae`, line 814 is `if not votes:`. The claim the cite was
+  supporting — each append guarded `is not None`, so a missing predictor
+  degrades silently rather than raising — **remains true of the three
+  predictors that are left**, and now lives at `classifier.py:807-812`
+  (PP3) and `:1162-1168` (BP4). A true sentence with a dead cite, not a
+  false claim.
+
+  **(b) The clinical conclusion, which is the half that matters, is
+  FALSE.** `ff9e5ae` removed the **vote branches**, not the input path.
+  **There is no vote left to restore, so a caller-annotated VCF restores
+  nothing, and the bar cannot vary with what the input carries.** The
+  per-input inconsistency described above does not exist at `ff9e5ae`.
+
+  **AND THAT MAKES THE SENTENCE THIS PASSAGE ORIGINALLY REPLACED CORRECT
+  AGAIN — WHICH IS WHY IT IS NOT BEING RESTORED.** The original text said
+  the bar was permanently lowered to 2-of-3. It was corrected this
+  morning for being wrong; it is right again at `ff9e5ae`, for a reason
+  unrelated to why it was written and unrelated to why it was wrong.
+  **A sentence restored is indistinguishable from a correction never
+  made**, so the history is written down instead of the wording being
+  reverted. This is the third time this claim has moved in one day.
+
+  **What is true at `ff9e5ae`, measured rather than restored**: the PP3
+  ballot is CADD, REVEL and AlphaMissense — and REVEL and AlphaMissense
+  are additionally gated on `e.is_missense` (`classifier.py:809,811`;
+  symmetric BP4 `:1164,:1166`). So the denominator is **3 for a missense
+  variant and 1 — CADD alone — for a non-missense one**, fixed by the
+  variant's own consequence and independent of the input VCF's
+  annotations. "Permanently 2-of-3" is therefore the right shape but
+  still not exactly right: it is the missense case, and it is the one
+  this passage is about. **This does not change the structural analysis
+  referred out below** — the formula is untouched by `ff9e5ae`, and the
+  incompatibility recorded there was never contingent on SpliceAI. Noted
+  and stopped there.
+
+  **A licensing decision silently changed the evidence bar for a
+  pathogenicity criterion** — nobody chose that as a clinical position,
+  it is a side effect of removing one voter from a majority-of-present
+  formula.
   **This is known and unresolved, not a fresh finding of this audit**:
   Kelly found it first, and found the deeper version — cards
   `kelly-classifier-denominator-fix-pp3-bp4` and
@@ -690,9 +937,14 @@ which, do not assume either").
     memory/wall-clock constraints — no code-enforced cap exists on either
     side, so the practical ceiling is a hardware question this repo does
     not answer. UNKNOWN — REQUIRES BENCHMARK/TESTING.
-  - Whether PGx diplotype calls or ancestry estimates are accurate against
-    independent ground truth — both stages disclose in their own code that
-    this has not been established. UNKNOWN — REQUIRES BENCHMARK/TESTING.
+  - Whether ancestry estimates are accurate against independent ground
+    truth — the stage discloses in its own code that this has not been
+    established. UNKNOWN — REQUIRES BENCHMARK/TESTING.
+    **[CORRECTED 2026-09-10 (angela-mszpsmyw): originally also asked this
+    of "PGx diplotype calls". `pipeline/pgx/` was deleted 2026-09-10
+    (merge `51320e1`) -- see §2's dated amendment. The question no longer
+    applies to a stage that does not exist; removed rather than left
+    open against nothing.]**
   - Whether the bridge actually functions against the real (non-mocked)
     Kim and geper/ binaries/models end to end, producing a report — no
     verified run exists; one half has an unverified self-reported claim,

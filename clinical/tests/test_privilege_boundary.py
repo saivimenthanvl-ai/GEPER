@@ -241,6 +241,21 @@ def seeded(dao, conn):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, now),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_id, user_id, now),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org_id, user_id, now),
+        )
     conn.commit()
     session = dao.login("priv@org.test", org_id, "password")
 
@@ -343,9 +358,10 @@ class TestTheConnectionsAreRealAndWorking:
 class TestClinicalAppCannotRewriteAppendOnlyTables:
     """
     The append-only guarantee, asked of the database rather than of the code.
-    ISO 15189 7.4.1.8 requires that the original is never modified and never
-    withdrawn from the record; a table the application may rewrite cannot meet
-    that however carefully the application is written.
+    GEPER's own rule (spec 15.2, implementing ISO 15189 7.4.1.8 b)/d)) is that
+    the original is never modified and never withdrawn from the record; a
+    table the application may rewrite cannot meet that however carefully the
+    application is written.
     """
 
     @pytest.mark.parametrize("table", APPEND_ONLY)

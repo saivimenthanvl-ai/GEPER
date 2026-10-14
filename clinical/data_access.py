@@ -5321,6 +5321,15 @@ class DataAccess:
         class. Reading state here is not a state FILTER -- every report is
         still returned in every state, which is the property
         test_report_state_is_a_control.py guards.
+
+        `is_retracted` is returned (added w122, human ruling E7) for the same
+        reason and under the same restriction. E7 ruled that a retracted
+        report is STILL RETURNED, carrying the fact: filtering it out would be
+        a state filter on a retrieval path, which is the exact property the
+        guard above forbids, and it would make a retracted report unfindable
+        by the route `geper/api/submission_worker.py` uses on the duplicate-
+        submission path. So the report comes back and the caller is told -- a
+        fact recorded alongside, never a record removed.
         """
         row = self._query_one(
             "SELECT id, interpretation_id, created_at, created_by, state FROM reports WHERE id = %s AND org_id = %s",
@@ -5334,6 +5343,7 @@ class DataAccess:
             "created_at": row[2],
             "created_by": row[3],
             "state": row[4],
+            "is_retracted": self._read_retraction_row(session, report_id) is not None,
         }
 
     # ── Phase 4c: Document discovery (all interpretations, including orphaned) ─────
@@ -7960,6 +7970,13 @@ class DataAccess:
                 "the platform without approval."
             )
 
+        # Preserve a readable retraction warning before recording a delivery.
+        retraction = self._read_retraction_row(session, report_id)
+        if retraction is not None and not (retraction[3] or "").strip():
+            raise BrokenRevisionRecordError(
+                f"Report {report_id} has a retraction with no usable reason; delivery is refused."
+            )
+
         release_id = uuid.uuid4()
         now = self._clock.now()
         self._execute(
@@ -7974,6 +7991,17 @@ class DataAccess:
                 ("released", report_id, session.org_id),
             )
 
+        # w122, human rulings E3 + E6. E3 permits a retracted report to be
+        # delivered; E6 says every party that received it is owed a
+        # notification. This consumer is receiving it NOW, after the
+        # retraction was recorded, so the debt for them arises now -- and if
+        # it were not written here, "which retractions have unnotified
+        # recipients" would silently miss exactly the people who received the
+        # report while it was already retracted. Same deduplication as
+        # retract_report's own pass: one debt per consumer, not per delivery.
+        if retraction is not None:
+            self._record_retraction_notification_debts(session, retraction[0], [consumer], retraction[3], now)
+
         return release_id
 
     @auditable(
@@ -7986,7 +8014,7 @@ class DataAccess:
         details_builder=lambda params, result: {"report_id": str(params.get("report_id"))},
     )
     @transactional
-    def require_release(self, session: Session, report_id: uuid.UUID) -> None:
+    def require_release(self, session: Session, report_id: uuid.UUID) -> bool:
         """
         The one gate every delivery path calls before handing report content
         to a consumer (spec 13.4). Hard stop: a report that is not at least
@@ -8030,6 +8058,15 @@ class DataAccess:
             raise ValueError(
                 f"Report is in '{state}' state -- spec 13.4: no report leaves the platform without approval."
             )
+
+        # A retracted report remains deliverable, but its warning must travel
+        # with it. An unreadable reason means the document cannot be released.
+        retraction = self._read_retraction_row(session, report_id)
+        if retraction is not None and not (retraction[3] or "").strip():
+            raise BrokenRevisionRecordError(
+                f"Report {report_id} has a retraction with no usable reason; delivery is refused."
+            )
+        return retraction is not None
 
     # ─── w156 (WAVE 6): report retraction ───────────────────────────────────
     #
@@ -8104,7 +8141,7 @@ class DataAccess:
         `org_id` parameter for a caller to supply.
         """
         return self._query_one(
-            "SELECT id, retracted_at, retracted_by, retracted_from_state "
+            "SELECT id, retracted_at, retracted_by, reason, retracted_from_state "
             "FROM report_retractions WHERE org_id = %s AND report_id = %s "
             "ORDER BY retracted_at LIMIT 1",
             (session.org_id, report_id),
@@ -8535,6 +8572,13 @@ class DataAccess:
         interpretation_id, report_created_at, report_approved_at = report
 
         revision: dict[str, Any] = {}
+        # w122: FIRST, because the banner it feeds renders first -- "do not
+        # act on this document" outranks every other statement, and retraction
+        # outranks supersession because a superseded report has a successor to
+        # obtain and a retracted one may not.
+        retracted = self._read_retracted(session, report_id, report_approved_at)
+        if retracted:
+            revision["retracted"] = retracted
         amends = self._read_amends(session, report_id)
         if amends:
             revision["amends"] = amends
@@ -8550,6 +8594,101 @@ class DataAccess:
         if reanalysed_since:
             revision["reanalysed_since"] = reanalysed_since
         return revision
+
+    def _read_retracted(
+        self, session: Session, report_id: uuid.UUID, report_approved_at: Any
+    ) -> Optional[dict[str, Any]]:
+        """
+        Banner 0 (w122). THIS REPORT HAS BEEN RETRACTED.
+
+        THE DATE BASIS COMES FROM THE STORED FACT, NOT FROM A LOOKUP, and that
+        is human ruling E1's whole point. `_issued_moment` derives the basis
+        from whatever release_events says AT READ TIME -- correct for the
+        amendment banners, wrong here: a report retracted while 'approved' can
+        legitimately be released afterwards (E3 permits it), and a reader that
+        re-derived the basis would then print "issued on <the release date>"
+        over a retraction recorded before any release existed. The retraction
+        row records WHICH state it was retracted from, so the sentence keeps
+        saying what was true when the lab acted. That is R2's rule -- the basis
+        travels with the timestamp, never inferred from which column happens to
+        be populated -- applied to the one place where the column would have
+        been populated LATER.
+
+        R7 fail-closed, in the shape `_read_amends` uses: a retraction that
+        cannot be read into a true sentence is an error, never a marker and
+        never a silent omission.
+        """
+        rows = self._query(
+            "SELECT id, retracted_at, retracted_by, reason, retracted_from_state, replacement_report_id "
+            "FROM report_retractions WHERE org_id = %s AND report_id = %s "
+            "ORDER BY retracted_at, id",
+            (session.org_id, report_id),
+        )
+        if not rows:
+            return None
+        if len(rows) > 1:
+            # retract_report refuses a second retraction for exactly this
+            # reason: the banner would have to pick one, and picking is
+            # guessing. Asserted here as well because the reader must not
+            # depend on the writer having been the only way in.
+            raise BrokenRevisionRecordError(
+                f"Report {report_id} carries {len(rows)} retraction records; it cannot state which retraction applies."
+            )
+        _id, retracted_at, retracted_by, reason, retracted_from_state, replacement_report_id = rows[0]
+
+        if not (reason or "").strip():
+            raise BrokenRevisionRecordError(
+                f"The retraction record for report {report_id} carries no reason; refusing to state the "
+                "retraction without it."
+            )
+
+        if retracted_from_state == "released":
+            row = self._query_one(
+                "SELECT MIN(released_at) FROM release_events WHERE org_id = %s AND report_id = %s",
+                (session.org_id, report_id),
+            )
+            issued_at = row[0] if row else None
+            issued_basis = "released"
+        elif retracted_from_state == "approved":
+            issued_at = report_approved_at
+            issued_basis = "approved"
+        else:
+            # The CHECK constraint admits two values. A third is a record this
+            # reader has never heard of, not a third meaning to guess at.
+            raise BrokenRevisionRecordError(
+                f"The retraction record for report {report_id} names state {retracted_from_state!r}, "
+                "which is neither 'approved' nor 'released'."
+            )
+        if issued_at is None:
+            raise BrokenRevisionRecordError(
+                f"Report {report_id} was retracted from '{retracted_from_state}' but carries no "
+                f"{'release' if retracted_from_state == 'released' else 'approval'}; there is no date "
+                "on which it was issued."
+            )
+
+        block: dict[str, Any] = {
+            "issued_at": issued_at,
+            "issued_basis": issued_basis,
+            "retracted_at": retracted_at,
+            # R1/R10: the person, by the three fields a report may print.
+            "retracted_by": self._signing_identity_text(session, retracted_by),
+            "reason": reason,
+        }
+        if replacement_report_id is not None:
+            replacement = self._query_one(
+                "SELECT tombstoned_at FROM reports WHERE org_id = %s AND id = %s",
+                (session.org_id, replacement_report_id),
+            )
+            if replacement is None:
+                raise BrokenRevisionRecordError(
+                    f"The retraction record for report {report_id} names replacement report "
+                    f"{replacement_report_id}, which does not exist in this organisation."
+                )
+            block["replacement_report_id"] = replacement_report_id
+            # R8 generalised: still retracted either way, but the reader is
+            # told the replacement is gone rather than sent to fetch it.
+            block["replacement_retained"] = replacement[0] is None
+        return block
 
     def _read_amends(self, session: Session, report_id: uuid.UUID) -> Optional[dict[str, Any]]:
         """Banner 1. This report IS an amendment of something."""

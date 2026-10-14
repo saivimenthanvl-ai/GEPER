@@ -7994,7 +7994,7 @@ class DataAccess:
         # retract_report's own pass: one debt per consumer, not per delivery.
         retraction = self._read_retraction_row(session, report_id)
         if retraction is not None:
-            self._record_retraction_notification_debts(session, retraction[0], [consumer], retraction[3], now)
+            self._record_retraction_notification_debts(session, retraction[0], [consumer], retraction[4], now)
 
         return release_id
 
@@ -8052,6 +8052,17 @@ class DataAccess:
             raise ValueError(
                 f"Report is in '{state}' state -- spec 13.4: no report leaves the platform without approval."
             )
+
+        # E3: approved documents remain retrievable when retracted, but the
+        # retraction must be readable so the warning can travel with them.
+        retraction = self._read_retraction_row(session, report_id)
+        if retraction is None:
+            return False
+        if not (retraction[4] or "").strip():
+            raise BrokenRevisionRecordError(
+                f"Report {report_id} has a retraction without a readable reason; delivery is refused."
+            )
+        return True
 
     # ─── w156 (WAVE 6): report retraction ───────────────────────────────────
     #
@@ -8126,7 +8137,7 @@ class DataAccess:
         `org_id` parameter for a caller to supply.
         """
         return self._query_one(
-            "SELECT id, retracted_at, retracted_by, retracted_from_state "
+            "SELECT id, retracted_at, retracted_by, retracted_from_state, reason "
             "FROM report_retractions WHERE org_id = %s AND report_id = %s "
             "ORDER BY retracted_at LIMIT 1",
             (session.org_id, report_id),

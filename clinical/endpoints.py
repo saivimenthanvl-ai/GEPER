@@ -25,7 +25,7 @@ import os
 import uuid
 from typing import Iterator, Optional
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response, status
 from pydantic import BaseModel
 
 from clinical.data_access import (
@@ -37,6 +37,16 @@ from clinical.data_access import (
 )
 
 router = APIRouter(prefix="/exceptions", tags=["exceptions"])
+
+# A SECOND ROUTER IN THIS MODULE, AND IT CARRIES NO PREFIX. `router` above is
+# prefixed `/exceptions`, so a route outside that tree cannot live on it. The
+# staff logout route belongs in THIS file rather than in `auth_endpoints.py`
+# because logout CONSUMES a session — it is the one authentication act that
+# takes a credential instead of minting one — and `_get_session` lives here.
+# `auth_endpoints.py` is pinned by a structural guard NOT to import either
+# session dependency, precisely so that a login route can never grow into one
+# that accepts a session.
+session_router = APIRouter(tags=["authentication"])
 
 
 class ExceptionListItem(BaseModel):
@@ -114,6 +124,73 @@ class ErrorResponse(BaseModel):
 _SESSION_COOKIE = "clinical_session"
 _DSN_ENV = "CLINICAL_DSN"
 
+# w132 fix C. The readiness probe has passed connect_timeout=3 since it was
+# written, with the reason stated in clinical/app.py: "a readiness check that
+# hangs is indistinguishable to an orchestrator from one that is slow to say
+# yes". The REQUEST path passed nothing, so an anonymous request could hold a
+# worker for libpq's default (no timeout at all on most builds; the OS TCP
+# timeout is the only bound, minutes).
+#
+# Five seconds, not three: a probe may fail fast and be retried on a schedule,
+# whereas a real request that fails has a person or a job behind it, and the
+# same connection under load can legitimately take longer to establish than a
+# probe's. Both are far below any TCP default.
+#
+# WHAT THIS DOES AND DOES NOT CLOSE, stated plainly because the difference
+# matters: it BOUNDS the resource-exhaustion path, it does not close it. Every
+# anonymous request that presents a well-formed credential still opens a real
+# connection and still consumes a Postgres connection slot for the length of
+# the request. What changed is that no single one of them can hold a slot for
+# longer than five seconds while the database is unreachable, so an outage
+# no longer converts into an unbounded pile-up of hung workers. The thing that
+# would actually close it is a bounded connection pool, which
+# `_get_data_access`'s docstring names as the production form and which this
+# wave deliberately does not build (it is an availability change to a path
+# w128/w129 pinned).
+_REQUEST_CONNECT_TIMEOUT_SECONDS = 5
+
+
+def _anonymous_refusal() -> HTTPException:
+    """
+    THE ONE REFUSAL. w132 fix B.
+
+    Every way this service can decline to serve a caller who has not proved
+    who they are returns THIS object: no credential, a malformed credential, a
+    credential that names nothing, a credential that expired, a credential
+    belonging to the other principal — and, since w132, a database that is not
+    configured and a database that is not reachable.
+
+    THE DEFECT IT CLOSES, and it is worth stating precisely because the fix is
+    not what it first looks like. `_get_session` takes `_get_data_access` as a
+    sub-dependency, so the data layer was reached before any credential was
+    examined, and it had two observable failure modes of its own:
+
+        CLINICAL_DSN unset      -> 503, with a body naming the variable
+        CLINICAL_DSN set, down  -> uncaught psycopg exception -> 500
+        database up, bad cookie -> 401 "Authentication failed."
+
+    The BODY was already generic in the third case; the STATUS discriminated
+    across all three. An anonymous caller could therefore read the state of
+    the clinical database off the status code without holding a credential.
+    That is the mirror image of the cross-tenant oracle w129b fixed, where
+    both refusals were 500 and only the body differed — which is why the tests
+    for this assert the (status, body) pair as a SET OF SIZE ONE across every
+    refusal case, and not a per-case equality.
+
+    WHAT IS NOT CLAIMED: that authentication now runs "before" the database in
+    general. For a session-authenticated route, validating the session IS a
+    database read, and no ordering can change that. What IS true, and is
+    tested:
+
+      * a caller presenting NO credential, or a credential that is not a UUID,
+        is refused by `_presented_session_id` BEFORE `_get_data_access` runs,
+        so no connection is opened at all — a genuine reordering, and the one
+        that covers the entire anonymous-scanner case;
+      * a caller presenting a well-formed credential cannot distinguish the
+        three database states, because all three arrive here.
+    """
+    return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=GENERIC_AUTH_ERROR)
+
 
 def _get_data_access() -> Iterator[DataAccess]:
     """
@@ -146,32 +223,94 @@ def _get_data_access() -> Iterator[DataAccess]:
     """
     dsn = os.environ.get(_DSN_ENV)
     if not dsn:
-        # A configuration gap, not a client error: 503 rather than 500 says
-        # the service is not ready rather than that the request was bad.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"{_DSN_ENV} is not configured; the clinical database is unavailable.",
+        # w132 fix B. This used to be a 503 whose detail named CLINICAL_DSN.
+        # It was a good operator error and a bad answer to an anonymous
+        # caller, who learned both that the service is misconfigured and the
+        # internal name of the setting, from a route whose only job is to say
+        # "Authentication failed."
+        #
+        # The configuration state is still reported, in full, by /readyz —
+        # which is the route that exists to report it, is documented as
+        # disclosing it, and is placed behind the network rather than behind a
+        # credential. Nothing was hidden from an operator; one thing stopped
+        # being told to a stranger.
+        raise _anonymous_refusal()
+
+    try:
+        import psycopg
+
+        connection = psycopg.connect(
+            dsn,
+            autocommit=False,
+            connect_timeout=_REQUEST_CONNECT_TIMEOUT_SECONDS,
         )
+    except Exception:  # noqa: BLE001
+        # w132 fix B, the second half. `psycopg.connect` was not wrapped, and
+        # COUNTED at 9d5261b the clinical app registers no exception handler of
+        # any kind — so an unreachable database reached the caller as FastAPI's
+        # default 500. A 500 here and a 401 there is the status-channel oracle.
+        #
+        # The broad `except` is deliberate and is the narrower fix, not the
+        # wider one: the alternative is a catch-all handler on the app, which
+        # would also swallow genuine 500s on authenticated routes. This catches
+        # only the failure to OBTAIN a connection, and only on the path where
+        # the caller has not yet proved anything. Nothing after `yield` is
+        # covered by it.
+        raise _anonymous_refusal()
 
-    import psycopg
-
-    connection = psycopg.connect(dsn, autocommit=False)
     try:
         yield DataAccess(connection)
     finally:
         connection.close()
 
 
-def _get_session(
+def _presented_session_id(
     authorization: str = Header(default=""),
     clinical_session: str = Cookie(default="", alias=_SESSION_COOKIE),
+) -> uuid.UUID:
+    """
+    The opaque session id the caller presented, or 401 — AND NOTHING ELSE
+    HAPPENS HERE. w132 fix B.
+
+    THIS FUNCTION TOUCHES NO DATABASE, and that is its entire purpose. It is
+    declared BEFORE `_get_data_access` in `_get_session`'s signature, and
+    FastAPI solves a dependant's sub-dependencies in declaration order, so a
+    caller who presents no credential at all — or presents something that is
+    not a UUID — is refused before a connection is opened.
+
+    That is the part of "authenticate before the database reveals its state"
+    that is actually achievable, and it is the part that covers the traffic
+    that matters: an anonymous scanner sends no cookie. A caller who presents
+    a well-formed id cannot be refused without a `SELECT`, because validating
+    a session IS a database read; for that caller the guarantee is
+    indistinguishability (`_anonymous_refusal`), not ordering.
+
+    Split out of `_get_session` rather than left inline because inline it ran
+    AFTER the sub-dependency resolved, which is the whole defect.
+    """
+    raw = clinical_session
+    if not raw and authorization.lower().startswith("bearer "):
+        raw = authorization[len("bearer ") :].strip()
+    if not raw:
+        raise _anonymous_refusal()
+
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        raise _anonymous_refusal()
+
+
+def _get_session(
+    session_id: uuid.UUID = Depends(_presented_session_id),
     dao: DataAccess = Depends(_get_data_access),
 ) -> Session:
     """
     FastAPI dependency: the authenticated session, or 401.
 
-    Reads an opaque session id from the `clinical_session` cookie or an
-    `Authorization: Bearer <id>` header, and validates it through
+    The opaque session id is read and shape-checked by
+    `_presented_session_id`, which is declared FIRST and touches nothing --
+    see its docstring, and w132 fix B. What is left here is the half that
+    genuinely requires the database: validating the id through
     `DataAccess.session_valid`, which refreshes the idle window and raises for
     a session that is terminated, past its absolute cap, or idle too long.
 
@@ -179,36 +318,95 @@ def _get_session(
     expired one and a terminated one are indistinguishable to the caller --
     `data_access.GENERIC_AUTH_ERROR`, which that module already uses for
     exactly this reason. Distinguishing them would tell an unauthenticated
-    caller which session ids exist.
+    caller which session ids exist. Since w132 the same object also answers an
+    unconfigured and an unreachable database, so the STATUS does not
+    discriminate either.
 
     Depends on `_get_data_access`, so within one request the session lookup
     and the endpoint body share one connection and one transaction: FastAPI
     caches a dependency's result per request, so this does not open a second.
     """
-    raw = clinical_session
-    if not raw and authorization.lower().startswith("bearer "):
-        raw = authorization[len("bearer ") :].strip()
-    if not raw:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=GENERIC_AUTH_ERROR,
-        )
-
-    try:
-        session_id = uuid.UUID(raw)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=GENERIC_AUTH_ERROR,
-        )
-
     try:
         return dao.session_valid(session_id)
     except AuthenticationError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=GENERIC_AUTH_ERROR,
-        )
+        raise _anonymous_refusal()
+
+
+def _clear_session_cookie(response: Response, name: str, path: str) -> None:
+    """
+    THE ONLY PLACE IN THIS REPOSITORY THAT CLEARS A COOKIE — the mirror of
+    `auth_endpoints._set_session_cookie`, which is the only place that sets
+    one.
+
+    WHY IT IS IN THIS MODULE AND THE SETTER IS IN THAT ONE, stated because a
+    reader will otherwise assume somebody was careless: `auth_endpoints`
+    imports from here, so the reverse import would be a cycle. What matters is
+    that each half is singular and that the two agree on `path`, which is
+    pinned structurally — see `test_w132_structural_guards.py`.
+
+    `path` MUST MATCH THE PATH THE COOKIE WAS SET WITH. A browser keys a
+    cookie on (name, domain, path); a deletion sent with a different path
+    creates a second, empty cookie and leaves the live credential in the jar.
+    The server-side termination is what actually ends the session, so a
+    mismatch here would not leave the session usable — but it would leave a
+    valid-looking credential in the browser, which is a different and worse
+    kind of confusion.
+
+    `httponly`/`secure`/`samesite` are repeated because a deletion is an
+    ordinary Set-Cookie with an expiry in the past: over plain HTTP a browser
+    would ignore a Secure deletion for a Secure cookie, so the attributes must
+    match the ones the cookie was set with.
+    """
+    response.delete_cookie(
+        key=name,
+        path=path,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+
+
+@session_router.post(
+    "/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="End the calling STAFF session",
+    responses={
+        204: {"description": "The session is terminated and the cookie cleared"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+    },
+)
+async def staff_logout(
+    session: Session = Depends(_get_session),
+    dao: DataAccess = Depends(_get_data_access),
+) -> Response:
+    """
+    End the calling session and clear the cookie.
+
+    THERE IS NO REQUEST BODY AND NO PATH PARAMETER, so a caller has no way to
+    name a session. That is the same construction `/portal/me` uses to make
+    "the patient cannot ask for somebody else's record" structural rather than
+    checked, and it is what the obvious wrong version gets wrong: a
+    `{"session_id": ...}` body scoped only to the caller's organisation lets
+    any authenticated user end a colleague's session from a route called
+    logout. A body that does not exist cannot carry an identifier, and a
+    query string that invents one is ignored by construction.
+
+    BOTH HALVES, AND THE SERVER HALF IS THE ONE THAT MATTERS. The cookie is
+    cleared so the browser stops presenting a credential it can no longer use;
+    the session is terminated server-side so that a copy of the cookie taken
+    from anywhere else is dead too. A logout that only cleared the cookie
+    would look identical to a person and be worth nothing to an attacker
+    holding the id.
+
+    EVERY REFUSAL IS THE SAME REFUSAL: an anonymous caller, a malformed id, an
+    unknown id, an already-terminated session and a PATIENT session id all
+    reach `_get_session`, which answers `_anonymous_refusal()`. So this route
+    tells nobody which session ids exist — including by succeeding.
+    """
+    dao.terminate_my_session(session)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _clear_session_cookie(response, _SESSION_COOKIE, path="/")
+    return response
 
 
 @router.get(
@@ -300,10 +498,12 @@ async def get_exceptions_for_order(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Order not found",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving exceptions: {str(e)}",
+            detail=f"Error retrieving exceptions: {type(e).__name__}",
         )
 
 
@@ -382,10 +582,12 @@ async def get_exceptions_worklist(
 
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving worklist: {str(e)}",
+            detail=f"Error retrieving worklist: {type(e).__name__}",
         )
 
 
@@ -502,8 +704,27 @@ async def resolve_exception(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exception {exception_id} not found",
         )
+    except HTTPException:
+        # Do not re-wrap. Wrapping turned the handler's own 404 and its own 500
+        # into "Error resolving exception: 500: ...", which is how one half of
+        # the existence oracle got its distinctive wording.
+        raise
     except Exception as e:
+        # w129 GAP-2, second half. THE TYPE, NEVER THE TEXT.
+        #
+        # This read f"...{str(e)}". Measured at 9bc3abd, that returned
+        #   {"detail":"Error resolving exception: current transaction is
+        #    aborted, commands ignored until end of transaction block"}
+        # to an authenticated caller in a DIFFERENT organisation -- the driver's
+        # own message, and the half of the existence oracle that told the caller
+        # its guessed UUID belongs to nobody. clinical/app.py:118-121 settled
+        # the rule for this repository and gives the reason in one line: "a
+        # libpq error message quotes the connection string back".
+        #
+        # The same statement stood on the two neighbouring read routes in this
+        # file and is changed there too; fixing only the route the oracle was
+        # found on would have left the identical leak twice over.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error resolving exception: {str(e)}",
+            detail=f"Error resolving exception: {type(e).__name__}",
         )

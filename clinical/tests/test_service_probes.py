@@ -145,10 +145,18 @@ class TestTheRouterIsMountedOnTheRealApp:
         Before this change `include_router` appeared once in the repository,
         in a test file. The routes existed and nothing served them.
 
-        Takes `bootstrapped` so the DSN is configured: without it these routes
-        answer 503 rather than 401, because `_get_session` depends on
-        `_get_data_access` and an unconfigured service outranks an
-        unauthenticated caller. Correct, but it would not prove a mount.
+        Takes `bootstrapped` so the DSN is configured. It used to matter for a
+        second reason: without it these routes answered 503 rather than 401,
+        because `_get_session` depends on `_get_data_access` and an
+        unconfigured service outranked an unauthenticated caller.
+
+        THAT IS NO LONGER TRUE, and the change is w132 fix B: an unconfigured
+        service, an unreachable one and a bad credential are now the same 401
+        with the same body, because the difference was readable by an
+        anonymous caller as the state of the clinical database. So the DSN no
+        longer changes what these routes answer — but the fixture stays,
+        because a 401 that arrives for the right reason and a 401 that arrives
+        because nothing is configured prove different things about a mount.
         """
         # Asserted by REQUESTING the routes rather than by reading the app's
         # route table: an unmounted route 404s, and a mounted one that needs a

@@ -58,6 +58,21 @@ def session_admin(dao, org_a, conn):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_a, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_a, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org_a, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+        )
     conn.commit()
     return dao.login("admin@org-a.test", org_a, "password")
 
@@ -1000,6 +1015,21 @@ class TestOrgIsolationLineage:
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
                 (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
             )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
         conn.commit()
         session_b = dao.login("admin@org-b.test", org_b, "password")
 
@@ -1023,6 +1053,21 @@ class TestOrgIsolationLineage:
             cur.execute(
                 "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
                 (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
             )
         conn.commit()
@@ -1058,6 +1103,21 @@ class TestOrgIsolationLineage:
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
                 (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
             )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
         conn.commit()
         session_b = dao.login("admin@org-b.test", org_b, "password")
 
@@ -1091,6 +1151,21 @@ class TestOrgIsolationLineage:
             cur.execute(
                 "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
                 (user_id, org_b, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
             )
         conn.commit()
@@ -1278,9 +1353,39 @@ class TestLineageQueries:
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
                 (user_a, org_a, user_a, now),
             )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_a, org_a, user_a, now),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
+                (user_a, org_a, user_a, now),
+            )
             cur.execute(
                 "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
+                (user_b, org_b, user_b, now),
+            )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_b, org_b, user_b, now),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
                 (user_b, org_b, user_b, now),
             )
         conn.commit()
@@ -1630,9 +1735,39 @@ class TestLineageQueries:
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
                 (user_a, org_a, user_a, now),
             )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_a, org_a, user_a, now),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
+                (user_a, org_a, user_a, now),
+            )
             cur.execute(
                 "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                 "VALUES (%s, %s, 'Administrator', %s, %s)",
+                (user_b, org_b, user_b, now),
+            )
+            # w129 phase B: the ordering operations require Orderer and the
+            # sample / laboratory / QC operations require Lab technician. This
+            # fixture's account is the whole staff of its organisation -- it
+            # orders, receives, runs and reviews -- so it holds the roles for
+            # the work it performs. Roles are additive; still an Administrator.
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Orderer', %s, %s)",
+                (user_b, org_b, user_b, now),
+            )
+            cur.execute(
+                "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+                "VALUES (%s, %s, 'Lab technician', %s, %s)",
                 (user_b, org_b, user_b, now),
             )
         conn.commit()

@@ -120,6 +120,21 @@ def session(dao, conn, org):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
     conn.commit()
     admin = dao.login("admin@state.test", org, "password")
     # The Interpreter role as well: create_report requires it, and this file needs
@@ -329,7 +344,7 @@ class TestTheWalkBackIsNowRefused:
         # because a trigger that only guarded OLD.state = 'approved' would pass
         # every other test in this class while leaving released rows rewritable.
         psycopg = pytest.importorskip("psycopg", reason="psycopg not installed")
-        dao._release_report(session, approved_report, consumer="LIMS", actor_id=approver.user_id)
+        dao._release_report(approver, approved_report, consumer="LIMS", actor_id=approver.user_id)
         with conn.cursor() as cur:
             with pytest.raises(psycopg.errors.RaiseException) as caught:
                 cur.execute("UPDATE reports SET state = 'under_review' WHERE id = %s", (approved_report,))
@@ -341,7 +356,7 @@ class TestTheWalkBackIsNowRefused:
         # by a trigger that refuses every state change -- which would break
         # release outright while every refusal above went on passing. approved ->
         # released is precisely what _release_report performs.
-        dao._release_report(session, approved_report, consumer="LIMS", actor_id=approver.user_id)
+        dao._release_report(approver, approved_report, consumer="LIMS", actor_id=approver.user_id)
         state = conn.execute("SELECT state FROM reports WHERE id = %s", (approved_report,)).fetchone()[0]
         assert state == "released"
 
@@ -354,17 +369,17 @@ class TestTheDeliveryGateFiltersOnState:
     exactly the kind of thing that must be asserted rather than assumed.
     """
 
-    def test_an_approved_report_is_delivered(self, dao, session, approved_report):
+    def test_an_approved_report_is_delivered(self, dao, session, approver, approved_report):
         # THE PERMITTED DIRECTION, and it is not padding: without it, a gate that
         # refused everything would satisfy every refusal test below.
-        dao.require_release(session, approved_report)
+        dao.require_release(approver, approved_report)
 
     def test_a_released_report_is_still_delivered(self, dao, session, approver, approved_report):
-        dao._release_report(session, approved_report, consumer="LIMS", actor_id=approver.user_id)
-        dao.require_release(session, approved_report)
+        dao._release_report(approver, approved_report, consumer="LIMS", actor_id=approver.user_id)
+        dao.require_release(approver, approved_report)
 
     @pytest.mark.parametrize("state", NON_DELIVERY_STATES)
-    def test_the_gate_refuses_every_non_delivery_state(self, dao, session, report_in_state, state):
+    def test_the_gate_refuses_every_non_delivery_state(self, dao, session, approver, report_in_state, state):
         # REWRITTEN. This used to approve a report and walk it back into `state`,
         # which the trigger now refuses. The SUBJECT was never the walk-back --
         # it is the gate's decision rule -- so the report is now constructed in
@@ -375,16 +390,16 @@ class TestTheDeliveryGateFiltersOnState:
         # up here as an unlisted case rather than as silence.
         report_id = report_in_state(state)
         with pytest.raises(ValueError, match=state):
-            dao.require_release(session, report_id)
+            dao.require_release(approver, report_id)
 
-    def test_amendment_creation_filters_on_state_too(self, dao, session, report_in_state):
+    def test_amendment_creation_filters_on_state_too(self, dao, session, approver, report_in_state):
         # REWRITTEN, same reasoning. The second path the read-side enumeration
         # found: amending requires the original to be approved or released, which
         # matters because amendment is the ISO 15189 7.4.1.8 mechanism for
         # correcting a report without altering the original.
         report_id = report_in_state("draft")
         with pytest.raises(ValueError, match="only approved or released"):
-            dao.create_amendment(session, report_id, reason="corrected variant call")
+            dao.create_amendment(approver, report_id, reason="corrected variant call")
 
 
 # ─── RETIRED: three tests whose SUBJECT was the gap itself ───────────────────
@@ -444,7 +459,7 @@ class TestRetrievalDoesNotFilterOnState:
         # through the workflow rather than by a raw write -- approved by the
         # fixture, released by the one forward transition the trigger permits.
         if state == "released":
-            dao._release_report(session, approved_report, consumer="LIMS", actor_id=approver.user_id)
+            dao._release_report(approver, approved_report, consumer="LIMS", actor_id=approver.user_id)
         assert dao.get_report(session, approved_report) is not None
 
     @pytest.mark.parametrize("state", NON_DELIVERY_STATES)

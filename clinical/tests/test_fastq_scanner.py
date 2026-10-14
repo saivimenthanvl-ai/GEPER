@@ -12,6 +12,15 @@ Phase 5d trap stated as a habit rather than a warning: a test that calls
 `db_session.execute()` INSTEAD OF the code under test verifies the database and
 passes while the code is broken.
 
+w129c: THE SCAN IS DRIVEN BY A SESSION, NOT AN org_id. `scan_org` takes the
+caller's `Session` and the organisation follows from it. The change through
+this file is mechanical -- the fixture already logged in, and it now also mints
+the System session the scan runs as -- and that is the point of keeping these
+tests unchanged otherwise: the behaviour below is the POSITIVE TWIN of the new
+authorisation tests in `test_w129c_fastq_session.py`. Deferral, idempotency,
+the file checks, read-only-ness, the audit row and org separation all still
+hold. The scanner deliberately does NOT mint the session itself; see that file.
+
 THE IDEMPOTENCY KEY IS THE CHECKSUM PAIR, NOT THE PATH (human ruling,
 2026-09-08). This is why the table deliberately carries no
 `UNIQUE (org_id, r1_path)`: a moved or renamed file with the same content is
@@ -84,7 +93,9 @@ def _seed_org_with_sample(dao, conn, label: str):
     org_id = dao.create_organisation(f"Scan Org {label}")
     admin_id = dao.create_user(org_id, f"admin@scan-{label}.test", "password")
     with conn.cursor() as cur:
-        for role in ("Administrator", "Interpreter"):
+        # w129 phase B: this fixture's account seeds an order and a sample, so it
+        # holds Orderer and Lab technician alongside the roles it already had.
+        for role in ("Administrator", "Interpreter", "Orderer", "Lab technician"):
             cur.execute(
                 "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
                 "VALUES (%s, %s, %s, %s, %s)",
@@ -118,7 +129,21 @@ def _seed_org_with_sample(dao, conn, label: str):
             (sample_id, order_id, org_id, NOW, admin_id),
         )
     conn.commit()
-    return {"org_id": org_id, "sample_id": sample_id, "user_id": admin_id}
+
+    # w129c: the scanner now takes the CALLER'S session, so this fixture --
+    # which already logs in at the top -- also mints the System session the
+    # scan runs as. It is minted HERE, in a test, and not in the scanner:
+    # `_create_system_session` is an authentication bypass whose call sites are
+    # pinned to background workers in geper/api/, and clinical/tests/ is
+    # excluded from that scan on purpose.
+    system = dao._create_system_session(org_id)
+    conn.commit()
+    return {
+        "org_id": org_id,
+        "sample_id": sample_id,
+        "user_id": admin_id,
+        "session": system,
+    }
 
 
 @pytest.fixture()
@@ -167,18 +192,18 @@ def _rows(conn, org_id):
         return cur.fetchall()
 
 
-def _scan_twice(scanner, org_id):
+def _scan_twice(scanner, session):
     """A set is only ingested once its size has held across two scans, so the
     ordinary path is two calls. Returning both results keeps the deferral
     visible to tests rather than hidden inside a helper."""
-    return scanner.scan_org(org_id), scanner.scan_org(org_id)
+    return scanner.scan_org(session), scanner.scan_org(session)
 
 
 class TestASetIsIngestedOnceItsSizeHasHeld:
     def test_the_first_sighting_is_deferred_not_ingested(self, dao, conn, two_orgs, root):
         a = two_orgs["a"]
         _write_pair(_incoming(root, a["org_id"]), a["sample_id"])
-        result = _scanner(dao, root).scan_org(a["org_id"])
+        result = _scanner(dao, root).scan_org(a["session"])
         conn.commit()
         assert result.ingested == []
         assert len(result.deferred) == 1
@@ -189,7 +214,7 @@ class TestASetIsIngestedOnceItsSizeHasHeld:
         a = two_orgs["a"]
         r1, r2, sum1, sum2 = _write_pair(_incoming(root, a["org_id"]), a["sample_id"])
         scanner = _scanner(dao, root)
-        _, second = _scan_twice(scanner, a["org_id"])
+        _, second = _scan_twice(scanner, a["session"])
         conn.commit()
         assert len(second.ingested) == 1
         rows = _rows(conn, a["org_id"])
@@ -208,9 +233,9 @@ class TestASetIsIngestedOnceItsSizeHasHeld:
         directory = _incoming(root, a["org_id"])
         r1, r2, _, _ = _write_pair(directory, a["sample_id"])
         scanner = _scanner(dao, root)
-        scanner.scan_org(a["org_id"])
+        scanner.scan_org(a["session"])
         _write_gz(r1, b"@r1\nACGT\n+\nIIII\n" * 50)  # still being written
-        second = scanner.scan_org(a["org_id"])
+        second = scanner.scan_org(a["session"])
         conn.commit()
         assert second.ingested == []
         assert [d.reason for d in second.deferred] == ["awaiting_size_stability"]
@@ -222,9 +247,9 @@ class TestTheChecksumPairIsTheIdempotencyKey:
         a = two_orgs["a"]
         _write_pair(_incoming(root, a["org_id"]), a["sample_id"])
         scanner = _scanner(dao, root)
-        _scan_twice(scanner, a["org_id"])
+        _scan_twice(scanner, a["session"])
         conn.commit()
-        third = scanner.scan_org(a["org_id"])
+        third = scanner.scan_org(a["session"])
         conn.commit()
         assert third.ingested == []
         assert [s.reason for s in third.skipped] == ["already_recorded"]
@@ -237,11 +262,11 @@ class TestTheChecksumPairIsTheIdempotencyKey:
         directory = _incoming(root, a["org_id"])
         r1, r2, _, _ = _write_pair(directory, a["sample_id"], tag="S1_L001")
         scanner = _scanner(dao, root)
-        _scan_twice(scanner, a["org_id"])
+        _scan_twice(scanner, a["session"])
         conn.commit()
         r1.rename(directory / f"{a['sample_id']}_S9_L009_R1_001.fastq.gz")
         r2.rename(directory / f"{a['sample_id']}_S9_L009_R2_001.fastq.gz")
-        _scan_twice(scanner, a["org_id"])
+        _scan_twice(scanner, a["session"])
         conn.commit()
         assert len(_rows(conn, a["org_id"])) == 1
 
@@ -253,11 +278,11 @@ class TestTheChecksumPairIsTheIdempotencyKey:
         directory = _incoming(root, a["org_id"])
         r1, r2, _, _ = _write_pair(directory, a["sample_id"])
         scanner = _scanner(dao, root)
-        _scan_twice(scanner, a["org_id"])
+        _scan_twice(scanner, a["session"])
         conn.commit()
         _write_gz(r1, b"@r1\nGGGG\n+\nIIII\n")
         _write_gz(r2, b"@r2\nCCCC\n+\nIIII\n")
-        _scan_twice(scanner, a["org_id"])
+        _scan_twice(scanner, a["session"])
         conn.commit()
         rows = _rows(conn, a["org_id"])
         assert len(rows) == 2
@@ -276,7 +301,7 @@ class TestAnotherOrgsSampleIsIndistinguishableFromUnknown:
         unknown = uuid.uuid4()
         _write_pair(directory, unknown, tag="S2_L001")  # no such sample anywhere
         scanner = _scanner(dao, root)
-        _, second = _scan_twice(scanner, a["org_id"])
+        _, second = _scan_twice(scanner, a["session"])
         conn.commit()
 
         by_sample = {r.sample_id: r for r in second.rejected}
@@ -293,7 +318,7 @@ class TestAnotherOrgsSampleIsIndistinguishableFromUnknown:
         would pass the test above."""
         a = two_orgs["a"]
         _write_pair(_incoming(root, a["org_id"]), a["sample_id"])
-        _, second = _scan_twice(_scanner(dao, root), a["org_id"])
+        _, second = _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         assert len(second.ingested) == 1
         assert second.rejected == []
@@ -305,7 +330,7 @@ class TestTheFileChecks:
         directory = _incoming(root, a["org_id"])
         (directory / "not-a-fastq-set.txt").write_bytes(b"hello")
         (directory / "missing_read_marker_001.fastq.gz").write_bytes(b"\x1f\x8b")
-        _, second = _scan_twice(_scanner(dao, root), a["org_id"])
+        _, second = _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         names = sorted(r.detail for r in second.rejected)
         assert names == ["missing_read_marker_001.fastq.gz", "not-a-fastq-set.txt"], second.rejected
@@ -316,7 +341,7 @@ class TestTheFileChecks:
         directory = _incoming(root, a["org_id"])
         r1, r2, _, _ = _write_pair(directory, a["sample_id"])
         r2.unlink()
-        _, second = _scan_twice(_scanner(dao, root), a["org_id"])
+        _, second = _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         assert [r.reason for r in second.rejected] == ["incomplete_pair"]
         assert _rows(conn, a["org_id"]) == []
@@ -328,7 +353,7 @@ class TestTheFileChecks:
         directory = _incoming(root, a["org_id"])
         r1, r2, _, _ = _write_pair(directory, a["sample_id"])
         r2.write_bytes(b"\x1f\x8b\x08\x00" + b"garbage that is not a gzip stream")
-        _, second = _scan_twice(_scanner(dao, root), a["org_id"])
+        _, second = _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         assert [r.reason for r in second.rejected] == ["gzip_unreadable"]
         assert _rows(conn, a["org_id"]) == []
@@ -338,7 +363,7 @@ class TestTheFileChecks:
         Computed here independently of the scanner."""
         a = two_orgs["a"]
         r1, r2, sum1, sum2 = _write_pair(_incoming(root, a["org_id"]), a["sample_id"])
-        _scan_twice(_scanner(dao, root), a["org_id"])
+        _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         row = _rows(conn, a["org_id"])[0]
         assert row[4] == hashlib.sha256(r1.read_bytes()).hexdigest() == sum1
@@ -359,7 +384,7 @@ class TestTheScannerIsReadOnly:
             return {p.name: (p.stat().st_size, p.read_bytes()) for p in sorted(directory.iterdir())}
 
         before = snapshot()
-        _scan_twice(_scanner(dao, root), a["org_id"])
+        _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         assert snapshot() == before
 
@@ -370,7 +395,7 @@ class TestTheScanIsAudited:
         one: the row must land in audit_log like every other write."""
         a = two_orgs["a"]
         _write_pair(_incoming(root, a["org_id"]), a["sample_id"])
-        _scan_twice(_scanner(dao, root), a["org_id"])
+        _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         with conn.cursor() as cur:
             cur.execute(
@@ -385,13 +410,13 @@ class TestOneOrgsScanCannotSeeAnothersDirectory:
         a, b = two_orgs["a"], two_orgs["b"]
         _write_pair(_incoming(root, a["org_id"]), a["sample_id"])
         _write_pair(_incoming(root, b["org_id"]), b["sample_id"])
-        _scan_twice(_scanner(dao, root), a["org_id"])
+        _scan_twice(_scanner(dao, root), a["session"])
         conn.commit()
         assert len(_rows(conn, a["org_id"])) == 1
         # THE HALF THAT MAKES IT MEAN SOMETHING: B's files really are there and
         # really are ingestible, so A's scan returned one row because it was
         # scoped, not because B's directory was empty or unreadable.
         assert _rows(conn, b["org_id"]) == []
-        _scan_twice(_scanner(dao, root), b["org_id"])
+        _scan_twice(_scanner(dao, root), b["session"])
         conn.commit()
         assert len(_rows(conn, b["org_id"])) == 1

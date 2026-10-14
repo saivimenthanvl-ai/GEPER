@@ -23,6 +23,7 @@ import ast
 import datetime as dt
 import os
 import pathlib
+import re
 import uuid
 
 import pytest
@@ -31,6 +32,7 @@ from clinical.data_access import (
     GENERIC_AUTH_ERROR,
     MAX_FAILED_LOGIN_ATTEMPTS,
     ORG_SCOPED_TABLES,
+    TABLES_EXEMPT_FROM_ORG_SCOPING,
     AuthenticationError,
     AuthorizationError,
     BcryptHasher,
@@ -81,12 +83,28 @@ class ReversibleCipher:
 
 
 class FixedTotpVerifier:
-    """Accepts one known code, so the suite does not depend on pyotp or on time steps."""
+    """
+    Accepts one known code, so this file does not depend on pyotp.
+
+    UPDATED w164, AND IT IS NOT A WEAKENING. `verify(...) -> bool` became
+    `matching_step(...) -> int | None`, because one-time use needs to know
+    WHICH step a code belongs to and a boolean cannot say. The step is derived
+    from the injected clock, so the replay guard is exercised here too: a test
+    that logs in twice on a frozen `FakeClock` with the same code is refused
+    the second time, which is the real behaviour.
+
+    It no longer pins `secret == "SECRET"`, because the secret is now generated
+    inside `enrol_totp` and the caller never sees it until it is returned. The
+    secret it IS given is asserted to be non-empty, so a stand-in handed
+    nothing still fails.
+    """
 
     VALID = "424242"
 
-    def verify(self, secret: str, code: str, at: dt.datetime) -> bool:
-        return secret == "SECRET" and code == self.VALID
+    def matching_step(self, secret: str, code: str, at: dt.datetime) -> int | None:
+        if not secret or code != self.VALID:
+            return None
+        return int(at.timestamp()) // 30
 
 
 # ─── fixtures ────────────────────────────────────────────────────────────────
@@ -152,6 +170,21 @@ def admin_session(dao, org_a, conn):
         cur.execute(
             "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
             "VALUES (%s, %s, 'Administrator', %s, %s)",
+            (admin_id, org_a, admin_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+        )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (admin_id, org_a, admin_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
             (admin_id, org_a, admin_id, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)),
         )
     return dao.login("admin@a.example", org_a, "correct horse battery staple", ip_address="10.0.0.1")
@@ -526,7 +559,7 @@ class TestRoles:
 class TestTotp:
     def test_totp_required_once_enrolled(self, dao, org_a, admin_session):
         target = dao.create_user(org_a, "mfa@a.example", "a sufficiently long password")
-        dao.enrol_totp(admin_session, target, "SECRET")
+        dao.enrol_totp(admin_session, target)
 
         with pytest.raises(AuthenticationError):
             dao.login("mfa@a.example", org_a, "a sufficiently long password")
@@ -541,7 +574,7 @@ class TestTotp:
 
     def test_recovery_code_used_once(self, dao, org_a, admin_session):
         target = dao.create_user(org_a, "codes@a.example", "a sufficiently long password")
-        codes = dao.enrol_totp(admin_session, target, "SECRET")
+        codes = dao.enrol_totp(admin_session, target).backup_codes
         assert len(codes) == 8
 
         first = codes[0]
@@ -556,7 +589,7 @@ class TestTotp:
 
     def test_backup_codes_are_not_stored_readably(self, dao, conn, org_a, admin_session):
         target = dao.create_user(org_a, "hashed@a.example", "a sufficiently long password")
-        codes = dao.enrol_totp(admin_session, target, "SECRET")
+        codes = dao.enrol_totp(admin_session, target).backup_codes
 
         with conn.cursor() as cur:
             cur.execute(
@@ -580,6 +613,81 @@ class TestStructuralIsolation:
     """
 
     @staticmethod
+    def _schema_tables() -> dict[str, str]:
+        """
+        Every CREATE TABLE in schema.sql, name -> column/constraint body.
+
+        The census the coverage guard is derived from. Parsing the schema
+        rather than reading a hand-written tuple is the whole point: a table
+        that exists is on this list the moment it is created, whether or not
+        anybody remembered to mention it in Python.
+        """
+        src = SCHEMA_PATH.read_text(encoding="utf-8")
+        return dict(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\((.*?)\n\);", src, re.S))
+
+    @classmethod
+    def _org_owned_tables(cls) -> set[str]:
+        """Schema census minus the written exemptions. Never the hand-written tuple."""
+        return set(cls._schema_tables()) - set(TABLES_EXEMPT_FROM_ORG_SCOPING)
+
+    def test_org_scoped_table_coverage_is_derived_from_the_schema(self):
+        """
+        w129 GAP-3. ORG_SCOPED_TABLES listed twelve of the schema's twenty-six
+        tables. The twelve it omitted were not exempt and not argued for --
+        they were simply missing, and a missing name is a guard rail that
+        silently declines to look. exception_events, where the cross-tenant
+        write of GAP-1 landed, was one of them.
+
+        So the coverage is derived here from schema.sql, and the tuple is held
+        to the derivation. A new org-owned table fails this test on the day it
+        is created; the only way out is to name it in
+        TABLES_EXEMPT_FROM_ORG_SCOPING with a reason somebody has to write down.
+        """
+        census = set(self._schema_tables())
+        assert census, "parsed no CREATE TABLE from schema.sql -- the census regex is broken, not the schema"
+
+        exempt = set(TABLES_EXEMPT_FROM_ORG_SCOPING)
+        listed = set(ORG_SCOPED_TABLES)
+
+        assert not (listed & exempt), f"table(s) both listed as org-scoped and exempted: {sorted(listed & exempt)}"
+        assert not (exempt - census), f"exemption(s) for table(s) that are not in schema.sql: {sorted(exempt - census)}"
+
+        missing = census - exempt - listed
+        assert not missing, (
+            f"org-owned table(s) in schema.sql that ORG_SCOPED_TABLES does not cover: {sorted(missing)}. "
+            "Add the name and bind org_id in every statement against it, or exempt it in "
+            "TABLES_EXEMPT_FROM_ORG_SCOPING with a written reason."
+        )
+        stale = listed - census
+        assert not stale, f"ORG_SCOPED_TABLES names table(s) that schema.sql does not create: {sorted(stale)}"
+
+    def test_only_a_table_without_an_org_id_column_may_be_exempt(self):
+        """
+        The interlock that stops the exemption list becoming the new hiding
+        place. Exemption is available only where the column genuinely does not
+        exist -- so a table cannot be exempted out of the org_id rule once it
+        has an org_id, and conversely every name on ORG_SCOPED_TABLES must
+        actually have the column it is being held to.
+        """
+        tables = self._schema_tables()
+
+        def has_org_id(body: str) -> bool:
+            return re.search(r"^\s*org_id\b", body, re.M) is not None
+
+        wrongly_exempt = [name for name in TABLES_EXEMPT_FROM_ORG_SCOPING if has_org_id(tables.get(name, ""))]
+        assert not wrongly_exempt, (
+            f"table(s) exempted from org scoping that DO have an org_id column: {wrongly_exempt}. "
+            "The exemption exists for tables where the column is absent, not for tables where "
+            "binding it was inconvenient."
+        )
+
+        no_column = [name for name in ORG_SCOPED_TABLES if not has_org_id(tables.get(name, ""))]
+        assert not no_column, (
+            f"table(s) declared org-scoped with no org_id column in schema.sql: {no_column}. "
+            "The statements against them cannot bind what the table does not have."
+        )
+
+    @staticmethod
     def _sql_literals() -> list[str]:
         source = (pathlib.Path(__file__).resolve().parent.parent / "data_access.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -592,13 +700,25 @@ class TestStructuralIsolation:
         return out
 
     def test_every_org_scoped_statement_binds_org_id(self):
+        """
+        Driven off the SCHEMA-DERIVED set, deliberately, and not off
+        ORG_SCOPED_TABLES.
+
+        If this read the tuple, then deleting a name from the tuple would
+        delete the check -- which is precisely the shape of the GAP-3 defect:
+        the guard was silent about exception_events because nobody had typed
+        its name. Deriving the set here means the only way to stop this test
+        looking at a table is to remove the table from the schema or to write
+        an exemption for it, and the exemption is itself checked above.
+        """
+        scoped = self._org_owned_tables()
         offenders = []
         for sql in self._sql_literals():
-            touches_scoped = any(
-                f"{verb} {table}" in sql for table in ORG_SCOPED_TABLES for verb in ("FROM", "INTO", "UPDATE", "JOIN")
+            touched = sorted(
+                {table for table in scoped for verb in ("FROM", "INTO", "UPDATE", "JOIN") if f"{verb} {table}" in sql}
             )
-            if touches_scoped and "org_id" not in sql:
-                offenders.append(sql)
+            if touched and "org_id" not in sql:
+                offenders.append(f"{','.join(touched)}: {sql}")
         assert not offenders, "statement(s) against an org-scoped table without an org_id predicate:\n  " + "\n  ".join(
             offenders
         )
@@ -670,36 +790,166 @@ class TestStructuralIsolation:
             f"@auditable(auditable=False, reason='...')."
         )
 
-    def test_create_system_session_call_site_enforcement(self):
-        """
-        _create_system_session is an authentication bypass. It must be called from
-        exactly one location (the automatic submission path), enforced via AST.
-        """
-        source = (pathlib.Path(__file__).resolve().parent.parent / "data_access.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
+    # ─── the _create_system_session call-site guard (w129 GAP-5) ─────────────
+    #
+    # THE CONTROL THAT REPORTED ITSELF ENFORCED AND WAS NOT.
+    #
+    # This guard used to read only clinical/data_access.py and match only
+    # `self._create_system_session(...)`. There are ZERO such calls in that
+    # file. The assertion was `0 <= 1`. It passed vacuously and had never once
+    # examined a real call site -- Rule 4 in its exact form, a counting test
+    # satisfied by the broken state as easily as by the working one.
+    #
+    # Widening the matcher and the tree makes it report 4, not 0. The stated
+    # invariant was "at most one"; reality is four. THE RULE WAS NOT "ONE", AND
+    # THE NUMBER WAS NOT CHANGED TO MAKE A TEST PASS. It was established from
+    # the code, and this is what the four sites have in common:
+    #
+    #   * all four are inside a BACKGROUND WORKER CLASS in geper/api/ --
+    #     ExceptionRetryWorker and InterpretationWorker;
+    #   * each worker class is instantiated in exactly one place, its own
+    #     module's main() entry point, and in nothing else: counted repo-wide,
+    #     `InterpretationWorker(` and `ExceptionRetryWorker(` appear zero times
+    #     outside their own modules and the test suites, and neither appears in
+    #     geper/api/main.py, clinical/app.py or clinical/endpoints.py at all;
+    #   * so none of them sits in, or is reachable from, a request-handling
+    #     path -- which is precisely and only what the method's docstring says
+    #     must never happen;
+    #   * each needs an organisation context for work that HAS no human actor:
+    #     retry scheduling, recording a submission failure, clinical preflight
+    #     for a queued submission, and reconciling interrupted submissions.
+    #
+    # The invariant is therefore about WHERE, not HOW MANY, and the sites are
+    # pinned BY NAME. A fifth call site fails this test; so does reverting the
+    # widening, because a narrowed scan finds fewer than four.
+    #
+    # TESTS ARE EXCLUDED FROM THE SCAN ON PURPOSE. clinical/tests/ mints system
+    # sessions dozens of times by design (test_phase_7_commit4_retention.py
+    # alone does it twenty times). The docstring's claim is about production,
+    # and a test suite is not a request-handling path.
+    _SYSTEM_SESSION_CALL_SITES = frozenset(
+        {
+            ("geper/api/exception_retry_worker.py", "ExceptionRetryWorker::_process_all_orgs"),
+            ("geper/api/submission_worker.py", "InterpretationWorker::_create_submission_failure_exception"),
+            ("geper/api/submission_worker.py", "InterpretationWorker::_clinical_preflight"),
+            ("geper/api/submission_worker.py", "InterpretationWorker::reconcile_interrupted_submissions"),
+        }
+    )
 
-        call_sites = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                # Match: self._create_system_session(...)
-                if (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_create_system_session"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "self"
-                ):
-                    # Find which method this call is in
-                    for potential_parent in ast.walk(tree):
-                        if isinstance(potential_parent, ast.FunctionDef):
-                            for child in ast.walk(potential_parent):
-                                if child is node:
-                                    call_sites.append(potential_parent.name)
-                                    break
+    @staticmethod
+    def _scan_for_system_session_calls(root: pathlib.Path) -> tuple[set[tuple[str, str]], int]:
+        """
+        Every attribute access ending in `_create_system_session` that is CALLED,
+        whatever it is spelled on -- `self.`, `self.data_access.`, `dao.`, or
+        anything else. The old matcher required the receiver to be the bare name
+        `self`, which is why it found nothing: the real sites are all
+        `self.data_access._create_system_session`.
 
-        assert len(call_sites) <= 1, (
-            f"_create_system_session must be called from at most one location "
-            f"(authentication bypass enforcement), but found {len(call_sites)} call(s): {call_sites}"
+        Returns the (file, Class::method) set and the number of files parsed, so
+        a scan that quietly stopped visiting the tree can be told apart from a
+        tree that genuinely has no call sites.
+        """
+        found: set[tuple[str, str]] = set()
+        files = 0
+        for path in sorted(root.rglob("*.py")):
+            rel = path.relative_to(root)
+            if "tests" in rel.parts or ".git" in rel.parts or ".venv" in rel.parts:
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            files += 1
+            context: list[str] = []
+            rel_posix = rel.as_posix()
+
+            class _Visitor(ast.NodeVisitor):
+                def visit_FunctionDef(self, node):  # noqa: N802
+                    context.append(node.name)
+                    self.generic_visit(node)
+                    context.pop()
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_ClassDef(self, node):  # noqa: N802
+                    context.append(node.name)
+                    self.generic_visit(node)
+                    context.pop()
+
+                def visit_Call(self, node):  # noqa: N802
+                    if isinstance(node.func, ast.Attribute) and node.func.attr == "_create_system_session":
+                        found.add((rel_posix, "::".join(context)))
+                    self.generic_visit(node)
+
+            _Visitor().visit(tree)
+        return found, files
+
+    def test_create_system_session_call_sites_are_the_four_pinned_worker_sites(self):
+        """
+        w129 GAP-5. The real source tree, the widened matcher, and the sites
+        pinned by name.
+        """
+        root = pathlib.Path(__file__).resolve().parent.parent.parent
+        found, files = self._scan_for_system_session_calls(root)
+
+        assert files > 1, (
+            f"the scan parsed {files} file(s) -- it is not looking at the source tree. "
+            "This guard was vacuous for exactly this reason once already."
         )
+
+        unexpected = found - self._SYSTEM_SESSION_CALL_SITES
+        assert not unexpected, (
+            f"NEW _create_system_session call site(s): {sorted(unexpected)}. "
+            "This method creates a session WITHOUT authentication. A new call site is "
+            "legitimate only in a background worker that has no human actor and is not "
+            "reachable from any request-handling path; if that is what this is, add it to "
+            "TestStructuralIsolation._SYSTEM_SESSION_CALL_SITES and say why. If it is in a "
+            "route, a dependency or an endpoint module, it is an authentication bypass."
+        )
+
+        missing = self._SYSTEM_SESSION_CALL_SITES - found
+        assert not missing, (
+            f"pinned call site(s) not found by the scan: {sorted(missing)}. Either they were "
+            "removed -- in which case update the pin -- or the scan has been narrowed back "
+            "to the file that contains none of them, which is the original defect."
+        )
+
+    def test_the_call_site_matcher_is_not_vacuous(self):
+        """
+        THE POSITIVE TWIN, and the direct antidote to `0 <= 1`.
+
+        The defect this guard shipped with was not a wrong threshold, it was a
+        matcher that matched nothing. An absence assertion whose matcher is
+        broken passes forever. So: show the scanner sources it has never seen,
+        each spelling a call site a different way, and require it to find every
+        one of them.
+        """
+        probe = tmp_source_tree = pathlib.Path(__import__("tempfile").mkdtemp(prefix="w129-callsite-"))
+        (probe / "worker_one.py").write_text(
+            "class W:\n    def run(self):\n        return self.data_access._create_system_session(org)\n",
+            encoding="utf-8",
+        )
+        (probe / "worker_two.py").write_text(
+            "class X:\n"
+            "    def handle(self):\n"
+            "        s = dao._create_system_session(org)\n"
+            "        return self._create_system_session(org) or s\n",
+            encoding="utf-8",
+        )
+        (probe / "not_a_call.py").write_text(
+            "REFERENCE = 'see DataAccess._create_system_session in the docstring'\n",
+            encoding="utf-8",
+        )
+        try:
+            found, files = self._scan_for_system_session_calls(tmp_source_tree)
+        finally:
+            __import__("shutil").rmtree(tmp_source_tree, ignore_errors=True)
+
+        assert files == 3
+        assert found == {
+            ("worker_one.py", "W::run"),
+            ("worker_two.py", "X::handle"),
+        }, f"the matcher missed a call site spelling: {sorted(found)}"
 
     def test_auditable_session_signature_enforcement(self):
         """

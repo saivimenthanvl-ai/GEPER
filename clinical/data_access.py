@@ -38,11 +38,13 @@ through.
 
 from __future__ import annotations
 
+import base64
 import datetime as _datetime
 import functools
 import hashlib
 import inspect
 import json
+import os
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -71,6 +73,35 @@ ROLES = (
     "Auditor",
     "System",
 )
+
+# w141. THE ROLES A PERSON MAY BE GRANTED. `ROLES` is the schema's vocabulary
+# -- the CHECK constraint on `role_assignments.role` enumerates all seven and
+# it is unchanged -- but "System" is not a role anybody holds, it is the
+# INTERNAL SYSTEM PRINCIPAL, and the difference was enforced by convention
+# only.
+#
+# THE CONVENTION, WHICH ALREADY EXISTED EVERYWHERE ELSE:
+#   * `login()` refuses any account with `is_system_account = true`
+#     (reason="system_account"), so the system principal cannot authenticate
+#     interactively;
+#   * the ONLY writer of a `role_assignments` row naming "System" is
+#     `_create_system_session`, which writes it with raw SQL alongside the
+#     `is_system_account = true` user it just created, and whose four call
+#     sites are pinned by name in test_identity.py.
+#
+# THE HOLE THOSE TWO LEFT. `_require_role(session, "System")` reads
+# `role_assignments`; it does NOT read `is_system_account`. So an
+# Administrator calling `assign_role(session, <an ordinary human>, "System")`
+# granted that human the principal the fastq detection write path gates on
+# -- and, because the human's own account is not a system account, that human
+# could still log in interactively and use it. No tenant boundary is crossed
+# (`session.org_id` binds the INSERT and the composite FK enforces it), so
+# this is a privilege-separation defect inside one organisation, not a leak.
+#
+# Stated as a set rather than as `role != "System"` at the call site so the
+# census is readable and so a future role that is also not human-assignable
+# has one place to go.
+HUMAN_ASSIGNABLE_ROLES = tuple(r for r in ROLES if r != "System")
 
 # Phase 7 commit 4 (spec 22, human ruling D2). RE-RULED 2026-09-09:
 # "everything downstream of a VCF inherits the VCF period" -- so
@@ -105,6 +136,172 @@ ASSEMBLY_CANONICAL = {
 # genuinely distinguishing message could pass one too.
 GENERIC_AUTH_ERROR = "Authentication failed."
 
+# w130. The one refusal a patient-axis miss produces, wherever it is produced.
+# A MODULE CONSTANT AND NOT AN f-STRING, for the reason the org axis already
+# learned: a message that names the identifier, or that differs between "this
+# patient is in another organisation", "this patient is not yours" and "this
+# patient does not exist", tells the caller which of the three is true. All
+# three are the same sentence, carrying no identifier.
+PATIENT_NOT_FOUND = "Patient not found."
+
+# w135. The one refusal the patient report surface produces, wherever it is
+# produced, for the same reason PATIENT_NOT_FOUND is one constant. FIVE
+# distinguishable conditions collapse onto this sentence: no such report, a
+# report belonging to another patient, a report in another organisation, and
+# the caller's OWN report in a state that has not been released -- draft,
+# under_review, approved-not-yet-released, or returned. The last of those is
+# the one worth naming: "your report exists but you may not have it yet" is a
+# clinical fact, and the release gate exists to withhold exactly that.
+REPORT_NOT_FOUND = "Report not found."
+
+
+# ─── w134: the patient-visible progress vocabulary, and what it refuses ──────
+#
+# THE CENSUS THAT PRODUCED THIS IS THE WHOLE JUSTIFICATION, so it is recorded
+# here and not in a document that ships separately from the code.
+#
+# COUNTED at 0b4bcac over non-test Python, whole tree, quoted-literal match:
+# the workflow declares NINETEEN state values across its four state columns
+# (orders.state 7, samples.qc_status 3, fastq_sets.state 4, reports.state 5).
+# TWELVE have a writer. SEVEN have none: in_progress, reported and closed on
+# orders; returned on reports; validated, rejected and consumed on fastq_sets.
+# Of those seven, exactly TWO occur at all -- `reported` and `closed`, both on
+# ONE line, data_access.py's `cancel_order` guard, and both as a READ
+# predicate. A surface built on a value nothing writes reports the same thing
+# for ever, so none of the seven appears below.
+#
+# AND A WRITER IS NOT ENOUGH. A value written and superseded inside ONE
+# transaction is never seen by any reader, so it is not a state this platform
+# can be observed in. `record_pipeline_result` inserts the sequencing run, the
+# VCF, the interpretation AND the draft report in a single transaction --
+# deliberately, so a failure cannot leave a lineage the platform never reported
+# on. That makes "processing in progress" and "interpretation in progress"
+# unobservable, and it is why the six stages below are six and not seven:
+# Processing and Interpretation are ONE stage, `analysis`, because they are one
+# commit. Splitting them would state twice what is observed once.
+#
+# WHAT EACH REFUSAL COSTS, so nobody "completes" the picture later:
+#   order.not_started      -- a listed order has a row; there is no prior state
+#   sample.in_progress     -- receive_sample writes collected_at AND
+#                             received_at in the same INSERT; nothing records
+#                             "collection requested"
+#   analysis.in_progress   -- the four-row single transaction above
+#   review.<returned>      -- zero writers, zero readers
+#   report.in_progress     -- release is one method: the release_events INSERT
+#                             and the state UPDATE. Nothing marks it pending
+#   a `processing` stage   -- sequencing_runs has no state column and no
+#                             completed_at, so a row cannot say "under way";
+#                             and fastq_sets.state is a ONE-VALUE column,
+#                             because schema.sql grants clinical_app SELECT and
+#                             INSERT on that table and no UPDATE at all
+#
+# ADDING A VALUE HERE REQUIRES A WRITER FIRST, and giving a value a writer is a
+# workflow decision -- who performs the transition and when -- not a wiring one.
+PORTAL_STAGES = ("order", "sample", "qc", "analysis", "review", "report")
+
+# The whole vocabulary. Held as a constant so a test can assert the emitted set
+# is a SUBSET of it and catch a value invented in a later edit.
+PORTAL_STAGE_STATES = ("not_started", "in_progress", "completed", "failed", "cancelled")
+
+
+def derive_order_stages(
+    *,
+    placed_at: Any,
+    cancelled_at: Any,
+    sample_count: int,
+    qc_pending: int,
+    qc_passed: int,
+    qc_failed: int,
+    interpretation_count: int,
+    report_count: int,
+    reports_signed_off: int,
+    reports_released: int,
+) -> list[dict[str, str]]:
+    """
+    Six stages for one order, DERIVED from counts of rows that already exist.
+
+    A PURE FUNCTION. No session, no connection, no clock, no writes. It is not
+    a workflow engine and cannot become one by accident: it has no notion of a
+    transition, of legality, or of what may follow what. It reads a tally and
+    names it.
+
+    KEYWORD-ONLY ON PURPOSE. Ten integers and two timestamps in positional
+    order is a defect waiting for a refactor to transpose two of them, and the
+    transposition that matters most -- qc_passed for qc_failed -- would tell a
+    patient their failed sample passed.
+
+    `failed` and `cancelled` are the two values outside the three-state
+    vocabulary, and both are states the writers genuinely produce: record_qc
+    validates its argument to exactly {passed, failed}, and cancel_order stamps
+    cancelled_at. Neither is a synthesis.
+    """
+    # ORDER. `completed` here means THE ORDER WAS PLACED -- the stage's own
+    # completion -- and nothing more. It does not and cannot mean "the test
+    # finished": `reported` and `closed` have no writer, so an order has no
+    # terminal success value to read.
+    if cancelled_at is not None:
+        order_state = "cancelled"
+    elif placed_at is not None:
+        order_state = "completed"
+    else:
+        order_state = "in_progress"
+
+    # SAMPLE. Row existence, because that is the only signal there is: a
+    # `samples` row is inserted by receive_sample and by nothing else, with
+    # received_at stamped in the same statement.
+    sample_state = "completed" if sample_count else "not_started"
+
+    # QC. The ONLY stage whose column has a writer for every declared value,
+    # and so the only one that supports the full distinction.
+    #
+    # A FAILURE ON ANY SAMPLE DOMINATES, and a pending one dominates a passed
+    # one. An order with one failed and one passed sample is not "completed":
+    # the failed specimen is the fact with a consequence for the patient, and a
+    # precedence that let it be hidden behind a passed sibling would be the
+    # status surface lying in the one place it must not.
+    if not sample_count:
+        qc_state = "not_started"
+    elif qc_failed:
+        qc_state = "failed"
+    elif qc_pending:
+        qc_state = "in_progress"
+    else:
+        qc_state = "completed"
+
+    # ANALYSIS -- sequencing run, VCF and interpretation, which are one commit.
+    # Keyed on the interpretation because it is the last of the four inserts:
+    # if it is there, the whole transaction committed.
+    analysis_state = "completed" if interpretation_count else "not_started"
+
+    # REVIEW. draft and under_review are both `in_progress` DELIBERATELY. Both
+    # have writers and the two are distinguishable, but "the report exists in
+    # draft" versus "the report has been submitted" is an internal distinction;
+    # collapsing them is refusing to make a product ruling nobody has made.
+    if not report_count:
+        review_state = "not_started"
+    elif reports_signed_off:
+        review_state = "completed"
+    else:
+        review_state = "in_progress"
+
+    # REPORT -- release. MEASURED AND STATED PLAINLY: `_release_report` is the
+    # writer, it exists, and COUNTED at 0b4bcac it has ZERO callers outside
+    # this repository's tests. In this deployment this stage therefore reads
+    # not_started for every order. That is the measurement being reported, not
+    # a defect introduced by reporting it, and the alternative -- treating
+    # `approved` as released -- would tell a patient a report had been issued
+    # when no release event exists.
+    report_state = "completed" if reports_released else "not_started"
+
+    return [
+        {"stage": "order", "state": order_state},
+        {"stage": "sample", "state": sample_state},
+        {"stage": "qc", "state": qc_state},
+        {"stage": "analysis", "state": analysis_state},
+        {"stage": "review", "state": review_state},
+        {"stage": "report", "state": report_state},
+    ]
+
 
 # ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -127,6 +324,18 @@ class NotFoundError(Exception):
     Deliberately indistinguishable from "does not exist at all": a cross-org
     read must not be able to confirm that some other organisation holds a
     record with that id. Existence is itself information.
+    """
+
+
+class PatientAlreadyEnrolledError(Exception):
+    """
+    Raised when a patient already holds a portal credential (w130).
+
+    NOT an AuthenticationError and deliberately not folded into one: this is
+    raised to a STAFF principal performing enrolment, who is entitled to know
+    why the enrolment did not happen. The generic-error discipline applies to
+    the unauthenticated login surface, where a distinguishing message is an
+    enumeration oracle; it does not apply here.
     """
 
 
@@ -299,17 +508,97 @@ class BcryptHasher:
             return False
 
 
+# ─── the second factor (w164) ────────────────────────────────────────────────
+
+# RFC 6238's default, and pyotp's. Named here rather than written as a literal
+# in two places, because `matching_step` below and the replay guard in
+# `_verify_second_factor` MUST agree about what a step is -- a disagreement
+# would either refuse valid codes or forget spent ones.
+TOTP_STEP_SECONDS = 30
+
+# One step of tolerance either side, the usual allowance for clock skew
+# between an authenticator and this server. It is deliberately small and it is
+# NOT free: a wider window is a larger set of simultaneously valid codes for an
+# attacker to guess at, and every extra step is one more that the replay guard
+# has to burn on a single login. One step each way means a code lives for at
+# most 90 seconds and exactly once.
+TOTP_WINDOW_STEPS = 1
+
+# 20 bytes = 160 bits, which is what RFC 4226 section 4 R6 requires as a
+# minimum for the shared secret, encoded base32 because that is what every
+# authenticator and every otpauth:// URI speaks.
+TOTP_SECRET_BYTES = 20
+
+
 class TotpVerifier(Protocol):
-    def verify(self, secret: str, code: str, at: _datetime.datetime) -> bool: ...
+    """
+    IT RETURNS THE STEP, NOT A BOOLEAN, AND THAT IS THE WHOLE POINT (w164).
+
+    A `-> bool` verifier can say "this code is currently acceptable" and
+    nothing more, which is not enough to refuse a REPLAY: the same code stays
+    acceptable for the rest of its step and, with the skew allowance, into the
+    next. One-time use needs to know WHICH step was accepted so that step can
+    be recorded as spent. RFC 6238 section 5.2 says the same thing -- the
+    verifier "MUST NOT accept the second attempt of the OTP generated for the
+    same time-step".
+
+    So the primitive is "which step does this code belong to, if any", and the
+    boolean is derivable from it. Returning None means no step in the window
+    matched.
+    """
+
+    def matching_step(self, secret: str, code: str, at: _datetime.datetime) -> Optional[int]: ...
 
 
 class PyOtpVerifier:
-    def verify(self, secret: str, code: str, at: _datetime.datetime) -> bool:
+    """
+    The production verifier. `pyotp` is imported lazily, exactly as `bcrypt` is
+    in `BcryptHasher`, so this class can be constructed anywhere.
+
+    CONSTANT-TIME COMPARISON IS pyotp's, NOT REIMPLEMENTED HERE:
+    `pyotp.TOTP.verify` compares through `pyotp.utils.strings_equal`, which is
+    `hmac.compare_digest` over the encoded strings. A `==` on a six-digit code
+    short-circuits on the first wrong digit and leaks the prefix by timing.
+    """
+
+    def matching_step(self, secret: str, code: str, at: _datetime.datetime) -> Optional[int]:
+        if not code:
+            return None
+
         import pyotp
 
-        # valid_window=1 tolerates one step of clock skew either side, the
-        # usual allowance; `at` keeps even this on the injected clock.
-        return bool(pyotp.TOTP(secret).verify(code, for_time=at, valid_window=1))
+        totp = pyotp.TOTP(secret)
+        centre = int(at.timestamp()) // TOTP_STEP_SECONDS
+        # THE WINDOW IS WALKED HERE RATHER THAN HANDED TO `valid_window`,
+        # because `valid_window=1` answers yes without saying WHICH of the
+        # three steps matched -- and the step is the thing the replay guard
+        # records. Each candidate is checked with valid_window=0 against the
+        # instant that step begins, so the arithmetic is identical and the
+        # answer is more specific. Ascending, so the EARLIEST matching step is
+        # the one returned: that is the conservative choice, since a later one
+        # would mark more steps spent than the code actually used.
+        for step in range(centre - TOTP_WINDOW_STEPS, centre + TOTP_WINDOW_STEPS + 1):
+            moment = _datetime.datetime.fromtimestamp(step * TOTP_STEP_SECONDS, tz=_datetime.timezone.utc)
+            if totp.verify(code, for_time=moment, valid_window=0):
+                return step
+        return None
+
+
+def generate_totp_secret() -> str:
+    """
+    A NEW SHARED SECRET, FROM `secrets`, AND THERE IS NO PARAMETER (w164).
+
+    Until this wave `enrol_totp` took the secret as an argument, which meant
+    the CALLER chose it -- and a secret the caller chose can be weak, reused
+    across accounts, or a constant. This is the house's defence-by-absent-
+    parameter applied to the one value in this system that must never be
+    attacker-influenced: there is no argument through which a worse secret
+    could arrive.
+
+    `secrets.token_bytes` is the CSPRNG, not `random`. base32 without padding,
+    which is what `pyotp.TOTP` and every authenticator expect.
+    """
+    return base64.b32encode(secrets.token_bytes(TOTP_SECRET_BYTES)).decode("ascii").rstrip("=")
 
 
 class SecretCipher(Protocol):
@@ -317,7 +606,199 @@ class SecretCipher(Protocol):
     def decrypt(self, ciphertext: str) -> str: ...
 
 
+# THE KEY THAT PROTECTS A STORED TOTP SECRET, AND WHERE IT COMES FROM (w164).
+#
+# THIS IS NOT A NEW DECISION. It is the decision `clinical/bootstrap.py`
+# already made for this service, in its own words:
+#
+#     "PASSWORDS COME FROM THE OPERATOR, NOT FROM THIS REPOSITORY. There is no
+#      secret store here and this file does not invent one: the two passwords
+#      are read from the environment and have NO DEFAULTS. A missing one is a
+#      hard refusal, never a fallback ... How the operator supplies them (a
+#      secrets manager, a CI secret, an interactive shell) is a deployment
+#      decision this file deliberately does not make."
+#
+# Four further things in the tree say the same:
+#
+#   * `CLINICAL_DSN` (clinical/endpoints.py, clinical/app.py) already arrives
+#     this way and CARRIES THE DATABASE PASSWORD -- app.py's own comment says
+#     so. The environment is already the channel by which this service is given
+#     the credential that grants full read and write on the very table
+#     `totp_secret` lives in. A key delivered the same way is not weaker than
+#     what is already there; a key delivered any other way would be a second
+#     secret channel for a system that has one.
+#   * `GEPER_API_KEYS` (geper/api/main.py::_load_api_keys) is this repository's
+#     production-credential pattern -- read from the environment, refuse on a
+#     malformed value -- and spec section 23.3 records it as IMPLEMENTED. It is
+#     the spec's ONLY statement about how a service credential is supplied.
+#   * `.env.example` is committed, `.env` is gitignored, and docker-compose
+#     passes these through. The deployment channel exists and is documented.
+#   * `clinical/schema.sql`'s comment on `users.totp_secret` already ruled the
+#     shape: "encrypted at rest by the application before it ever reaches this
+#     column ... Encrypted rather than hashed". Application-side symmetric
+#     encryption was decided by the schema, not by this wave. The `SecretCipher`
+#     Protocol above agrees: it is handed no user, no record and no
+#     organisation, which admits exactly one architecture -- a single
+#     process-wide symmetric key from configuration.
+#
+# GEPER_CLINICAL_PLATFORM_SPEC.md IS SILENT on key management, encryption at
+# rest and rotation (23.1-23.4 and 30.1-30.3; 23.4 covers transport only), and
+# none of the fourteen held branches carries a cipher, a key loader or a
+# ruling. Recorded here so that nobody later reads either as agreement.
+#
+# A LIST, NOT A VALUE, and that is the rotation mechanism rather than a
+# convenience. `MultiFernet` encrypts under the FIRST key and decrypts under
+# ANY, so putting a new key first and keeping the old one second re-protects
+# every new enrolment while every existing row still reads. What is NOT decided
+# here, and is deliberately not invented: who rotates, how often, and what
+# re-encrypts the rows already stored. That is an operator policy and it is
+# carded.
+TOTP_SECRET_KEYS_ENV = "CLINICAL_TOTP_SECRET_KEYS"
+
+
+class FernetSecretCipher:
+    """
+    Authenticated symmetric encryption for the TOTP shared secret.
+
+    FERNET, NOT A CONSTRUCTION OF OUR OWN. It is AES-128-CBC with an
+    HMAC-SHA256 over the ciphertext (encrypt-then-MAC), a random IV per token
+    and a versioned format, from `cryptography` -- the standard library offers
+    no AEAD at all, and the alternative to a maintained implementation here
+    would be writing a cipher for a clinical product, which is not defensible
+    however carefully it is done.
+
+    WHY AUTHENTICATED AND NOT MERELY ENCRYPTED. Without the MAC, anybody who
+    can write to `users.totp_secret` -- which `clinical_app` can, it holds
+    UPDATE -- could replace the token with one whose plaintext they control and
+    then log in with codes they generate. The MAC makes that a decryption
+    FAILURE, and `_verify_second_factor` turns a decryption failure into a
+    refusal.
+
+    THE IMPORT IS LAZY, exactly as `BcryptHasher`'s bcrypt and
+    `PyOtpVerifier`'s pyotp are, so constructing this class costs nothing and
+    a deployment that has not configured a key never touches `cryptography`.
+    The KEY IS VALIDATED EAGERLY, in `__init__`, using only base64 from the
+    standard library -- so a typo in the variable is a refusal at construction
+    rather than a traceback at the first enrolment, without that check itself
+    depending on the optional package.
+    """
+
+    def __init__(self, keys: Sequence[str]) -> None:
+        cleaned: List[str] = [key.strip() for key in keys if key and key.strip()]
+        if not cleaned:
+            raise ConfigurationError(
+                f"{TOTP_SECRET_KEYS_ENV} holds no usable key. It has no default on purpose: a "
+                "layer that invented its own key would encrypt every secret under a value nobody "
+                "knows and could not decrypt them after a restart."
+            )
+        for position, key in enumerate(cleaned, start=1):
+            try:
+                raw = base64.urlsafe_b64decode(key.encode("ascii"))
+            except Exception as exc:  # noqa: BLE001 -- every decode failure is the same refusal
+                raise ConfigurationError(
+                    f"{TOTP_SECRET_KEYS_ENV} entry {position} is not url-safe base64. Generate one "
+                    'with: python -c "from cryptography.fernet import Fernet; '
+                    'print(Fernet.generate_key().decode())"'
+                ) from exc
+            if len(raw) != 32:
+                # The VALUE is never quoted back, here or anywhere else: this
+                # message reaches a log.
+                raise ConfigurationError(
+                    f"{TOTP_SECRET_KEYS_ENV} entry {position} decodes to {len(raw)} bytes; a Fernet key is exactly 32."
+                )
+        self._keys: tuple = tuple(cleaned)
+        self._cipher: Any = None
+
+    def _fernet(self) -> Any:
+        if self._cipher is None:
+            from cryptography.fernet import Fernet, MultiFernet
+
+            self._cipher = MultiFernet([Fernet(key) for key in self._keys])
+        return self._cipher
+
+    def encrypt(self, plaintext: str) -> str:
+        return self._fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+    def decrypt(self, ciphertext: str) -> str:
+        return self._fernet().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+
+
+def default_secret_cipher(raw: Optional[str] = None) -> Optional[SecretCipher]:
+    """
+    The cipher a `DataAccess` gets when nobody injects one.
+
+    READ AT CALL TIME, NOT AT IMPORT. `clinical/app.py` reads its docs flag
+    once at import so the served surface cannot change under a running process;
+    the opposite argument applies here. `_get_data_access` builds a
+    `DataAccess` per request, and a key read once into a module constant would
+    be untestable without reloading the module and would make a restart the
+    only way to observe a corrected variable. Neither costs anything: this is
+    a dictionary lookup and a base64 decode beside a bcrypt verification.
+
+    ABSENT MEANS None, AND MALFORMED MEANS REFUSE. Those are different states
+    and collapsing them is the defect worth naming: treating an unreadable key
+    as "no key" would turn one typo into a deployment that silently cannot
+    enrol and silently cannot verify, reported to the caller as an ordinary
+    authentication failure. Absent is a deployment that has not turned MFA on;
+    malformed is a deployment that thinks it has.
+    """
+    value = os.environ.get(TOTP_SECRET_KEYS_ENV, "") if raw is None else raw
+    value = value.strip()
+    if not value:
+        return None
+    return FernetSecretCipher(value.split(","))
+
+
+@dataclass(frozen=True)
+class TotpEnrolment:
+    """
+    What `enrol_totp` returns: the one moment either value exists in readable
+    form.
+
+    The secret is stored encrypted and is selected by no read method; the
+    backup codes are stored only as bcrypt hashes. Neither can be recovered,
+    which is why re-enrolling is the recovery path and why re-enrolment voids
+    the previous codes.
+    """
+
+    secret: str
+    backup_codes: List[str]
+
+
 # ─── Session ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PatientSession:
+    """
+    The patient principal's session. DELIBERATELY NOT A `Session`, and not a
+    subclass of one (w130).
+
+    WHAT IT CARRIES AND WHY. `org_id` answers "which organisation?" exactly as
+    it does on Session. `patient_id` answers "WHICH PATIENT?" -- a second axis
+    that does not exist anywhere else in this codebase, and it is carried here
+    for precisely the reason Session's own docstring gives for org_id: it is
+    read from here and NEVER from a caller argument, which is what makes the
+    isolation structural rather than remembered.
+
+    WHAT IT DELIBERATELY DOES NOT CARRY: `user_id`. Roughly thirty statements
+    in this layer write `session.user_id` into a created_by / recorded_by /
+    actor column. A patient session that reached one of them would write a
+    patient id into a staff actor column. With no such attribute, it raises
+    AttributeError at the first use instead -- a runtime backstop UNDER the
+    real control, which is the @auditable refusal (decision 7).
+
+    HONEST LIMIT. Annotations are not enforced at run time and this object
+    carries org_id, so it would duck-type into any method that touches only
+    session.org_id. That is why the refusal is enforced in the decorator every
+    public DataAccess method already carries, and not left to the type
+    checker.
+    """
+
+    session_id: uuid.UUID
+    patient_login_id: uuid.UUID
+    patient_id: uuid.UUID
+    org_id: uuid.UUID
 
 
 @dataclass(frozen=True)
@@ -392,23 +873,135 @@ def _clean_identity_value(value: Optional[str], field: str, allow_none: bool = F
 
 
 # Tables whose rows belong to exactly one organisation. Every statement this
-# module issues against one of these must bind org_id. The isolation test
-# reads this tuple, so adding a table here without adding the predicate is
-# what makes the test fail.
+# module issues against one of these must bind org_id.
+#
+# w129 — HOW THIS LIST IS NOW MAINTAINED, AND WHY THE OLD ANSWER WAS THE DEFECT.
+# This used to be a hand-written subset: twelve names out of the schema's
+# twenty-six tables. The other twelve org-owned tables were simply absent, and
+# absence is invisible — so the guard rail in test_identity.py had no opinion
+# about them at all. That is how GAP-1 shipped green: exception_events, the
+# table at the centre of a cross-tenant write, was never on the list, so the
+# test that exists to catch exactly that never looked at it.
+#
+# The fix is NOT to add the missing twelve names; that reproduces the defect
+# for table twenty-seven. The coverage is now DERIVED from schema.sql by
+# clinical/tests/test_identity.py: every CREATE TABLE in the schema is
+# org-owned unless it appears in TABLES_EXEMPT_FROM_ORG_SCOPING below with a
+# written reason. This tuple is checked against that derivation, so a new
+# table is covered the day it is created and the only way to leave one out is
+# to argue for it in writing.
 ORG_SCOPED_TABLES = (
+    "organisations",
     "users",
     "role_assignments",
     "sessions",
     "totp_backup_codes",
+    "audit_log",
     "patients",
+    "external_identifiers",
     "consents",
+    "tests",
     "orders",
     "samples",
+    "fastq_sets",
     "sequencing_runs",
     "vcfs",
     "interpretations",
     "reports",
+    "reviewer_claims",
+    "release_events",
+    "amendments",
+    "amendment_notifications",
+    "notification_read_receipts",
+    "retention_policies",
+    "exceptions",
+    "exception_events",
+    # w130. The patient portal principal and its sessions. Both carry org_id,
+    # so NEITHER MAY BE EXEMPTED -- test_only_a_table_without_an_org_id_column_
+    # may_be_exempt permits an exemption only where the column genuinely does
+    # not exist. Every statement against either binds org_id, INCLUDING the
+    # patient login lookup, which is WHERE org_id = %s AND email = %s exactly
+    # as login()'s users lookup already is.
+    "patient_logins",
+    "patient_sessions",
+    # w148. The w122 retraction tables, brought into the schema by migration
+    # 0003 at 2de2fef. BOTH CARRY org_id, so NEITHER MAY BE EXEMPTED --
+    # test_only_a_table_without_an_org_id_column_may_be_exempt permits an
+    # exemption only where the column genuinely does not exist, and that
+    # interlock is here because GAP-1 shipped green while exception_events was
+    # simply missing from this list.
+    #
+    # COUNTED, NOT ASSUMED. This file issues exactly ONE statement against
+    # either of them: the `is_retracted` projection inside the shared
+    # patient-report statement below, whose subquery binds
+    # `rr.org_id = rep.org_id` (and `rr.report_id = rep.id`). The constant's
+    # name is deliberately not spelled here -- the guard that pins its caller
+    # count counts occurrences of the name in this file's TEXT, so prose
+    # naming it would read as a fourth caller. Against
+    # `retraction_notifications` it issues none, which is why listing it is a
+    # true claim rather than an empty one -- the claim is about every
+    # statement there is, and there are none.
+    "report_retractions",
+    "retraction_notifications",
 )
+
+
+# Tables in schema.sql that are deliberately NOT held to the org_id rule, each
+# with the reason. An exemption you can read is a decision; an omission you
+# cannot see is a hole — and the hole is what GAP-1 rode in on.
+#
+# A name may only appear here if the table genuinely has no org_id column;
+# test_identity.py enforces that, so a table cannot be exempted out of trouble
+# once it has the column.
+TABLES_EXEMPT_FROM_ORG_SCOPING = {
+    "test_genes": (
+        "No org_id column exists on this table, so no statement against it could "
+        "bind one. Its single reference, test_genes.test_id -> tests (test_id), is "
+        "the non-composite foreign key recorded as GAP-4 by the w129 Phase A audit; "
+        "tests carries no UNIQUE (org_id, test_id) that would let it be composite. "
+        "data_access.py issues zero statements against this table — counted, not "
+        "assumed. This exemption records a known structural asymmetry; it does not "
+        "claim the table is not org-owned."
+    ),
+    # w126m. THE ONE TABLE IN THIS SCHEMA THAT IS NOT ABOUT PATIENTS AT ALL.
+    #
+    # This exemption was WRITTEN BECAUSE THE GUARD DEMANDED IT: adding
+    # schema_migrations to schema.sql turned
+    # test_org_scoped_table_coverage_is_derived_from_the_schema red, which is
+    # the w129 GAP-3 derivation doing exactly the job it was built for -- a new
+    # table was covered the day it was created, and leaving it out required an
+    # argument in writing. That is recorded here rather than smoothed over,
+    # because the alternative (adding the name to ORG_SCOPED_TABLES) would have
+    # been the false answer: it would assert that every statement against this
+    # table binds org_id, and none could, because there is nothing to bind.
+    #
+    # WHY IT IS GENUINELY NOT ORG-OWNED, and not merely inconvenient to scope.
+    # Its rows are DEPLOYMENT FACTS about the database as a whole -- which
+    # migration ran, over which bytes, when, as whom. A schema is at one
+    # version; it is not at one version per organisation. There is no tenant
+    # dimension to carry, which is why the table has no org_id column and why
+    # test_only_a_table_without_an_org_id_column_may_be_exempt permits this
+    # entry at all: that interlock still binds, so this cannot become a hiding
+    # place the day someone adds the column.
+    #
+    # COUNTED, NOT ASSUMED: data_access.py issues ZERO statements against this
+    # table -- grep for the name in this file returns only this comment. It is
+    # written only by clinical/migrate.py, which runs as the administrative
+    # principal and never through DataAccess, and read there and by
+    # clinical/app.py's readiness probe. The application role is granted SELECT
+    # on it and REVOKEd INSERT, UPDATE and DELETE by
+    # clinical/migrations/0001_schema_migrations.sql, so clinical_app cannot
+    # write deployment state even by a route this list does not police.
+    "schema_migrations": (
+        "No org_id column exists on this table, and none could: its rows are deployment "
+        "facts about the database as a whole -- which migration ran, over which bytes, "
+        "when and as whom -- and a schema is at one version, not at one version per "
+        "organisation. data_access.py issues zero statements against it, counted, not "
+        "assumed; it is written only by clinical/migrate.py as the administrative "
+        "principal, and clinical_app holds SELECT on it with INSERT, UPDATE and DELETE "
+        "revoked, so the application cannot forge its own version."
+    ),
+}
 
 
 # ─── Audit decorator ────────────────────────────────────────────────────────
@@ -478,6 +1071,33 @@ def auditable(
 
     def decorator(func):
         def wrapper(self, *args, **kwargs):
+            # ── w130, DECISION 7: a patient session is refused by every staff
+            # operation, and the refusal lives HERE rather than in the type
+            # annotations.
+            #
+            # WHY HERE AND NOWHERE ELSE. Python annotations are not enforced at
+            # run time, and a PatientSession carries org_id -- so it duck-types
+            # perfectly into any staff method that touches only session.org_id,
+            # which is most of the twenty-nine ungated readers. MEASURED, not
+            # argued: before this check existed, dao.get_patient(alice_session,
+            # bobs_patient_id) RETURNED BOB'S RECORD. Two tests failed with
+            # "DID NOT RAISE" and thirty-two passed.
+            #
+            # This decorator is the one thing every public DataAccess method
+            # carries -- test_every_public_method_has_auditable_decorator makes
+            # that structural -- so it is the only place a single check covers
+            # all of them. The check runs BEFORE the `auditable` early return
+            # on purpose: get_patient is auditable=False, and it is exactly the
+            # method that leaked.
+            #
+            # It NARROWS: it refuses a PatientSession where a Session is
+            # required, and changes nothing else about any existing call.
+            if requires_session and args and isinstance(args[0], PatientSession):
+                raise AuthorizationError(
+                    f"{func.__name__} is a staff operation and does not accept a patient session. "
+                    "Patient access is served by the portal surface, which binds the patient from "
+                    "the session rather than from an argument."
+                )
             if not auditable:
                 # Non-auditable method: just call it
                 return func(self, *args, **kwargs)
@@ -491,6 +1111,49 @@ def auditable(
                 session = args[0]
             else:
                 session = None
+
+            # ── w137: WHICH ORGANISATION THE ROW IS FILED UNDER, WHEN THE
+            # ACTING PRINCIPAL IS NOT A STAFF `Session`.
+            #
+            # THE DEFECT. Every audit row's org_id/user_id was bound from
+            # `session` above and from nothing else, and `session` is None for
+            # every requires_session=False method. `read_audit` is
+            # Auditor-gated and filters `WHERE org_id = %s`, so a row written
+            # with org_id NULL is recorded where the organisation that owns it
+            # cannot look. `terminate_my_patient_session` is the method that
+            # shape reaches -- a patient logging out of the portal -- and the
+            # organisation was never unknown: it is on the PatientSession, and
+            # w132 had to carry it in `details` instead.
+            #
+            # THIS IS NOT A WIDENING OF DECISION 7. The refusal above is keyed
+            # on requires_session=True and is untouched; a PatientSession is
+            # still refused by every staff operation, and the tripwire for
+            # that is test_w137_patient_backend.py::TestDecisionSevenWasNotWidened
+            # as well as w130's own suite. What changes here is only which
+            # column an already-permitted call's row lands in.
+            #
+            # COUNTED at 4213cd3, so the blast radius is a fact: sixteen
+            # methods declare requires_session=False; ten are auditable=False
+            # and write no row at all; of the remaining six,
+            # log_failed_login, login, create_organisation, create_user and
+            # patient_login all carry a literal org_id (or a name) parameter
+            # and are already bound by the fallbacks below.
+            # terminate_my_patient_session is the only one whose acting
+            # principal is an object, and it is the only row this changes.
+            #
+            # user_id COMES FROM `getattr`, AND THAT IS THE POINT.
+            # audit_log.user_id means a `users` row; PatientSession
+            # deliberately has no user_id (see its docstring), so a patient
+            # logout keeps a NULL there and the acting credential stays in
+            # `details`. A staff Session presented to a patient-principal
+            # method -- the denied path _require_patient_session exists for --
+            # does name its user, which is exactly what an auditor reading a
+            # refused attempt needs.
+            acting_principal = (
+                args[0] if (not requires_session and args and isinstance(args[0], (Session, PatientSession))) else None
+            )
+            principal_org_id = session.org_id if session else getattr(acting_principal, "org_id", None)
+            principal_user_id = session.user_id if session else getattr(acting_principal, "user_id", None)
 
             # Bind arguments to resolve positional/keyword ambiguity
             # Try to get the original function's signature if wrapped
@@ -516,8 +1179,8 @@ def auditable(
                 # Build audit details — pass resolved parameters to avoid positional/keyword issues
                 details = details_builder(bound_params, result) if details_builder else {}
                 # For provisioning methods without session, extract org_id from parameters
-                write_org_id = session.org_id if session else None
-                write_user_id = session.user_id if session else None
+                write_org_id = principal_org_id
+                write_user_id = principal_user_id
 
                 # For organisation creation, result is the org_id
                 if not session and isinstance(result, uuid.UUID) and resource_type == "organisation":
@@ -565,8 +1228,8 @@ def auditable(
                     resource_type,
                     resource_id="<denied>",
                     outcome="denied",
-                    org_id=session.org_id if session else None,
-                    user_id=session.user_id if session else None,
+                    org_id=principal_org_id,
+                    user_id=principal_user_id,
                     actor_role=self._get_actor_role(session) if session else None,
                     details=details if details else None,
                     ip_address=bound_params.get("ip_address"),
@@ -588,8 +1251,8 @@ def auditable(
                     resource_type,
                     resource_id="<error>",
                     outcome="error",
-                    org_id=session.org_id if session else None,
-                    user_id=session.user_id if session else None,
+                    org_id=principal_org_id,
+                    user_id=principal_user_id,
                     actor_role=self._get_actor_role(session) if session else None,
                     details=details if details else None,
                     ip_address=bound_params.get("ip_address"),
@@ -672,8 +1335,30 @@ class DataAccess:
         self.__connection = connection
         self._clock: Clock = clock or SystemClock()
         self._hasher: PasswordHasher = password_hasher or BcryptHasher()
-        self._totp: Optional[TotpVerifier] = totp_verifier
-        self._cipher: Optional[SecretCipher] = secret_cipher
+        # w164. THE DEFAULTS ARE WHERE MFA BECAME REACHABLE, and they are here
+        # rather than at the four call sites for a structural reason.
+        #
+        # Measured at 4ab1fbf by an alias-resolving ast.Call census: EXACTLY
+        # FOUR non-test constructions of DataAccess exist --
+        # clinical/endpoints.py:262, geper/api/exception_retry_worker.py:132,
+        # geper/api/submission_worker.py:850 and geper/review/signoff.py:936 --
+        # and all four pass the connection ALONE. Both collaborators were
+        # therefore None in every production process, which is why
+        # `_verify_second_factor` and `enrol_totp` could only ever raise there.
+        #
+        # Editing the four sites would have worked and would have been WORSE:
+        # a fifth site -- a worker, a CLI path, a future router -- would then
+        # be one forgotten keyword away from a DataAccess that cannot verify a
+        # second factor, and nothing would say so until an enrolled user tried
+        # to log in. Defaulting here means there is nothing to remember. The
+        # keyword arguments stay, for tests that inject a stand-in.
+        #
+        # The verifier needs no configuration, so it is unconditional. The
+        # cipher needs a key and has none unless the deployment supplies one,
+        # so `default_secret_cipher` returns None when the variable is unset --
+        # which leaves the fail-closed behaviour below exactly as it was.
+        self._totp: Optional[TotpVerifier] = totp_verifier or PyOtpVerifier()
+        self._cipher: Optional[SecretCipher] = secret_cipher if secret_cipher is not None else default_secret_cipher()
         self._in_transaction = False
 
     # ── internals ────────────────────────────────────────────────────────────
@@ -837,7 +1522,7 @@ class DataAccess:
 
         row = self._query_one(
             "SELECT user_id, password_hash, failed_login_attempts, locked_until, "
-            "       disabled, totp_secret, is_system_account "
+            "       disabled, totp_secret, is_system_account, totp_last_used_step "
             "FROM users WHERE org_id = %s AND email = %s",
             (org_id, email),
         )
@@ -849,9 +1534,33 @@ class DataAccess:
             self.log_failed_login(email, org_id, ip_address, reason="unknown_user")
             raise AuthenticationError()
 
-        user_id, password_hash, failed_attempts, locked_until, disabled, totp_secret, is_system = row
+        (
+            user_id,
+            password_hash,
+            failed_attempts,
+            locked_until,
+            disabled,
+            totp_secret,
+            is_system,
+            totp_last_used_step,
+        ) = row
 
         if locked_until is not None and locked_until > now:
+            # EQUALISE HERE TOO -- w139. This branch used to be the ONE failure
+            # path in either login method that spent no bcrypt work at all, so
+            # a locked-out address answered measurably faster than a wrong
+            # password against a live one. That is a timing oracle in the
+            # direction that helps: only an address that EXISTS can be locked,
+            # so "cheap" confirmed the address, and an attacker can create the
+            # state themselves with five wrong guesses.
+            #
+            # IT MUST NOT TOUCH THE COUNTER. `_equalise_password_work` verifies
+            # against the dummy hash and discards the result; it does not call
+            # `_register_failed_attempt`, so a locked account is not driven
+            # deeper and its `locked_until` is not extended. The lockout policy
+            # is unchanged -- this branch still refuses, before the real hash is
+            # ever consulted.
+            self._equalise_password_work(password)
             self.log_failed_login(email, org_id, ip_address, reason="locked_out")
             raise AuthenticationError()
 
@@ -872,8 +1581,12 @@ class DataAccess:
             self.log_failed_login(email, org_id, ip_address, reason="system_account")
             raise AuthenticationError()
 
+        # THE SECOND FACTOR IS CHECKED LAST, AND THE ORDER IS THE POLICY.
+        # `disabled`, `is_system_account` and the lockout all refuse ABOVE
+        # this line, so a principal who has been taken out of service cannot
+        # be let back in by holding a valid code -- the code is never reached.
         if totp_secret is not None:
-            if not self._verify_second_factor(user_id, org_id, totp_secret, totp_code, now):
+            if not self._verify_second_factor(user_id, org_id, totp_secret, totp_code, now, totp_last_used_step):
                 self._register_failed_attempt(user_id, org_id, failed_attempts, now)
                 self.log_failed_login(email, org_id, ip_address, reason="invalid_totp")
                 raise AuthenticationError()
@@ -936,7 +1649,43 @@ class DataAccess:
         stored_secret: str,
         code: Optional[str],
         now: _datetime.datetime,
+        last_used_step: Optional[int] = None,
     ) -> bool:
+        """
+        THE ONLY PLACE A SECOND FACTOR IS ACCEPTED, AND IT NEVER RETURNS True
+        BY ACCIDENT.
+
+        Read the exits rather than the flow: there are exactly two `return
+        True` statements reachable from here -- one after a step that has not
+        been spent, one inside `_consume_backup_code` after a row was marked
+        used in the same statement that matched it. Every other path returns
+        False or raises, INCLUDING every exception the crypto can produce.
+
+        ONE-TIME USE (RFC 6238 section 5.2). `matching_step` names the step the
+        code belongs to; `users.totp_last_used_step` remembers the last one
+        accepted; a step at or before it is refused. Storing the STEP and not
+        the CODE is what makes the guard monotonic -- remembering only the last
+        code would still admit the PREVIOUS step's code, which the one-step
+        skew window keeps arithmetically valid for another half minute.
+
+        FAIL CLOSED, IN TWO DIFFERENT SHAPES, DELIBERATELY:
+
+          * A MISSING COLLABORATOR RAISES. `ConfigurationError` is an operator
+            fault -- the account has a secret and this process was given no key
+            -- and it must be loud. It is not a login refusal dressed up as one,
+            and it never admits: the caller (`clinical/auth_endpoints.py::
+            _refuse_uniformly`) flattens it into the same 401 every other
+            failure produces, so the loudness reaches the audit trail and the
+            operator without reaching the caller.
+          * A FAILING COLLABORATOR REFUSES. A secret that will not decrypt (a
+            lost key, a rotated-away key, a tampered column) or a verifier that
+            raises is a fault about ONE ROW, not about the process. The broad
+            `except` below is the point rather than a lapse: whatever it
+            catches, `step` stays None and the only paths left are the backup
+            code -- which is exactly the recovery route a lost key needs -- and
+            refusal. There is no arrangement of an exception here that can
+            produce a session.
+        """
         if not code:
             return False
         if self._cipher is None:
@@ -947,8 +1696,26 @@ class DataAccess:
         if self._totp is None:
             raise ConfigurationError("TOTP is enrolled for this user but no totp_verifier was provided.")
 
-        if self._totp.verify(self._cipher.decrypt(stored_secret), code, now):
+        step: Optional[int]
+        try:
+            step = self._totp.matching_step(self._cipher.decrypt(stored_secret), code, now)
+        except Exception:  # noqa: BLE001 -- see the docstring; a failure here is a refusal, never an admission
+            # AUDITED, because it is otherwise indistinguishable from a wrong
+            # code and it is not the same event: it means this organisation's
+            # stored secrets cannot be read by this process.
+            self._audit("totp_secret_unreadable", org_id, user_id, {})
+            step = None
+
+        if step is not None:
+            if last_used_step is not None and step <= last_used_step:
+                self._audit("totp_code_replayed", org_id, user_id, {"step": str(step)})
+                return False
+            self._execute(
+                "UPDATE users SET totp_last_used_step = %s WHERE user_id = %s AND org_id = %s",
+                (step, user_id, org_id),
+            )
             return True
+
         return self._consume_backup_code(user_id, org_id, code, now)
 
     def _consume_backup_code(
@@ -1054,6 +1821,57 @@ class DataAccess:
             (now, session.user_id, target_session_id, session.org_id),
         )
 
+    @auditable(
+        action="session_logged_out",
+        resource_type="session",
+        requires_session=True,
+        details_builder=lambda params, result: {"session_id": str(result)},
+    )
+    @transactional
+    def terminate_my_session(self, session: Session) -> uuid.UUID:
+        """
+        End THE CALLING session. Log out.
+
+        IT TAKES NO TARGET IDENTIFIER, AND THAT IS THE WHOLE DESIGN. The
+        obvious version of this method accepts a `target_session_id` and ends
+        it, scoped to the caller's organisation — and that hands every
+        authenticated user the capability `terminate_session` reserves for an
+        Administrator, through a route called "logout". The defence is not a
+        check that the target belongs to the caller: a check can be forgotten,
+        refactored away, or made optional by a later `if target_session_id is
+        None` convenience. THERE IS NOTHING TO CHECK, because the id ended is
+        read from the session object the dependency produced and there is no
+        other way to name one.
+
+        NO ROLE IS REQUIRED, and that distinguishes it from
+        `terminate_session` above rather than duplicating it. Ending somebody
+        else's session is an administrative act; ending your own is not, and
+        a self-logout gated on Administrator would mean ordinary staff could
+        not log out at all — a defect that would read like security.
+
+        `terminated_by` holds the acting user. `terminated_at IS NULL` in the
+        predicate makes a second call a no-op rather than a rewrite: the
+        recorded moment a session ended must be the first one, not the last
+        redundant request.
+
+        RETURNS THE SESSION ID so that @auditable's `resource_id` names the
+        session that ended. A `-> None` here would record `<none>` — the w120
+        defect — and an audit row that cannot name its subject is not an
+        audit.
+
+        NOT A CREDENTIAL REVOCATION. This ends one session. The credential
+        that minted it is untouched and can mint another immediately, which is
+        correct for logout and is NOT what `users.disabled` /
+        `patient_logins.disabled` are for.
+        """
+        now = self._clock.now()
+        self._execute(
+            "UPDATE sessions SET terminated_at = %s, terminated_by = %s "
+            "WHERE session_id = %s AND org_id = %s AND terminated_at IS NULL",
+            (now, session.user_id, session.session_id, session.org_id),
+        )
+        return session.session_id
+
     # ── roles ────────────────────────────────────────────────────────────────
 
     @auditable(
@@ -1083,10 +1901,27 @@ class DataAccess:
         `basis` is mandatory for Approver -- ISO 15189 7.4.1.5 c) requires the
         reviewer's identity and authority to be retrievable, and the schema
         CHECK refuses the row without it.
+
+        "System" IS NOT ASSIGNABLE, BY ANYBODY, INCLUDING AN ADMINISTRATOR
+        (w141). See HUMAN_ASSIGNABLE_ROLES above for why: it is the internal
+        system principal that `_require_role(session, "System")` gates the
+        fastq detection write path on, and `_create_system_session` is the
+        only thing entitled to hold it. The refusal is a ValueError and not an
+        AuthorizationError deliberately -- an AuthorizationError would say
+        "you may not do this", which invites somebody to look for a principal
+        who may. There is none.
+
+        THE ORDER MATTERS: the Administrator check stays FIRST, so a caller
+        without it learns nothing about which roles are assignable.
         """
         self._require_role(session, "Administrator")
         if role not in ROLES:
             raise ValueError(f"Unknown role: {role!r}. Known roles: {', '.join(ROLES)}")
+        if role not in HUMAN_ASSIGNABLE_ROLES:
+            raise ValueError(
+                f"Role {role!r} is the internal system principal and cannot be granted to a "
+                f"person. Assignable roles: {', '.join(HUMAN_ASSIGNABLE_ROLES)}."
+            )
         if role == "Approver" and not basis:
             raise ValueError(
                 "Assigning Approver requires a qualification basis "
@@ -1108,6 +1943,139 @@ class DataAccess:
             (assignment_id, target_user_id, session.org_id, role, session.user_id, now, basis),
         )
         return assignment_id
+
+    @auditable(
+        action="role_revoked",
+        resource_type="role_assignment",
+        resource_id_param="target_user_id",
+        requires_session=True,
+        details_builder=lambda params, result: {
+            "target_user_id": str(params.get("target_user_id")),
+            "role": params.get("role"),
+            "assignments_revoked": result,
+        },
+    )
+    @transactional
+    def revoke_role(self, session: Session, target_user_id: uuid.UUID, role: str) -> int:
+        """
+        Withdraw a role. THE FIRST PRODUCTION WRITER OF `revoked_at` /
+        `revoked_by`, and w154 (WAVE 4) exists because there was none.
+
+        THE STATE HAD NO WRITER AND THE ENFORCEMENT WAS ALREADY COMPLETE.
+        Measured at 4700f40 over non-test Python, whole tree: `revoked_at`
+        and `revoked_by` occurred at exactly two code sites, `_get_actor_role`
+        and `get_user_roles`, and BOTH were `revoked_at IS NULL` read
+        predicates. Three sites wrote a `role_assignments` row -- this
+        method's neighbour `assign_role`, `provision_organisation`, and
+        `_create_system_session` -- and not one of them ever set the two
+        columns back. So the platform could grant a role and could read a
+        revocation it had no way to record.
+
+        ── WHY THIS METHOD DOES NOT TOUCH SESSIONS, WHICH IS THE DESIGN
+           QUESTION AND IS SETTLED BY MEASUREMENT RATHER THAN BY TASTE ──
+
+        ROLES ARE RESOLVED PER REQUEST, FROM THIS TABLE. `Session` is a
+        frozen dataclass of exactly three fields -- session_id, user_id,
+        org_id -- and carries no role. `session_valid` reads one `sessions`
+        row and returns those three fields; it does not join
+        `role_assignments` and never has. `_require_role` calls
+        `get_user_roles`, which reads `role_assignments` with
+        `revoked_at IS NULL`, on EVERY gated call. Nothing captures a role at
+        login, so there is no stale copy anywhere to invalidate.
+
+        Therefore setting `revoked_at` IS the enforcement: the caller's very
+        next gated request recomputes the set and fails. Terminating the
+        target's sessions here would be a SECOND mechanism for an effect the
+        first one already has, and the two could then disagree -- which is
+        precisely the failure `set_user_disabled` has to live with and this
+        method does not.
+
+        AND THAT IS NOT WHAT `set_user_disabled` DOES, FOR A REASON.
+        `users.disabled` is the mirror image: NOTHING on the authenticated
+        path reads it. `session_valid` reads only `sessions`, so a disabled
+        user's live session stayed valid until its own window closed -- which
+        is why w133 had to end the sessions inside that method's body. The
+        house pattern is "write the state, then close whatever enforcement
+        does not reach"; here enforcement reaches everything, so there is
+        nothing to close. Copying the session UPDATE across would not be
+        following the pattern, it would be inverting it.
+
+        ── THE UNIT OF REVOCATION IS (USER, ROLE), NOT AN ASSIGNMENT ROW ──
+
+        `_require_role` tests membership in a SET of role NAMES, so the thing
+        authorisation is a function of is "does this user still hold this
+        role", not "is this particular assignment row live". Revoking one row
+        by `assignment_id` would leave a duplicate grant standing and mark a
+        row while changing nothing an authorisation check can see -- a writer
+        whose effect on authorisation is not guaranteed. This method revokes
+        EVERY live assignment of that role for that user in that
+        organisation, in one statement, so the post-condition is the one the
+        gate actually reads.
+
+        ── REFUSALS, IN THE ORDER `assign_role` ALREADY ESTABLISHED ──
+
+        The Administrator check is FIRST, before the vocabulary check and
+        before any row is read, so a caller who is not an Administrator
+        learns nothing about which roles exist or which users do.
+
+        "System" IS NOT REVOCABLE HERE, on the same `HUMAN_ASSIGNABLE_ROLES`
+        tuple `assign_role` refuses it on (w141) and deliberately not on a
+        second, differently-derived rule. That tuple names the roles that are
+        part of the HUMAN role lifecycle; "System" is the internal principal
+        that `_create_system_session` is the only thing entitled to hold, and
+        an Administrator able to withdraw it would hold new authority over
+        the internal principal rather than the preserved authority w141 left
+        them. The lifecycle is closed at both ends by one constant. This is
+        fail-closed: if the platform later needs a System revoker it is an
+        addition, not a repair.
+
+        NO SELF-TARGETING RULE IS ADDED, and the absence is preserved on
+        purpose. There is no such rule anywhere in this class today --
+        `set_user_disabled` lets an Administrator disable their own account
+        and says so, and nothing guards a "last Administrator". An
+        Administrator who revokes their own Administrator role therefore
+        succeeds and is refused on their next administrative request, because
+        roles are resolved per request. Whether an organisation should be
+        prevented from locking itself out is a product decision nobody has
+        made; inventing one here would be widening an existing rule under
+        cover of preserving it.
+
+        A USER WHO DOES NOT HOLD THE ROLE IS NOT A REFUSAL. The target
+        existing is checked (`get_user`, which is where the 404 and the
+        organisation predicate live); holding the role is not. Revoking a
+        role nobody holds returns 0 and writes nothing, because the
+        post-condition asked for -- "this user does not hold this role" -- is
+        already true. Returning the count rather than None is what makes that
+        distinction visible to a caller and to the audit row.
+
+        ONE STATEMENT WITH `RETURNING`, not a read followed by a write. The
+        count and the change then come from the same statement, so a
+        concurrent revoker cannot make this method report a number that does
+        not match what it did.
+        """
+        self._require_role(session, "Administrator")
+        if role not in ROLES:
+            raise ValueError(f"Unknown role: {role!r}. Known roles: {', '.join(ROLES)}")
+        if role not in HUMAN_ASSIGNABLE_ROLES:
+            raise ValueError(
+                f"Role {role!r} is the internal system principal and cannot be revoked from a "
+                f"person. Revocable roles: {', '.join(HUMAN_ASSIGNABLE_ROLES)}."
+            )
+
+        # The target must be in the acting session's organisation. The same
+        # call assign_role makes, in the same position, for the same reason:
+        # a clear NotFoundError, and one that cannot distinguish "no such
+        # user" from "a real user in another organisation".
+        self.get_user(session, target_user_id)
+
+        now = self._clock.now()
+        revoked = self._query(
+            "UPDATE role_assignments SET revoked_at = %s, revoked_by = %s "
+            "WHERE org_id = %s AND user_id = %s AND role = %s AND revoked_at IS NULL "
+            "RETURNING assignment_id",
+            (now, session.user_id, session.org_id, target_user_id, role),
+        )
+        return len(revoked)
 
     @auditable(
         action="roles_read",
@@ -1240,6 +2208,163 @@ class DataAccess:
             ),
         )
         return user_id
+
+    # ── w153 (WAVE 3): the third bootstrap step, which never had a ──────────
+    #    session-free form. Built to the human's w128 ruling
+    #    (`hive/agents/god/briefs/w128-provisioning.md`), which specifies this
+    #    operation exactly: "organisation row -> first user -> first
+    #    Administrator role assignment, in one transaction", session-free
+    #    "because it is called before any session can exist", operator-run,
+    #    and with NO HTTP ROUTE.
+    #
+    # WHY IT IS NEEDED, COUNTED AT fd9d63b RATHER THAN ASSERTED. `INSERT INTO
+    # role_assignments` occurs at exactly TWO production sites in this
+    # repository -- one inside `assign_role`, which requires an existing
+    # Administrator, and one inside `_create_system_session`, which only ever
+    # writes 'System' and which w141 made unassignable to a person. So a fresh
+    # deployment could not produce its first Administrator by any code path,
+    # and the four administrative routes `clinical/admin_endpoints.py` mounted
+    # were correct, tested and unreachable because of it.
+    #
+    # `clinical/bootstrap.py` IS NOT THIS AND NEVER WAS. Read rather than
+    # inferred from its name, it creates the two POSTGRES LOGIN ROLES that
+    # `schema.sql` grants to and optionally applies the schema. It writes no
+    # application row of any kind. It is a DATABASE bootstrap; this is an
+    # IDENTITY one, and they are not substitutes.
+    #
+    # THE THREE WRITES ARE DELIBERATELY OPEN-CODED, and this is the single
+    # most important thing about the method. Composing it out of the existing
+    # `create_organisation` and `create_user` would be the obvious
+    # implementation and it would be silently WRONG: `@auditable` calls
+    # `commit()` ITSELF after writing each audit row, OUTSIDE `@transactional`'s
+    # `_in_transaction` re-entrancy guard, so each inner call would commit
+    # mid-way. A failure at the role step would then leave a committed
+    # organisation and a committed user with NO ADMINISTRATOR -- the exact
+    # unusable state this method exists to prevent.
+    #
+    # THE TRANSACTION BOUNDARY is `@transactional` on this method. `@auditable`
+    # is the OUTER decorator, so on an unexpected exception `@transactional`
+    # has already ROLLED BACK before `@auditable`'s error branch writes and
+    # commits its row: the data goes, the evidence stays.
+    #
+    # WHAT MAKES IT INERT ONCE AN ADMINISTRATOR EXISTS -- and it is not a
+    # flag, because a flag is something a caller supplies:
+    #   * `org_id` is generated HERE, by `uuid.uuid4()`. There is no parameter
+    #     of any kind by which a caller could name an existing organisation,
+    #     so this method can never add an Administrator to a tenant that
+    #     already has one. The wrong version is UNWRITABLE, not merely
+    #     refused -- the same defence-by-absent-parameter shape as
+    #     `terminate_my_session` and `list_my_report_trend`.
+    #   * the role is a SQL LITERAL, not a parameter, so 'System' cannot be
+    #     reached through it either.
+    #   * it is on no served surface, and the only caller is an operator who
+    #     already holds the database credential and could therefore already
+    #     write these three rows by hand. It grants nobody a capability they
+    #     did not already have; it makes an out-of-band raw INSERT into one
+    #     audited atomic act.
+    # A SECOND CALL IS NOT REFUSED. It creates a SECOND organisation with that
+    # organisation's own first Administrator, which is spec 4.2's
+    # single-instance multi-organisation tenancy, not a bypass.
+    #
+    # THE ACTOR IS NULL AND THAT IS NOT AN OVERSIGHT. There is no session, so
+    # the audit row's `user_id` and `actor_role` are NULL: the creator is an
+    # operator outside the tenancy model and no principal exists to name. An
+    # `organisations.created_by` column was considered in the w128 ruling and
+    # recommended AGAINST for exactly that reason -- it could not be populated
+    # truthfully. What CAN be recorded truthfully is the operating context,
+    # which is why `operating_context` is a REQUIRED parameter rather than a
+    # convenience, and it goes in the existing `details` JSONB.
+    #
+    # NO SCHEMA CHANGE. Every column written already exists and `clinical_app`
+    # already holds INSERT on organisations, users and role_assignments.
+    @auditable(
+        action={
+            "success": "organisation_provisioned",
+            "error": "organisation_provisioning_failed",
+            "denied": "organisation_provisioning_denied",
+        },
+        resource_type="organisation",
+        requires_session=False,
+        reason="provisioning: called before any session exists -- this method is what makes the first session possible",
+        details_builder=lambda params, result: {
+            "name": params.get("name"),
+            "admin_email": params.get("admin_email"),
+            "operating_context": params.get("operating_context"),
+        },
+    )
+    @transactional
+    def provision_organisation(
+        self,
+        name: str,
+        admin_email: str,
+        admin_password: str,
+        operating_context: str,
+        full_name: Optional[str] = None,
+        registration_number: Optional[str] = None,
+        hospital: Optional[str] = None,
+    ) -> uuid.UUID:
+        """
+        Organisation row -> first user -> first Administrator role assignment,
+        in ONE transaction. Returns the new org_id, which is what `login`
+        needs (there is no lookup by name, by design).
+
+        Session-free, like `create_organisation` and `create_user`, and for
+        the same reason. NOT an administrator action: an operator with a
+        database credential and a Python interpreter runs it out of band.
+
+        `operating_context` is REQUIRED, not optional. The audit row this
+        method writes can carry no actor, so a free-text statement of who ran
+        it and why is the only accountability available; making it defaultable
+        would mean it was NULL on every row in practice.
+
+        WHAT THIS METHOD DELIBERATELY DOES NOT DO:
+          * It does not grant Approver. An Approver signs reports and the
+            grant needs a qualification basis (ISO 15189 7.4.1.5 c);
+            inventing one here would collapse the separation `assign_role`
+            exists to state.
+          * It does not seed retention policies. `_resolve_vcf_retention_days`
+            LEFT JOINs and falls back to the code default, so their absence is
+            a valid and already-tested state.
+          * It does not enable or disable the organisation. `disabled` takes
+            its schema default of FALSE.
+
+        `assigned_by` is the new user's own id. The column is NOT NULL and
+        there is no earlier principal in this organisation to name -- the same
+        self-granted shape `_create_system_session` already uses for 'System'.
+        """
+        now = self._clock.now()
+        org_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        assignment_id = uuid.uuid4()
+
+        self._execute(
+            "INSERT INTO organisations (org_id, name, created_at) VALUES (%s, %s, %s)",
+            (org_id, name, now),
+        )
+        self._execute(
+            "INSERT INTO users (user_id, org_id, email, password_hash, password_changed_at, "
+            "                   full_name, registration_number, hospital, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                user_id,
+                org_id,
+                admin_email,
+                self._hasher.hash(admin_password),
+                now,
+                _clean_identity_value(full_name, "full_name", allow_none=True),
+                _clean_identity_value(registration_number, "registration_number", allow_none=True),
+                _clean_identity_value(hospital, "hospital", allow_none=True),
+                now,
+                now,
+            ),
+        )
+        self._execute(
+            "INSERT INTO role_assignments (assignment_id, user_id, org_id, role, "
+            "                              assigned_by, assigned_at) "
+            "VALUES (%s, %s, %s, 'Administrator', %s, %s)",
+            (assignment_id, user_id, org_id, user_id, now),
+        )
+        return org_id
 
     @auditable(
         action="clinician_identity_set",
@@ -1397,41 +2522,137 @@ class DataAccess:
     )
     @transactional
     def set_user_disabled(self, session: Session, target_user_id: uuid.UUID, disabled: bool) -> None:
-        """Offboarding. Never a DELETE -- that would orphan the audit chain."""
+        """
+        Offboarding. Never a DELETE -- that would orphan the audit chain.
+
+        AND IT ENDS THE USER'S LIVE SESSIONS (w133). Until w133 this method
+        wrote one row in `users` and nothing else, and that was a real gap
+        rather than a tidy omission: `session_valid` reads only `sessions` and
+        `_require_role` reads only `role_assignments`, so NOTHING anywhere
+        consulted `users.disabled` once a session existed. A user disabled at
+        10:00 passed validation at 10:01 and kept every Administrator-gated
+        capability -- including disabling somebody else -- for up to the 24h
+        absolute cap, with the 30-minute idle window refreshed by their own
+        activity. Measured, not reasoned: the two capability rows in
+        test_w133_staff_revocation.py failed with "DID NOT RAISE" against the
+        previous version of this method.
+
+        The statement is in THIS body, not a second decorated call, because
+        @auditable commits after every audit row it writes: a composition
+        would commit "user_disabled" while the sessions ran on, and an audit
+        that records something that did not happen is worse than one that
+        records nothing.
+
+        `terminated_by` holds the ACTING Administrator, consistent with
+        terminate_session. `terminated_at IS NULL` makes a second disable a
+        no-op rather than a rewrite. ONLY WHEN `disabled` IS TRUTHY: re-enabling
+        must not terminate anything, and it does not resurrect anything either.
+
+        POINT-IN-TIME, NOT CONTINUOUS, AND THE RESIDUE IS REAL. This ends the
+        sessions that exist WHEN IT RUNS. `session_valid` is unchanged -- one
+        row from `sessions` by primary key, no join on `users` -- so a
+        `disabled` flag set by any other route (direct SQL, a restore, a
+        future bootstrap) leaves that user's live sessions valid until their
+        own window closes. Closing that residue means reading the principal
+        row on every authenticated request, which is a change to the hottest
+        path in this layer and was deliberately not made here. Proved, not
+        described, by test_w133_staff_revocation.py::TestTheResidueIsReal.
+
+        WHAT IT DOES NOT DO: it does not touch role resolution. `_require_role`
+        still reads `role_assignments` and still never consults this flag. The
+        capability is removed by the session ending, which is what
+        `_get_session` revalidates on every request -- not by the roles
+        changing. That distinction is why the staff tests make a real
+        role-gated call through the request path rather than asserting on
+        validation alone.
+        """
         self._require_role(session, "Administrator")
         self.get_user(session, target_user_id)
+        now = self._clock.now()
         self._execute(
             "UPDATE users SET disabled = %s, updated_at = %s WHERE user_id = %s AND org_id = %s",
-            (disabled, self._clock.now(), target_user_id, session.org_id),
+            (disabled, now, target_user_id, session.org_id),
         )
+
+        if disabled:
+            self._execute(
+                "UPDATE sessions SET terminated_at = %s, terminated_by = %s "
+                "WHERE user_id = %s AND org_id = %s AND terminated_at IS NULL",
+                (now, session.user_id, target_user_id, session.org_id),
+            )
 
     @auditable(
         action="totp_enrolled",
         resource_type="totp",
         requires_session=True,
+        # w164. WITHOUT THIS THE AUDIT ROW WOULD HAVE HELD THE CREDENTIALS.
+        # `@auditable` writes `resource_id=str(result)` for any method that
+        # does not declare where its identifier comes from, and this method's
+        # result is the secret and the eight backup codes. At 4ab1fbf that was
+        # latent only because nobody could reach `enrol_totp` at all; making it
+        # reachable makes it reachable too. The identifier of a TOTP enrolment
+        # is the USER it was issued to, which is a parameter, so it is declared
+        # as one -- exactly the defect w120 added this parameter for.
+        resource_id_param="target_user_id",
         details_builder=lambda params, result: {
             "target_user_id": str(params.get("target_user_id")),
-            "backup_codes_issued": len(result) if result else 0,
+            "backup_codes_issued": len(result.backup_codes) if result else 0,
         },
     )
     @transactional
-    def enrol_totp(self, session: Session, target_user_id: uuid.UUID, secret: str) -> List[str]:
+    def enrol_totp(self, session: Session, target_user_id: uuid.UUID) -> TotpEnrolment:
         """
-        Administrator-initiated TOTP enrolment. Returns the backup codes in
-        plaintext ONCE -- this return value is the only moment they exist in
-        readable form. Only bcrypt hashes are stored, so they cannot be
-        recovered, displayed again, or read out of the database by anyone.
+        Administrator-initiated TOTP enrolment.
+
+        THE SECRET IS GENERATED HERE AND THERE IS NO PARAMETER FOR IT (w164).
+        This method used to accept the secret, which meant the caller chose it,
+        and a secret the caller chose can be weak, shared between accounts or a
+        constant. `generate_totp_secret()` takes 160 bits from `secrets`; there
+        is no argument through which a worse one could arrive.
+
+        THE RETURN VALUE IS THE ONLY MOMENT either the secret or the backup
+        codes exist in readable form. The secret is stored encrypted under the
+        deployment's key and is selected by no read method on this class; the
+        codes are stored only as bcrypt hashes. Neither can be recovered,
+        displayed again, or read out of the database by anyone -- an
+        administrator who loses this response re-enrols.
+
+        RE-ENROLMENT VOIDS WHAT CAME BEFORE, and that is a security property
+        rather than tidiness. Before this wave a second enrolment added eight
+        MORE codes beside the old ones, so replacing a compromised
+        authenticator left the compromised account's backup codes working.
+        `totp_last_used_step` is cleared for the mirror-image reason: the new
+        secret's steps have not been spent, and inheriting the old
+        authenticator's counter would refuse valid codes until the clock caught
+        up.
+
+        ATOMIC. `@transactional` wraps the whole body, so the secret, the
+        voiding of the old codes and all eight new rows land together or not at
+        all -- there is no state in which the column has been replaced and the
+        codes have not.
         """
         self._require_role(session, "Administrator")
         self.get_user(session, target_user_id)
         if self._cipher is None:
-            raise ConfigurationError("Enrolling TOTP requires a secret_cipher.")
+            raise ConfigurationError(
+                f"Enrolling TOTP requires a secret cipher; {TOTP_SECRET_KEYS_ENV} is not configured."
+            )
 
         now = self._clock.now()
+        secret = generate_totp_secret()
         self._execute(
-            "UPDATE users SET totp_secret = %s, totp_enrolled_at = %s, updated_at = %s "
+            "UPDATE users SET totp_secret = %s, totp_enrolled_at = %s, totp_last_used_step = NULL, "
+            "                 updated_at = %s "
             "WHERE user_id = %s AND org_id = %s",
             (self._cipher.encrypt(secret), now, now, target_user_id, session.org_id),
+        )
+        # MARKED USED RATHER THAN DELETED, because nothing in this schema
+        # deletes (the D0b ruling; `clinical_app` holds no DELETE on this table
+        # and the REVOKE is explicit). A used row is also the honest record:
+        # the code existed and stopped being valid at a known moment.
+        self._execute(
+            "UPDATE totp_backup_codes SET used_at = %s WHERE user_id = %s AND org_id = %s AND used_at IS NULL",
+            (now, target_user_id, session.org_id),
         )
 
         codes: List[str] = []
@@ -1443,7 +2664,7 @@ class DataAccess:
                 "VALUES (%s, %s, %s, %s, %s)",
                 (uuid.uuid4(), target_user_id, session.org_id, self._hasher.hash(code), now),
             )
-        return codes
+        return TotpEnrolment(secret=secret, backup_codes=codes)
 
     # ── audit reads ──────────────────────────────────────────────────────────
 
@@ -1511,10 +2732,62 @@ class DataAccess:
         self,
         session: Session,
         name: str,
-        dob: _datetime.date,
+        dob: "_datetime.date | str",
         sex: str,
     ) -> uuid.UUID:
-        """Create a patient record in this organisation."""
+        """
+        Create a patient record in this organisation.
+
+        REQUIRES THE ORDERER ROLE (w162, human ruling 2026-09-19: "PATIENT
+        REGISTRATION + CONSENT -- the ORDERER/CLINICIAN owns both. Do NOT make
+        Administrator registration mandatory. Do NOT make Lab Technician a
+        patient identity creator.").
+
+        THE TOKEN IS READ OFF THE VOCABULARY, NOT CHOSEN. `ROLES` is what the
+        schema's CHECK on `role_assignments.role` enumerates, and exactly one
+        of its seven names a clinician -- the same one `create_order` already
+        names for the same reason ("Ordering a test is the clinical decision
+        the Orderer role names"). Registration and consent are the acts that
+        precede an order and they belong to the principal who places it.
+
+        NO HIERARCHY IS INTRODUCED, which is the half a later reader will be
+        tempted to undo. An Administrator is NOT implicitly an Orderer here,
+        exactly as `create_order` already says: the ruling gives Administrator
+        organisation/staff administration, and a role that silently subsumes
+        the others is the RBAC redesign the same ruling forbids. The ruling
+        forbids MANDATORY Administrator registration and is silent on whether
+        Administrator may ALSO register; the narrower reading is implemented
+        and the widening is carded, because widening a gate later is a line
+        and a test while narrowing one after deployment withdraws a
+        capability somebody is using.
+
+        UNTIL w162 THIS METHOD ENFORCED NO ROLE AT ALL. Every authenticated
+        session in the organisation could mint a patient identity, and w155
+        correctly refused to guess a role without a ruling. The ruling is now
+        in force and this is it.
+
+        `dob` ACCEPTS A `date` OR AN ISO-8601 STRING, AND THE PARSE IS BELOW
+        THE GATE. That is not a convenience: `clinical/clinic_endpoints.py`
+        takes the date as a `str` because Pydantic runs BEFORE the handler and
+        therefore before this gate, so a `datetime.date` annotation on the
+        request model would answer "that is not a date" to a caller whose
+        authorisation had not been evaluated. The format check belongs where
+        the `sex` vocabulary already is -- after the gate -- so it lives here.
+        Existing callers passing a `date` are unaffected.
+
+        THE ORDER MATTERS AND IS PINNED BY A TEST: the role gate is the FIRST
+        EXECUTABLE STATEMENT, above the format parse and above the sex
+        vocabulary, so an unauthorised caller's refusal cannot vary with the
+        content of the body.
+        """
+        self._require_role(session, "Orderer")
+
+        if isinstance(dob, str):
+            try:
+                dob = _datetime.date.fromisoformat(dob)
+            except ValueError:
+                raise ValueError(f"Date of birth must be an ISO-8601 date (YYYY-MM-DD), not {dob!r}")
+
         if sex not in ("M", "F", "O", "U"):
             raise ValueError(f"Sex must be one of M/F/O/U, not {sex!r}")
 
@@ -1544,7 +2817,30 @@ class DataAccess:
         scope: str,
         supersedes_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
-        """Record a new consent. Optionally supersedes an old one."""
+        """
+        Record a new consent. Optionally supersedes an old one.
+
+        REQUIRES THE ORDERER ROLE (w162, the same ruling `create_patient`
+        carries in full). Consent capture is the second half of the act the
+        ruling names, and the tree already treats it as the ordering
+        clinician's: `create_order` re-reads this row, checks its scope
+        against the order's `required_scope`, and refuses without an active
+        one. Gating creation while leaving capture open would move the hole
+        rather than close it -- the argument `place_order` already makes.
+
+        THE GATE IS THE FIRST EXECUTABLE STATEMENT, above the patient lookup,
+        so an unauthorised caller's 403 is a function of its own roles alone
+        and carries no information about whether the named patient exists --
+        in this organisation or in another.
+
+        `recorded_by` IS `session.user_id` AND IS NOT A PARAMETER. The actor
+        is derived from the authenticated principal, never claimed by the
+        caller: under ISO 15189 the record of who performed an action is
+        evidence, and a claimed actor is indistinguishable in the log from a
+        verified one.
+        """
+        self._require_role(session, "Orderer")
+
         # Validate patient exists in this org
         patient = self._query_one(
             "SELECT patient_id FROM patients WHERE patient_id = %s AND org_id = %s",
@@ -1601,7 +2897,36 @@ class DataAccess:
         priority: str = "routine",
         clinical_indication: Optional[str] = None,
     ) -> uuid.UUID:
-        """Create a new order in draft state. Requires valid patient, test, and consent."""
+        """
+        Create a new order in draft state. Requires valid patient, test, and consent.
+
+        Requires the Orderer role (w129 phase B). Ordering a test is the
+        clinical decision the Orderer role names, and until w129 nothing
+        consulted it: `Orderer` occurred exactly once in all non-test Python
+        of clinical/ and geper/, inside the ROLES tuple, so every
+        authenticated session in the organisation could order equally.
+
+        Gated with `_require_role` and the session model -- the same
+        mechanism the nine pre-existing role gates use. No hierarchy is
+        introduced: an Administrator is not implicitly an Orderer, because
+        the ruling gives Administrator organisation/staff administration and
+        a role that silently subsumes the others is the RBAC redesign the
+        same ruling forbids.
+
+        SUPERSEDED AT w162, AND THE OLD TEXT IS REPLACED RATHER THAN LEFT TO
+        ROT. This docstring used to say that `create_patient`,
+        `record_consent` and `withdraw_consent` were NOT gated "because no
+        role in the vocabulary names them, and inventing one from
+        create_order's proximity would be reading the model off a workflow
+        diagram instead of off the code". That reasoning was correct while it
+        stood and it is no longer the state of the tree: the human ruled on
+        2026-09-19 that the ordering clinician owns registration and consent,
+        and all three are now `_require_role(session, "Orderer")` as their
+        first executable statement. The role was not inferred from proximity;
+        it was RULED, and the token was then resolved against `ROLES`.
+        """
+        self._require_role(session, "Orderer")
+
         if priority not in ("routine", "urgent"):
             raise ValueError(f"Priority must be 'routine' or 'urgent', not {priority!r}")
 
@@ -1670,7 +2995,16 @@ class DataAccess:
     )
     @transactional
     def place_order(self, session: Session, order_id: uuid.UUID) -> None:
-        """Place an order, transitioning it from draft to placed state."""
+        """
+        Place an order, transitioning it from draft to placed state.
+
+        Requires the Orderer role (w129 phase B). This is the act that
+        commits the laboratory to the work; it belongs to whoever may create
+        the order, and gating creation while leaving placement open would
+        move the hole rather than close it.
+        """
+        self._require_role(session, "Orderer")
+
         order = self._query_one(
             "SELECT order_id, state FROM orders WHERE order_id = %s AND org_id = %s",
             (order_id, session.org_id),
@@ -1698,7 +3032,16 @@ class DataAccess:
     )
     @transactional
     def cancel_order(self, session: Session, order_id: uuid.UUID) -> None:
-        """Cancel an order."""
+        """
+        Cancel an order.
+
+        Requires the Orderer role (w129 phase B). Withdrawal is the third and
+        last of the ordering operations this file defines -- counted by
+        scanning every method definition, not by grepping for a word -- and
+        it moves `orders.state` exactly as the other two do.
+        """
+        self._require_role(session, "Orderer")
+
         order = self._query_one(
             "SELECT order_id, state FROM orders WHERE order_id = %s AND org_id = %s",
             (order_id, session.org_id),
@@ -1721,7 +3064,22 @@ class DataAccess:
         requires_session=True,
         details_builder=lambda params, result: {
             "order_id": str(params.get("order_id")),
-            "type": params.get("type"),
+            # w157. WAS `params.get("type")`, WHICH IS NOT A PARAMETER OF THIS
+            # METHOD. `auditable` builds `params` by binding the ORIGINAL
+            # function's signature (`sig.bind(self, *args, **kwargs)`), so its
+            # keys are the real parameter names -- and this one is
+            # `sample_type`. Every `sample_received` audit row this repository
+            # has ever written therefore recorded `"type": null`, for every
+            # specimen, silently: the row landed, the count was right, and the
+            # one clinical fact it carried was absent.
+            #
+            # Nothing observed it. No test asserted on this action's details at
+            # all, and no production caller existed to write a row in the first
+            # place (zero call sites at 764d646) -- which is why wiring the
+            # route is what surfaced it. The OUTPUT key stays `"type"`, because
+            # that is the column it describes (`samples.type`); only the lookup
+            # is corrected.
+            "type": params.get("sample_type"),
         },
     )
     @transactional
@@ -1732,7 +3090,23 @@ class DataAccess:
         sample_type: str,
         condition_on_receipt: Optional[str] = None,
     ) -> uuid.UUID:
-        """Record receipt of a sample. Transitions order to sample_awaited state if needed."""
+        """
+        Record receipt of a sample. Transitions order to sample_awaited state if needed.
+
+        Requires the Lab technician role (w129 phase B). Receiving a specimen
+        is bench work, and this method stamps `received_by` and
+        `collected_by` from the session -- laboratory provenance, which is
+        exactly the claim a role qualifies. Until w129 `Lab technician`
+        occurred once in all non-test Python of clinical/ and geper/, inside
+        the ROLES tuple, and gated nothing.
+
+        The two operational roles do not overlap and neither subsumes the
+        other: an Orderer may order and may not receive, a Lab technician may
+        receive and may not order. Administrator is not a superuser over
+        either -- the ruling gives it organisation/staff administration.
+        """
+        self._require_role(session, "Lab technician")
+
         if sample_type not in ("blood", "saliva", "tissue", "dna"):
             raise ValueError(f"Sample type must be one of: blood, saliva, tissue, dna; not {sample_type!r}")
 
@@ -1797,7 +3171,17 @@ class DataAccess:
         qc_status: str,
         qc_reason: Optional[str] = None,
     ) -> None:
-        """Record QC result for a sample."""
+        """
+        Record QC result for a sample.
+
+        Requires the Lab technician role (w129 phase B). The QC verdict
+        decides whether a specimen is fit to sequence and is stamped with
+        `qc_recorded_by` from the session; it is the operation in this group
+        with the clearest patient-safety consequence, and before w129 any
+        authenticated session in the organisation could sign it.
+        """
+        self._require_role(session, "Lab technician")
+
         if qc_status not in ("passed", "failed"):
             raise ValueError(f"QC status must be 'passed' or 'failed', not {qc_status!r}")
 
@@ -1827,7 +3211,37 @@ class DataAccess:
     )
     @transactional
     def withdraw_consent(self, session: Session, consent_id: uuid.UUID) -> None:
-        """Withdraw an active consent."""
+        """
+        Withdraw an active consent.
+
+        REQUIRES THE ORDERER ROLE (w162, the same ruling `create_patient`
+        carries in full). Withdrawal is the third and last of the consent
+        operations this file defines -- counted by scanning every method
+        definition, not by grepping for a word -- and it is the inverse of
+        `record_consent`, so it answers to the same principal. A withdrawal
+        open to anyone authenticated would let a role that may not record
+        consent destroy the basis for an order.
+
+        THE GATE IS THE FIRST EXECUTABLE STATEMENT, above the consent lookup,
+        for the reason `record_consent` states.
+
+        WHAT THIS IS NOT: a deletion. The row stays and `withdrawn_at` /
+        `withdrawn_by` are stamped on it, so the consent remains readable as
+        the historical fact it is. The `withdrawn_at IS NULL` predicate below
+        is also why withdrawing an already-withdrawn consent is NOT FOUND
+        rather than a distinct refusal -- it is simply not among the active
+        ones, and a distinct status would tell a caller that a consent it may
+        not act on nevertheless exists.
+
+        WHETHER WITHDRAWAL IS RETROACTIVE -- what it means for orders already
+        placed against this consent -- IS NOT DECIDED HERE AND IS NOT DECIDED
+        ANYWHERE IN THIS TREE. This method touches `consents` and nothing
+        else; no order state moves, no report is recalled. That is the
+        behaviour as shipped, it is unchanged by w162, and changing it would
+        be a product ruling nobody has made. Carded, not guessed.
+        """
+        self._require_role(session, "Orderer")
+
         consent = self._query_one(
             "SELECT consent_id FROM consents WHERE consent_id = %s AND org_id = %s AND withdrawn_at IS NULL",
             (consent_id, session.org_id),
@@ -1864,6 +3278,1143 @@ class DataAccess:
             "created_at": row[4],
             "disabled": row[5],
         }
+
+    # ── the portal read surface: THE SECOND AXIS OF ISOLATION (w130) ─────────
+    #
+    # THE ONE RULE, AND EVERY METHOD BELOW OBEYS IT:
+    #
+    #     The patient is bound FROM THE SESSION. It is never an argument.
+    #
+    # NOT a comparison. Not `if requested_patient_id != session.patient_id:
+    # raise`. A value read from the session and never from a caller argument is
+    # STRUCTURAL; a comparison is REMEMBERED, and every tenancy property in
+    # this codebase was built the first way -- see Session's own docstring,
+    # which says org_id "is read from here and never from a caller argument,
+    # which is what makes the isolation structural rather than remembered".
+    #
+    # THE PARAMETER DOES NOT EXIST, which is the strong form of the rule: if a
+    # patient id cannot be passed in, the class of bug where it is passed in
+    # unvalidated cannot exist.
+    #
+    # MEASURED, NOT ARGUED. The version of these two methods that took
+    # `patient_id` as an argument and bound only org_id PASSED 41 OF 46 TESTS
+    # in this file. It passed every cross-organisation test, every
+    # authentication test, every enrolment test, every decision-7 test, and it
+    # returned the right record whenever the supplied id happened to match the
+    # session. The five it failed are the five that hand it a DIFFERENT, REAL,
+    # SAME-ORGANISATION patient's id.
+    #
+    # EVERY READ ANCHORS ON `patients`. Only four tables carry a patient_id
+    # column -- patients, external_identifiers, consents, orders -- so anything
+    # further downstream is reachable only by joining back up to `patients` and
+    # binding both org_id and patient_id at the anchor. patient_id is
+    # deliberately NOT denormalised onto samples, runs, VCFs, interpretations
+    # or reports.
+
+    def _require_patient_session(self, session: Any) -> None:
+        """
+        DECISION 8: a staff session does not automatically become a patient
+        session. Patient access is explicit.
+
+        A Session and a PatientSession both carry org_id, so a staff session
+        handed to a portal method would duck-type into the org predicate and
+        then fail on the missing patient_id attribute with an AttributeError --
+        an accident that looks like a bug rather than a refusal. This makes it
+        a refusal.
+        """
+        if not isinstance(session, PatientSession):
+            raise AuthorizationError(
+                "This is a patient portal operation and requires a patient session. A staff "
+                "session does not automatically become a patient session."
+            )
+
+    @auditable(
+        action="portal_patient_record_read",
+        resource_type="patient",
+        requires_session=False,
+        auditable=False,
+        reason="every patient-record reader in this layer is auditable=False, and whether a patient "
+        "portal changes that is an OPEN RULING -- it is one decision covering get_patient, get_order, "
+        "get_consent, get_sample and the held find_variant_trends_for_patient, and it changes the "
+        "trends endpoint's stated two-round-trip cost. Deciding it here, for one method, would settle "
+        "by accident a question that needs settling on purpose",
+    )
+    @transactional
+    def get_my_patient_record(self, patient_session: "PatientSession") -> dict[str, Any]:
+        """
+        The authenticated patient's own record. TAKES NO PATIENT IDENTIFIER.
+
+        Returns name, date of birth and sex, because that is the whole of what
+        a `patients` row holds. There is no contact detail on it and no report
+        content anywhere in this schema -- `reports` has no content column, so
+        "view my report" is not a route waiting to be written.
+        """
+        self._require_patient_session(patient_session)
+        row = self._query_one(
+            "SELECT patient_id, name, dob, sex, created_at FROM patients WHERE patient_id = %s AND org_id = %s",
+            # BOTH bound from the session. The org predicate answers "which
+            # organisation?" and the patient predicate answers "which patient?"
+            # -- in the same position, with the same status.
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        if row is None:
+            # Reachable only if the patient row was removed under a live
+            # session. The same constant every other patient-axis miss uses.
+            raise NotFoundError(PATIENT_NOT_FOUND)
+        return {
+            "patient_id": row[0],
+            "name": row[1],
+            "dob": row[2],
+            "sex": row[3],
+            "created_at": row[4],
+        }
+
+    @auditable(
+        action="portal_orders_read",
+        resource_type="order",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def list_my_test_orders(self, patient_session: "PatientSession") -> list[dict[str, Any]]:
+        """
+        The authenticated patient's own test orders. TAKES NO PATIENT
+        IDENTIFIER.
+
+        ANCHORED ON `patients`, not on `orders`. orders does carry patient_id,
+        so the join is not strictly required for this one table -- it is
+        written this way because it is the shape every deeper portal read will
+        need, and because the anchor is where both predicates are bound.
+
+        WHAT IS STILL DELIBERATELY NOT RETURNED: `orders.state`. w134 re-counted
+        it and the refusal stands, for a sharper reason than "three values have
+        no writer". `sample_awaited` is written by `receive_sample` AFTER the
+        specimen has arrived (see that method), so the column's own vocabulary
+        is inverted: a patient whose sample is already sequenced would be shown
+        "awaiting sample". The column is not renderable to a patient under any
+        name, and no caller of this method is given the chance to try.
+
+        WHAT IS RETURNED INSTEAD (w134): `stages`, DERIVED. Six named stages,
+        each carrying one value out of a vocabulary that this repository's
+        WRITERS support -- see `derive_order_stages`, which is where every
+        refusal is justified value by value. Nothing here is stored; there is
+        no status column, no status table and no transition. Delete
+        `derive_order_stages` and the workflow is exactly what it was.
+
+        THE COUNTS THE DERIVATION NEEDS ARE AGGREGATED IN THE DATABASE, in two
+        lateral subqueries, each of which is an ungrouped aggregate and so
+        returns exactly one row. That is not a micro-optimisation: a plain
+        LEFT JOIN to `samples` and to `reports` would FAN OUT, and an order
+        with two samples would appear twice in a patient's list of orders.
+
+        EVERY SUBQUERY IS ORG-SCOPED ON ITS OWN, correlated to `o.org_id`
+        rather than trusting the outer join to have narrowed it. The chain
+        samples -> sequencing_runs -> vcfs -> interpretations -> reports is
+        followed with the composite (org_id, id) keys the schema declares, so
+        no hop can cross an organisation even if a bare id were duplicated.
+        """
+        self._require_patient_session(patient_session)
+        rows = self._query(
+            "SELECT o.order_id, o.created_at, o.placed_at, o.cancelled_at, "
+            "       sm.total, sm.qc_pending, sm.qc_passed, sm.qc_failed, "
+            "       an.interpretations, an.reports_total, an.reports_signed_off, an.reports_released "
+            "FROM orders o "
+            "JOIN patients p ON p.patient_id = o.patient_id AND p.org_id = o.org_id "
+            "LEFT JOIN LATERAL ("
+            "    SELECT count(*) AS total, "
+            "           count(*) FILTER (WHERE s.qc_status = 'pending') AS qc_pending, "
+            "           count(*) FILTER (WHERE s.qc_status = 'passed')  AS qc_passed, "
+            "           count(*) FILTER (WHERE s.qc_status = 'failed')  AS qc_failed "
+            "      FROM samples s "
+            "     WHERE s.org_id = o.org_id AND s.order_id = o.order_id"
+            ") sm ON TRUE "
+            "LEFT JOIN LATERAL ("
+            "    SELECT count(DISTINCT i.id) AS interpretations, "
+            "           count(DISTINCT rep.id) AS reports_total, "
+            "           count(DISTINCT rep.id) FILTER (WHERE rep.state IN ('approved', 'released')) "
+            "               AS reports_signed_off, "
+            "           count(DISTINCT rep.id) FILTER (WHERE rep.state = 'released') AS reports_released "
+            "      FROM samples s2 "
+            "      JOIN sequencing_runs r ON r.org_id = s2.org_id AND r.sample_id = s2.sample_id "
+            "      JOIN vcfs v            ON v.org_id = r.org_id  AND v.sequencing_run_id = r.id "
+            "      JOIN interpretations i ON i.org_id = v.org_id  AND i.vcf_id = v.id "
+            "      LEFT JOIN reports rep  ON rep.org_id = i.org_id AND rep.interpretation_id = i.id "
+            "     WHERE s2.org_id = o.org_id AND s2.order_id = o.order_id"
+            ") an ON TRUE "
+            "WHERE p.patient_id = %s AND p.org_id = %s "
+            "ORDER BY o.created_at",
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        return [
+            {
+                "order_id": r[0],
+                "created_at": r[1],
+                "placed_at": r[2],
+                "cancelled_at": r[3],
+                "stages": derive_order_stages(
+                    placed_at=r[2],
+                    cancelled_at=r[3],
+                    sample_count=r[4] or 0,
+                    qc_pending=r[5] or 0,
+                    qc_passed=r[6] or 0,
+                    qc_failed=r[7] or 0,
+                    interpretation_count=r[8] or 0,
+                    report_count=r[9] or 0,
+                    reports_signed_off=r[10] or 0,
+                    reports_released=r[11] or 0,
+                ),
+            }
+            for r in rows
+        ]
+
+    # ── w135: the patient's own RELEASED reports ─────────────────────────────
+    #
+    # WHAT A RELEASED REPORT CONSISTS OF IN THIS MODEL, STATED AS A
+    # MEASUREMENT BEFORE ANYTHING IS RETURNED. `reports` carries org_id, id,
+    # interpretation_id, created_at, created_by, state, approver_id,
+    # approved_at, content_hash, tombstoned_at, tombstoned_by and
+    # retention_days -- and NO CONTENT COLUMN. A `reports` row is a governance
+    # record ABOUT a document, not the document. The document itself is
+    # rendered outside this schema, from `interpretations.run_document`, by
+    # geper/report/clinical_report_builder.py, and is not stored here in any
+    # form.
+    #
+    # SO THE TWO METHODS BELOW RETURN METADATA AND RELEASE STATE, AND THAT IS
+    # THE WHOLE OF WHAT THERE IS TO RETURN. This is not a reduced version of a
+    # richer surface: there is no richer surface in this schema, and inventing
+    # report-content storage to make one is the thing the brief forbids.
+    #
+    # WHY `run_document` IS NOT THE SUBSTITUTE, and this is the one edge a
+    # future implementer will be tempted by. `get_interpretation` returns the
+    # entire raw run_document with NO report-state check at all -- so routing a
+    # patient through it would hand out the unapproved pipeline output of a
+    # DRAFT report, which is precisely the "raw result data must not bypass
+    # report-release rules" failure. Neither method below reads
+    # `interpretations`, `vcfs`, `variants` or `run_document`, and neither
+    # returns `interpretation_id`: an interpretation id is the handle that
+    # addresses raw pipeline output, and handing it to a patient makes the
+    # bypass one route away instead of zero.
+    #
+    # THE RELEASE REQUIREMENT, AND WHY `require_release` IS NOT CALLED HERE.
+    # `require_release` is the gate every STAFF delivery path calls, and since
+    # w129 phase B it is an AUTHORITY gate as well as a state gate: its first
+    # line is `self._require_role(session, "Approver")`. A patient never holds
+    # Approver and never will, so calling it from a patient read would either
+    # refuse every patient or require weakening the gate -- and weakening it is
+    # forbidden. These methods do not re-implement it either. They read the
+    # RECORDED OUTCOME of a release that already happened: a `release_events`
+    # row, written by `_release_report` behind that same Approver gate, for a
+    # report whose own state says `released`. That is strictly NARROWER than
+    # `require_release` admits (it passes `approved` as well), and narrower is
+    # the safe direction.
+    #
+    # NOTHING IN THIS REPOSITORY CALLS `_release_report`. COUNTED at d6246cd,
+    # non-test callers: ZERO (the one grep hit is prose in
+    # geper/review/signoff.py). So in THIS deployment no report ever reaches
+    # `released` and both methods below return nothing for everybody, for ever.
+    # They are still correct, and they are tested by driving `_release_report`
+    # itself; what cannot be demonstrated is a production path that reaches
+    # them. Recorded here rather than implied.
+    #
+    # RETRACTION IS FLAGGED HERE AND NEVER FILTERED -- w148, human decision 1.
+    # COUNTED, AND THE COUNT HAS MOVED since this note was first written:
+    # `report_retractions` DOES now exist in schema.sql (migration 0003,
+    # 2de2fef), while `clinical/data_access.py` STILL has no
+    # unapprove/retract/rescind method -- re-counted at 2de2fef, and
+    # enforce_content_immutability() still FORBIDS walking an approved report
+    # back at the database. So the table is readable and nothing in this
+    # repository can write to it; see the flag's own note below the readers.
+    #
+    # The human rulings settle the reader question in the opposite direction
+    # from hiding: E7 says a retracted report must NOT become unfindable, and
+    # E3 says retraction does not refuse at the release gate -- the retraction
+    # TRAVELS with the document instead. Decision 1 is that form exactly: these
+    # methods filter on RELEASE, never on retraction, and return
+    # `is_retracted` as a plain boolean beside the row. No reason, no
+    # retractor, no timestamp, no `replacement_report_id`.
+
+    @auditable(
+        action="portal_reports_read",
+        resource_type="report",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def list_my_released_reports(self, patient_session: "PatientSession") -> list[dict[str, Any]]:
+        """
+        Every RELEASED report belonging to the authenticated patient. TAKES NO
+        PATIENT IDENTIFIER, and takes no identifier of any other kind either.
+
+        ANCHORED ON `patients`, like every other portal read: both predicates
+        are bound at the anchor, from the session, and the chain
+        orders -> samples -> sequencing_runs -> vcfs -> interpretations ->
+        reports is walked with the composite (org_id, id) keys the schema
+        declares, so no hop can cross an organisation even if a bare id
+        repeated.
+
+        THE RELEASE PREDICATE IS TWO CONDITIONS, NOT ONE, and the second is
+        the load-bearing one. `reports.state = 'released'` is, by
+        `_release_report`'s own docstring, a DERIVED SUMMARY -- "has this
+        report been released at all" -- while `release_events` is the record of
+        who received what and when. A surface that trusted the summary alone
+        would show a report as delivered on the strength of a column the
+        application holds a column-scoped write grant on (schema.sql's
+        `GRANT` block, near the bottom, on `reports`). So the delivery record
+        is required to exist as well.
+
+        THE LATERAL AGGREGATE IS A CORRECTNESS REQUIREMENT, not a performance
+        choice, and it is the same hazard w134 hit one table over: a report
+        released to three consumers has THREE `release_events` rows, and a
+        plain JOIN would return that patient's one report three times.
+
+        `released_at` IS THE FIRST DELIVERY (`min`), which is also the anchor
+        the retention clock uses (ruling D3, clinical/retention.py): re-delivery
+        to a second consumer does not restart it and does not change what the
+        patient is told about when their report was issued.
+
+        WHAT IS DELIBERATELY NOT RETURNED, each with its reason:
+          * `interpretation_id` -- the handle to raw pipeline output (above).
+          * `approver_id` / any approver name -- ISO 15189 7.4.1.5 c) requires
+            the authoriser to be RETRIEVABLE, and it is, from `reports`, by a
+            staff reader. Naming a member of laboratory staff to a patient over
+            an unauthenticated-by-default internet surface is a separate
+            ruling nobody has made.
+          * `content_hash` -- a SHA-256 of content this surface does not carry.
+          * `state` -- every row returned is `released` by construction, so a
+            state field could only ever say one thing.
+          * `tombstoned_at` -- see the module note above and w135's card.
+          * EVERY COLUMN OF `report_retractions` EXCEPT THE FACT ITSELF --
+            w148, human decision 1, stated as a refusal because that is what
+            it is: `reason`, `retracted_by`, `retracted_at`,
+            `retracted_from_state` and `replacement_report_id` are all
+            available in the row this statement already touches, and none of
+            them is returned. The reason is internal review detail; the
+            retractor is a member of laboratory staff (the same ruling that
+            withholds `approver_id`); the replacement is E4's optional edge,
+            which the human declined for this surface. What IS returned is one
+            boolean, `is_retracted`.
+
+        WHAT IS NOW RETURNED, AND IT IS FOUR FIELDS RATHER THAN THREE:
+        `report_id`, `order_id`, `released_at`, `is_retracted`.
+        """
+        self._require_patient_session(patient_session)
+        rows = self._query(
+            self._MY_RELEASED_REPORTS_SQL + " ORDER BY rel.first_released_at, rep.id",
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        return [{"report_id": r[0], "order_id": r[1], "released_at": r[2], "is_retracted": r[4]} for r in rows]
+
+    @auditable(
+        action="portal_report_read",
+        resource_type="report",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def get_my_released_report(self, patient_session: "PatientSession", report_id: uuid.UUID) -> dict[str, Any]:
+        """
+        ONE released report of the authenticated patient's, by its id.
+
+        `report_id` IS A RESOURCE IDENTIFIER AND NOT AN IDENTITY. The patient
+        is still bound from the session and is still never an argument: the id
+        below is an extra NARROWING predicate applied AFTER the anchor has
+        already restricted the rows to this patient, in this organisation. It
+        can only ever select from among the caller's own released reports, so
+        supplying somebody else's selects nothing. That is the structural form
+        -- the parameter that would matter, `patient_id`, does not exist here
+        either.
+
+        EVERY MISS RAISES THE SAME NotFoundError WITH THE SAME CONSTANT. A
+        report that does not exist, one belonging to another patient, one in
+        another organisation, and one of the caller's OWN that is still draft,
+        under_review, approved-but-never-released or returned are all one
+        answer. Distinguishing any of them would tell a caller which report ids
+        are real, and "my own unreleased report exists" is the one that leaks a
+        clinical fact the release gate exists to withhold.
+        """
+        self._require_patient_session(patient_session)
+        row = self._query_one(
+            self._MY_RELEASED_REPORTS_SQL + " AND rep.id = %s",
+            (patient_session.patient_id, patient_session.org_id, report_id),
+        )
+        if row is None:
+            raise NotFoundError(REPORT_NOT_FOUND)
+        return {"report_id": row[0], "order_id": row[1], "released_at": row[2], "is_retracted": row[4]}
+
+    # ── w136: the patient's own released reports, AS A SERIES ────────────────
+    #
+    # WHAT A PATIENT TREND IS IN THIS MODEL, AND WHAT IT IS NOT. The held
+    # trends work (`w127-trends`, tip 861e59f, read via `git show`, NEVER
+    # MERGED) builds a series of ACMG CLASSIFICATIONS, one point per variant
+    # per INTERPRETATION, read out of `interpretations.run_document`. That
+    # series is NOT served to a patient here, and there are two separate
+    # reasons, either of which alone would be sufficient:
+    #
+    #   1. IT IS THE REFUSAL w135 ALREADY MADE, ONE WAVE AGO, IN THIS FILE.
+    #      `run_document` is raw pipeline output with no report-state check
+    #      anywhere near it; `get_interpretation` returns the whole of it. The
+    #      two report readers above return no `interpretation_id` precisely so
+    #      that the bypass is zero routes away rather than one, and two tests
+    #      in test_w135_patient_report_access.py pin that. Reversing that
+    #      refusal one wave later, with no ruling, is not a reconciliation.
+    #   2. A CLASSIFICATION SERIES CANNOT CARRY A RETRACTION. Retraction, on
+    #      the held `w122-retraction` (a4907d3), attaches to a REPORT --
+    #      `report_retractions.report_id`. A w127 trend point is keyed on an
+    #      INTERPRETATION, and one interpretation carries many reports (an
+    #      amendment is a new `reports` row on the SAME interpretation_id; see
+    #      create_amendment). So there is no function from a w127 point to a
+    #      retraction status: the point names the wrong object. Human ruling
+    #      E3's whole bargain is that the retraction TRAVELS WITH THE
+    #      DOCUMENT, and a series that structurally cannot carry it has taken
+    #      the benefit of that bargain without paying it.
+    #
+    # SO THE SERIES THIS FILE SERVES A PATIENT IS KEYED ON REPORTS, which is
+    # the object retraction, amendment and release all already attach to. The
+    # trend a patient can be told about, in THIS model, is: which reports were
+    # issued to me, in what order, and which of them replaced which.
+    #
+    # THE EDGE IS `amendments`, WHICH EXISTS AT THIS SHA -- COUNTED. The
+    # corrective act this schema has is AMENDMENT (schema.sql:1213,
+    # `clinical_app` holds SELECT at schema.sql:1594, `create_amendment` is
+    # Approver-gated).
+    #
+    # RE-COUNTED IN w148, BECAUSE HALF OF WHAT THIS PARAGRAPH SAID HAS STOPPED
+    # BEING TRUE and a census claim gets fixed rather than left standing. It
+    # used to read "the one it does not have is RETRACTION (`report_retractions`
+    # appears 0 times in schema.sql ...)". At 2de2fef `report_retractions`
+    # appears in schema.sql and has its own migration. What has NOT changed is
+    # the other half: there is still no retract/unapprove/rescind verb in this
+    # class, and enforce_content_immutability still REFUSES to walk an approved
+    # report back. So the schema can RECORD a retraction and this layer can
+    # READ one; nothing in this repository can CREATE one.
+    #
+    # AND NOTHING IS FILTERED. No retraction predicate, no tombstone
+    # predicate -- only release, exactly as the two readers above. Rulings E3
+    # and E7 settle the reader question in the opposite direction from hiding:
+    # a retracted report is STILL RETURNED, carrying the fact, because
+    # filtering it "would make a retracted report unfindable".
+    #
+    # w148: THAT IS NO LONGER A FORECAST. `report_retractions` arrived in the
+    # schema with migration 0003 (2de2fef), the two rows that said "fail the
+    # moment this table appears" did exactly that, and the human ruled both
+    # patient surfaces: a SIMPLE BOOLEAN, and nothing else.
+    #
+    #   1. PATIENT RETRACTED REPORT -- Decision A. The report responses expose
+    #      a retraction flag. NOT the reason, NOT the reviewer, NOT
+    #      `replacement_report_id`.
+    #   2. PATIENT RETRACTED TREND POINT -- Decision A. The point REMAINS in
+    #      the series and carries the same flag. Again no replacement id and
+    #      no internal detail.
+    #
+    # SO E4's OPTIONAL `replacement_report_id` IS REFUSED, and its refusal is
+    # the whole of the difference between this wave and the forecast above:
+    # the edge shape was available and the human declined it.
+    #
+    # WHERE THE FLAG LIVES, AND WHY IT COULD NOT LIVE ANYWHERE ELSE. It is a
+    # SCALAR `EXISTS` IN THE SELECT LIST of this same statement. Two standing
+    # requirements forced that and neither had any give in it:
+    #   * `test_every_portal_statement_binds_the_patient_from_the_session`
+    #     requires every statement a portal method issues to bind the
+    #     session's patient, and `test_the_two_methods_share_one_sql_text`
+    #     pins the caller count of this constant at exactly four -- one
+    #     definition and three callers. A SECOND statement breaks both.
+    #   * Rulings E3/E7 forbid the flag from removing a row.
+    # A projection satisfies both by construction: it is evaluated per row
+    # that the FROM/WHERE has ALREADY chosen, so it cannot add a row and
+    # cannot drop one, and it inherits this statement's patient anchor rather
+    # than needing its own.
+    #
+    # AND IT IS BOUND TO THE ROW IT DESCRIBES, on BOTH axes, structurally:
+    # `rr.org_id = rep.org_id AND rr.report_id = rep.id`. Without the first, a
+    # retraction in another tenant would flag this patient's report; without
+    # the second, one patient's retraction would flag their neighbour's. Both
+    # wrong versions have their own test.
+    #
+    # THE TWO GUARD ROWS THAT SAID `"retract" not in shared` WERE RE-AUTHORED,
+    # NOT DELETED, and the property they protected is unchanged: retraction
+    # must not decide WHICH ROWS COME BACK. They now assert that the word
+    # appears ONLY in the select list and NOWHERE in the FROM/JOIN/WHERE --
+    # which is the same property stated where it can still be enforced, and is
+    # strictly stronger than the old text on the half that matters, because
+    # the old text would have been satisfied by deleting the constant.
+
+    # ONE SQL TEXT, THREE CALLERS. The list, the single-report read and the
+    # trend must not be able to disagree about what "released" and "mine"
+    # mean: three copies of this join is three places for an org predicate to
+    # be dropped from, and only one of them is exercised by the isolation
+    # tests somebody remembers to write.
+    #
+    # THE FOURTH COLUMN IS THE AMENDMENT EDGE, and it is inside THIS text
+    # rather than in a second statement for exactly that reason. The two w135
+    # readers select it and ignore it; their returned dicts are unchanged.
+    #
+    # WHY THE EDGE CANNOT POINT OUTSIDE THE CALLER'S OWN RELEASED REPORTS,
+    # STRUCTURALLY AND NOT BY ARGUMENT:
+    #   * `orig.interpretation_id = rep.interpretation_id` -- create_amendment
+    #     copies the original's interpretation_id onto the amendment, so an
+    #     amendment and its original always share one interpretation, which
+    #     already sits under this patient's own order via the five hops above.
+    #     An edge to another patient's report cannot satisfy it.
+    #   * `orig.state = 'released'` AND an EXISTS over `release_events` -- the
+    #     same two conditions, in the same order, that gate the rows
+    #     themselves. Naming an original the patient was never sent would be
+    #     an existence oracle for an unreleased report id.
+    #   * `amd.org_id = rep.org_id` on every hop, as everywhere else here.
+    # LATERAL ... LIMIT 1 rather than a plain JOIN: `amendments` has no unique
+    # constraint on `amendment_report_id`, and a plain join would return the
+    # patient's one report twice if one ever appeared twice. Same hazard the
+    # `rel` aggregate exists for, one table over.
+    #
+    # THE FIFTH COLUMN IS THE RETRACTION FLAG (w148), and it is a SCALAR
+    # SUBQUERY IN THE PROJECTION rather than a join for the reason set out at
+    # length above: a projection cannot change the row set, which is exactly
+    # what rulings E3 and E7 forbid it from doing. It is bound on both axes to
+    # the row it describes. It returns a plain boolean and nothing else --
+    # no reason, no retractor, no timestamp, no replacement id -- so there is
+    # no internal detail in this result set for a handler to leak by accident.
+    _MY_RELEASED_REPORTS_SQL = (
+        "SELECT rep.id, o.order_id, rel.first_released_at, sup.amends_report_id, "
+        "       EXISTS (SELECT 1 FROM report_retractions rr "
+        "                WHERE rr.org_id = rep.org_id AND rr.report_id = rep.id) AS is_retracted "
+        "FROM patients p "
+        "JOIN orders o          ON o.org_id = p.org_id  AND o.patient_id = p.patient_id "
+        "JOIN samples s         ON s.org_id = o.org_id  AND s.order_id = o.order_id "
+        "JOIN sequencing_runs r ON r.org_id = s.org_id  AND r.sample_id = s.sample_id "
+        "JOIN vcfs v            ON v.org_id = r.org_id  AND v.sequencing_run_id = r.id "
+        "JOIN interpretations i ON i.org_id = v.org_id  AND i.vcf_id = v.id "
+        "JOIN reports rep       ON rep.org_id = i.org_id AND rep.interpretation_id = i.id "
+        "JOIN LATERAL ("
+        "    SELECT min(re.released_at) AS first_released_at, count(*) AS deliveries "
+        "      FROM release_events re "
+        "     WHERE re.org_id = rep.org_id AND re.report_id = rep.id"
+        ") rel ON rel.deliveries > 0 "
+        "LEFT JOIN LATERAL ("
+        "    SELECT orig.id AS amends_report_id "
+        "      FROM amendments amd "
+        "      JOIN reports orig ON orig.org_id = amd.org_id AND orig.id = amd.original_report_id "
+        "     WHERE amd.org_id = rep.org_id "
+        "       AND amd.amendment_report_id = rep.id "
+        "       AND orig.interpretation_id = rep.interpretation_id "
+        "       AND orig.state = 'released' "
+        "       AND EXISTS (SELECT 1 FROM release_events re2 "
+        "                    WHERE re2.org_id = orig.org_id AND re2.report_id = orig.id) "
+        "     ORDER BY amd.created_at, amd.id "
+        "     LIMIT 1"
+        ") sup ON TRUE "
+        "WHERE p.patient_id = %s AND p.org_id = %s "
+        "  AND rep.state = 'released'"
+    )
+
+    @auditable(
+        action="portal_report_trend_read",
+        resource_type="report",
+        requires_session=False,
+        auditable=False,
+        reason="see get_my_patient_record -- the same open ruling covers this method",
+    )
+    @transactional
+    def list_my_report_trend(self, patient_session: "PatientSession") -> list[dict[str, Any]]:
+        """
+        The authenticated patient's own released reports AS A SERIES, in
+        first-delivery order, with the supersession edge between them.
+
+        TAKES NO IDENTIFIER OF ANY KIND -- not a patient id, not a report id,
+        not a date range. The patient is bound from the session at the anchor,
+        in the ONE shared SQL text above, exactly as the two w135 readers are.
+
+        WHAT A POINT IS: one RELEASED report of the caller's own. Not an
+        interpretation, not a variant, not a classification. The node key is a
+        `report_id`, which is the object `amendments`, `release_events` and
+        (on the held w122 branch) `report_retractions` all attach to.
+
+        `amends_report_id` -- the caller's own released report that THIS one
+        was created to correct, or None. `superseded_by_report_id` is its
+        inverse, DERIVED IN PYTHON FROM THIS SAME LIST and never from a second
+        query: it can therefore only ever name a report already in the answer,
+        so it is structurally incapable of being an existence oracle for a
+        report the caller cannot see. A second query would not have that
+        property for free.
+
+        NOTHING IS HIDDEN. There is no retraction predicate and no tombstone
+        predicate; the only thing that keeps a report out of this series is
+        that it was never released to anyone. See the long note above the SQL
+        for rulings E3/E7 and for why a classification series is refused.
+
+        `is_retracted` -- w148, human decision 2: "a trend point originating
+        from a retracted report REMAINS in the patient's longitudinal data but
+        carries an `is_retracted` flag." A boolean, per POINT, derived in the
+        shared statement's projection and bound there to (org_id, report_id),
+        so a retraction belonging to another patient or another organisation
+        cannot reach it. NO `replacement_report_id` and no other internal
+        retraction detail, which the same decision refuses explicitly -- and
+        that refusal is what makes this different from `amends_report_id`
+        beside it, whose edge shape E4 would have allowed.
+
+        IN THIS DEPLOYMENT THIS METHOD RETURNS `[]` FOR EVERY PATIENT, FOR
+        EVER, because `_release_report` has ZERO non-test callers (re-counted
+        at 3a482f1). It is still correct, and the tests construct the released
+        state the only legitimate way there is -- by calling `_release_report`
+        behind its own Approver gate. What is not claimed is that any
+        production path reaches it. Same finding as w134-C3 and w135-C3.
+        """
+        self._require_patient_session(patient_session)
+        rows = self._query(
+            self._MY_RELEASED_REPORTS_SQL + " ORDER BY rel.first_released_at, rep.id",
+            (patient_session.patient_id, patient_session.org_id),
+        )
+        series = [
+            {
+                "report_id": r[0],
+                "order_id": r[1],
+                "released_at": r[2],
+                "amends_report_id": r[3],
+                "superseded_by_report_id": None,
+                # w148, human decision 2. A BOOLEAN, PER POINT, AND THE POINT
+                # STAYS. Nothing is dropped from `series` on account of it --
+                # there is no comprehension condition and no `if` anywhere in
+                # this method that reads it, which is what the re-authored
+                # guard in test_w136 now asserts structurally.
+                "is_retracted": r[4],
+            }
+            for r in rows
+        ]
+        # The inverse edge, over the answer itself. `amends_report_id` is
+        # already restricted by the SQL to a report in this same list, so this
+        # loop cannot invent a node and cannot name one the caller may not see.
+        by_id = {point["report_id"]: point for point in series}
+        for point in series:
+            earlier = by_id.get(point["amends_report_id"])
+            if earlier is not None:
+                earlier["superseded_by_report_id"] = point["report_id"]
+        return series
+
+    # ── patient authentication and patient sessions (w130) ───────────────────
+    #
+    # THE SAME MECHANISM OVER A SECOND PRINCIPAL TABLE. Not a second
+    # authentication system: no new secret material, no new credential format,
+    # no new failure vocabulary, no new session policy, no new endpoint
+    # semantics. The same bcrypt hasher, the same dummy-hash timing
+    # equalisation, the same MAX_FAILED_LOGIN_ATTEMPTS / LOCKOUT_MINUTES, the
+    # same GENERIC_AUTH_ERROR, the same SESSION_ABSOLUTE_HOURS and
+    # SESSION_IDLE_MINUTES with the same inclusive idle boundary.
+    #
+    # WHY NOT REFACTOR login() INTO A SHARED HELPER PARAMETERISED BY PRINCIPAL
+    # TABLE: it is available and it was not done. It would edit the single
+    # authenticated path of a clinical system whose behaviour is pinned by
+    # existing tests, to save about sixty lines. The cost of the choice made
+    # instead is one duplicated validation method, stated rather than hidden.
+    #
+    # NO SECOND FACTOR, AND THIS IS A DECLARED GAP RATHER THAN AN OMISSION.
+    # users.totp_secret is enrolled by enrol_totp, which is Administrator-gated
+    # and presumes an administrator sitting with the account holder and a
+    # device the organisation controls. That assumption does not hold for a
+    # patient at home. Whether patient authentication is single-factor is a
+    # ruling; shipping a totp_secret column nothing ever enrols would be how
+    # external_identifiers came to exist.
+
+    @auditable(
+        action={
+            "success": "patient_login_succeeded",
+            "error": "patient_login_failed",
+            "denied": "patient_login_failed",
+        },
+        resource_type="patient_session",
+        requires_session=False,
+        details_builder=lambda params, result: {
+            "session_id": str(result.session_id) if result else None,
+            "patient_login_id": str(result.patient_login_id) if result else None,
+        },
+    )
+    @transactional
+    def patient_login(
+        self,
+        email: str,
+        org_id: uuid.UUID,
+        password: str,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> "PatientSession":
+        """
+        Authenticate a patient and open a server-side patient session.
+
+        Every failure path raises AuthenticationError carrying exactly
+        GENERIC_AUTH_ERROR -- the SAME constant staff authentication uses, so a
+        caller cannot tell "no such address" from "wrong password" from
+        "disabled" from "locked out", and cannot tell a patient address from a
+        staff one either.
+
+        The returned session carries patient_id. Nothing downstream asks the
+        caller which patient this is.
+        """
+        now = self._clock.now()
+
+        org = self._query_one("SELECT org_id, disabled FROM organisations WHERE org_id = %s", (org_id,))
+        if org is None:
+            self.log_failed_login(email, None, ip_address, reason="unknown_organisation")
+            self._equalise_password_work(password)
+            raise AuthenticationError()
+        if org[1]:
+            self.log_failed_login(email, org_id, ip_address, reason="organisation_disabled")
+            self._equalise_password_work(password)
+            raise AuthenticationError()
+
+        # BINDS org_id, exactly as login()'s users lookup does. An email is
+        # unique only WITHIN an organisation -- patient_logins_org_email_unique
+        # -- so a lookup keyed on the address alone would authenticate one
+        # tenant's patient against another tenant's credential.
+        row = self._query_one(
+            "SELECT patient_login_id, patient_id, password_hash, failed_login_attempts, locked_until, disabled "
+            "FROM patient_logins WHERE org_id = %s AND email = %s",
+            (org_id, email),
+        )
+        if row is None:
+            self._equalise_password_work(password)
+            self.log_failed_login(email, org_id, ip_address, reason="unknown_patient_login")
+            raise AuthenticationError()
+
+        patient_login_id, patient_id, password_hash, failed_attempts, locked_until, disabled = row
+
+        if locked_until is not None and locked_until > now:
+            # EQUALISE HERE TOO -- w139, and for the same reason as login()'s
+            # locked-out branch, which this mirrors line for line. The patient
+            # half had the identical shape and w138 recorded it rather than
+            # carding it precisely because login() did too; both are fixed
+            # together so the two methods cannot drift.
+            #
+            # The counter is NOT touched: `_equalise_password_work` spends the
+            # work and discards the result, so a locked patient credential is
+            # not driven deeper and `locked_until` is not extended. The lockout
+            # policy is unchanged.
+            self._equalise_password_work(password)
+            self.log_failed_login(email, org_id, ip_address, reason="locked_out")
+            raise AuthenticationError()
+
+        if not self._hasher.verify(password, password_hash):
+            self._register_failed_patient_attempt(patient_login_id, org_id, failed_attempts, now)
+            self.log_failed_login(email, org_id, ip_address, reason="invalid_password")
+            raise AuthenticationError()
+
+        # AFTER the password, exactly as login() does it and for the same
+        # reason: checking first answers "is this account disabled?" to anyone
+        # who can guess an address.
+        if disabled:
+            self.log_failed_login(email, org_id, ip_address, reason="patient_login_disabled")
+            raise AuthenticationError()
+
+        self._execute(
+            "UPDATE patient_logins SET failed_login_attempts = 0, locked_until = NULL, updated_at = %s "
+            "WHERE patient_login_id = %s AND org_id = %s",
+            (now, patient_login_id, org_id),
+        )
+
+        session_id = uuid.uuid4()
+        self._execute(
+            "INSERT INTO patient_sessions (session_id, patient_login_id, patient_id, org_id, created_at, "
+            "                              expires_at, last_activity_at, idle_timeout_minutes, ip_address, "
+            "                              user_agent) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                session_id,
+                patient_login_id,
+                patient_id,
+                org_id,
+                now,
+                now + _datetime.timedelta(hours=SESSION_ABSOLUTE_HOURS),
+                now,
+                SESSION_IDLE_MINUTES,
+                ip_address,
+                user_agent,
+            ),
+        )
+        return PatientSession(
+            session_id=session_id,
+            patient_login_id=patient_login_id,
+            patient_id=patient_id,
+            org_id=org_id,
+        )
+
+    def _register_failed_patient_attempt(
+        self,
+        patient_login_id: uuid.UUID,
+        org_id: uuid.UUID,
+        current_attempts: int,
+        now: _datetime.datetime,
+    ) -> None:
+        """The staff lockout policy, unchanged, applied to the patient row."""
+        attempts = current_attempts + 1
+        locked_until = (
+            now + _datetime.timedelta(minutes=LOCKOUT_MINUTES) if attempts >= MAX_FAILED_LOGIN_ATTEMPTS else None
+        )
+        self._execute(
+            "UPDATE patient_logins SET failed_login_attempts = %s, locked_until = %s, updated_at = %s "
+            "WHERE patient_login_id = %s AND org_id = %s",
+            (attempts, locked_until, now, patient_login_id, org_id),
+        )
+
+    @auditable(
+        action="patient_session_validated",
+        resource_type="patient_session",
+        requires_session=False,
+        auditable=False,
+        reason="validation read on every request; the patient session audit trail records creation and "
+        "termination, not use -- the same decision session_valid already carries",
+    )
+    @transactional
+    def patient_session_valid(self, session_id: uuid.UUID) -> "PatientSession":
+        """
+        Validate a patient session id and refresh its idle window.
+
+        A DELIBERATE MIRROR of session_valid, against a different table. The
+        two session id spaces are therefore different tables: a STAFF session
+        id presented here is simply not found, and a patient session id
+        presented to session_valid is simply not found. That separation is
+        structural, not checked -- which is why _get_session was not widened
+        and must not be.
+        """
+        now = self._clock.now()
+        row = self._query_one(
+            "SELECT patient_login_id, patient_id, org_id, expires_at, last_activity_at, "
+            "       idle_timeout_minutes, terminated_at "
+            "FROM patient_sessions WHERE session_id = %s",
+            (session_id,),
+        )
+        if row is None:
+            raise SessionExpired()
+
+        patient_login_id, patient_id, org_id, expires_at, last_activity_at, idle_minutes, terminated_at = row
+
+        if terminated_at is not None:
+            raise SessionExpired()
+        if now >= expires_at:
+            raise SessionExpired()
+        if now >= last_activity_at + _datetime.timedelta(minutes=idle_minutes):
+            raise SessionExpired()
+
+        self._execute(
+            "UPDATE patient_sessions SET last_activity_at = %s WHERE session_id = %s AND org_id = %s",
+            (now, session_id, org_id),
+        )
+        return PatientSession(
+            session_id=session_id,
+            patient_login_id=patient_login_id,
+            patient_id=patient_id,
+            org_id=org_id,
+        )
+
+    @auditable(
+        action="patient_session_logged_out",
+        resource_type="patient_session",
+        # requires_session=False BECAUSE THE DECORATOR REFUSES A PatientSession
+        # WHERE requires_session=True (w130 decision 7), which is correct and
+        # is not being worked around: this method is not a staff operation.
+        #
+        # w132 SHIPPED THIS WITH A NULL org_id AND SAID SO; w137 CLOSED IT.
+        # The decorator bound the audit row's org_id/user_id COLUMNS from a
+        # staff Session and from nothing else, so every row written here had
+        # org_id NULL — and read_audit is Auditor-gated and filters
+        # `WHERE org_id = %s`, so a patient session termination was recorded
+        # where the organisation that owns it could not look. The organisation
+        # was never unknown: it is on the PatientSession. The decorator now
+        # reads it from the acting principal for requires_session=False
+        # methods, WITHOUT touching decision 7's refusal, which is keyed on
+        # requires_session=True. `user_id` stays NULL here because a patient
+        # is not a `users` row; the acting credential stays in `details`
+        # below, where it also was before.
+        requires_session=False,
+        # `getattr`, NOT attribute access, AND IT IS NOT DEFENSIVE HABIT. The
+        # decorator runs the details_builder on the DENIED and ERRORED paths
+        # too, where the argument is whatever the caller passed -- including
+        # the staff `Session` that `_require_patient_session` exists to
+        # refuse, which has no `patient_login_id`. Plain access raised
+        # AttributeError from inside the audit writer and MASKED the
+        # AuthorizationError, turning a clean refusal into a crash. Found by
+        # test_a_staff_session_is_refused_by_the_patient_logout_method.
+        details_builder=lambda params, result: {
+            "session_id": str(getattr(params.get("patient_session"), "session_id", None)),
+            "org_id": str(getattr(params.get("patient_session"), "org_id", None)),
+            "patient_login_id": str(getattr(params.get("patient_session"), "patient_login_id", None)),
+        },
+    )
+    @transactional
+    def terminate_my_patient_session(self, patient_session: "PatientSession") -> uuid.UUID:
+        """
+        End THE CALLING patient session. The patient's logout.
+
+        A DELIBERATE MIRROR of `terminate_my_session`, against a different
+        table, and a mirror rather than a shared helper for the same reason
+        `patient_login` mirrors `login`: one function reaching two session
+        tables is the union this design refuses.
+
+        IT TAKES NO TARGET IDENTIFIER, for the reason given there. And it ends
+        ONE ROW, NOT EVERY ROW THE CREDENTIAL HOLDS — the plausible wrong
+        version keys the UPDATE on `patient_login_id`, which reads like a
+        tidier logout and silently signs a patient out of every device they
+        have. "Log out everywhere" is a different, rulable feature with a
+        different name; it is not the default meaning of a logout button, and
+        nothing in an absence-shaped test can tell the two apart. The positive
+        twin in test_w132_logout.py is what does.
+
+        `terminated_by` HOLDS THE `patient_login_id` — the credential that
+        performed the act, which `patient_sessions` already carries — and this
+        is expressible WITHOUT A SCHEMA CHANGE only because `terminated_by`
+        has NO foreign key on either session table. Had it referenced
+        `users (user_id, org_id)`, which `terminate_session` writing
+        `session.user_id` there makes a reasonable thing to assume, a patient
+        could not name themselves as the actor and this would have been a
+        migration in a repository that has no migration mechanism and three
+        schema changes already held unlanded.
+
+        NOT A CREDENTIAL REVOCATION: `patient_logins.disabled` still has no
+        writer anywhere in this repository, and this method is not one.
+        """
+        self._require_patient_session(patient_session)
+        now = self._clock.now()
+        self._execute(
+            "UPDATE patient_sessions SET terminated_at = %s, terminated_by = %s "
+            "WHERE session_id = %s AND org_id = %s AND terminated_at IS NULL",
+            (now, patient_session.patient_login_id, patient_session.session_id, patient_session.org_id),
+        )
+        return patient_session.session_id
+
+    # ── patient portal identity (w130) ───────────────────────────────────────
+    #
+    # A PATIENT IS A PRINCIPAL AND IT IS NOT A STAFF USER. The tables are
+    # separate (see the note above patient_logins in schema.sql), the session
+    # type is separate (PatientSession), the login method is separate, and the
+    # HTTP dependency is separate. What is NOT separate is the mechanism: the
+    # same bcrypt hasher, the same dummy-hash timing equalisation, the same
+    # lockout constants, the same GENERIC_AUTH_ERROR, the same absolute and
+    # idle session windows. No second security policy was invented here.
+
+    @auditable(
+        action="patient_login_enrolled",
+        resource_type="patient_login",
+        requires_session=True,
+        details_builder=lambda params, result: {
+            "patient_id": str(params.get("patient_id")),
+            "email": params.get("email"),
+        },
+    )
+    @transactional
+    def enrol_patient_login(
+        self,
+        session: Session,
+        patient_id: uuid.UUID,
+        email: str,
+        password: str,
+    ) -> uuid.UUID:
+        """
+        Issue a portal credential for one patient. STAFF ENROLMENT: a staff
+        principal chooses the patient record, and there is no self-registration
+        path of any kind.
+
+        That is what answers "how is a person matched to their patient record?"
+        -- a staff member who already knows which record this is picks it. It
+        is not answered by an external identifier vocabulary, and this method
+        deliberately does not consult external_identifiers.
+
+        WHY THIS IS ONE METHOD AND NOT A COMPOSITION. @auditable commits after
+        each audit row it writes. So a version assembled out of two decorated
+        calls -- "check the patient, then create the credential" -- would leave
+        the first call's audit row committed when the second failed, and the
+        audit would record an enrolment that did not happen. The precondition
+        reads, the uniqueness read and the INSERT are therefore all inside one
+        @transactional body with exactly one @auditable around the whole of it.
+        A failure anywhere leaves NOTHING: no credential row, and no
+        success-outcome audit row.
+
+        THE ROLE. Administrator, on the conservative default the design
+        recorded: issuing a credential is account administration, and
+        assign_role, enrol_totp and set_user_disabled are all Administrator
+        today. Which role SHOULD own patient credential issuance is a ruling
+        that has not been made; this picks the tightest existing gate rather
+        than inventing an eighth role or leaving the method ungated. Note that
+        it is strictly tighter than the surrounding patient lifecycle, where
+        create_patient and record_consent are gated by nothing at all -- this
+        does not weaken that; it declines to copy it.
+
+        Raises NotFoundError for a patient that does not exist IN THIS
+        ORGANISATION -- the same refusal, byte for byte, as for a patient that
+        does not exist anywhere, because which patients another tenant holds is
+        not a question this method answers.
+        """
+        self._require_role(session, "Administrator")
+
+        # The org predicate is bound from the session and never from an
+        # argument. A real patient in another organisation reads exactly like
+        # an invented one.
+        patient = self._query_one(
+            "SELECT patient_id FROM patients WHERE patient_id = %s AND org_id = %s",
+            (patient_id, session.org_id),
+        )
+        if patient is None:
+            raise NotFoundError(PATIENT_NOT_FOUND)
+
+        # One login per patient is a DECISION (proxy and guardian access would
+        # relax it and that is a ruling nobody has made), so it is refused here
+        # with a message that says so, as well as by the UNIQUE constraint.
+        existing = self._query_one(
+            "SELECT patient_login_id FROM patient_logins WHERE org_id = %s AND patient_id = %s",
+            (session.org_id, patient_id),
+        )
+        if existing is not None:
+            raise PatientAlreadyEnrolledError(
+                "This patient already has a portal credential. A second credential for the same "
+                "patient is a proxy-access decision, not a re-enrolment."
+            )
+
+        patient_login_id = uuid.uuid4()
+        now = self._clock.now()
+        self._execute(
+            "INSERT INTO patient_logins (patient_login_id, patient_id, org_id, email, password_hash, "
+            "                            password_changed_at, enrolled_by, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                patient_login_id,
+                patient_id,
+                session.org_id,
+                email,
+                # The same hasher that hashes staff passwords. Not a second
+                # credential format, and not a second cost parameter.
+                self._hasher.hash(password),
+                now,
+                session.user_id,
+                now,
+                now,
+            ),
+        )
+        return patient_login_id
+
+    @auditable(
+        # The pair mirrors user_disabled / user_enabled, keyed on the same
+        # parameter and for the same reason: the two are different events and
+        # an audit that spells them the same cannot answer "who turned it back
+        # on".
+        action=lambda params, result: "patient_login_disabled" if params.get("disabled") else "patient_login_enabled",
+        resource_type="patient_login",
+        # -> None, so the identifier cannot come from the return value. Without
+        # this the row records the literal '<none>' -- the w120 defect -- and
+        # test_w120_audit_resource_id.py refuses the method outright.
+        resource_id_param="target_patient_login_id",
+        requires_session=True,
+        # `params.get`, not attribute access: the builder runs on the DENIED
+        # and ERRORED paths too, with whatever the caller actually passed.
+        details_builder=lambda params, result: {
+            "target_patient_login_id": str(params.get("target_patient_login_id")),
+            "disabled": bool(params.get("disabled")),
+        },
+    )
+    @transactional
+    def set_patient_login_disabled(
+        self,
+        session: Session,
+        target_patient_login_id: uuid.UUID,
+        disabled: bool,
+    ) -> None:
+        """
+        Revoke (or restore) a patient's portal credential, AND END THE LIVE
+        SESSIONS IT HOLDS. Administrator only.
+
+        Never a DELETE, for the reason set_user_disabled gives: it would orphan
+        the audit chain, and nothing in this schema deletes.
+
+        WHY THE SESSION TERMINATION IS IN THIS BODY AND NOT A SECOND CALL.
+        @auditable commits after every audit row it writes. A revocation
+        assembled out of two decorated calls -- "disable the credential, then
+        end its sessions" -- would leave a committed audit row saying the
+        credential was revoked while the sessions ran on, which is the worst
+        of the three possible outcomes: the record says the thing happened.
+        So the role gate, the precondition read, the credential UPDATE and the
+        session UPDATE are one @transactional body inside exactly one
+        @auditable. A failure anywhere leaves NOTHING: the credential still
+        authenticates and no success-outcome row exists. Pinned by
+        test_w133_revocation.py::TestAtomicity.
+
+        THE UPDATE IS KEYED ON patient_login_id, AND THAT IS THE STATEMENT
+        terminate_my_patient_session DELIBERATELY REFUSED. The two are not in
+        conflict; they are opposites and both are deliberate:
+
+            logout      is SELF-SCOPED, takes no target, and ends ONE session.
+                        Keying it on the credential would sign a patient out
+                        of every device they have, under a button that says
+                        "log out".
+            revocation  is ADMINISTRATIVE, names a target, and withdraws THE
+                        CREDENTIAL. Every session that credential minted was
+                        minted by the thing being withdrawn, so ending only
+                        one of them would leave the revoked holder logged in
+                        on the other device -- which is the actor the
+                        revocation was invoked against.
+
+        `terminated_by` HOLDS THE ACTING ADMINISTRATOR'S user_id -- the column
+        names the actor and the actor is the Administrator, consistent with
+        terminate_session. It is expressible without a schema change only
+        because `terminated_by` has NO foreign key on either session table.
+        (Which of the two ids an administrative termination SHOULD record is
+        an open question, carded; this picks the actor and says so.)
+
+        `terminated_at IS NULL` makes a second revocation a no-op rather than
+        a rewrite: the recorded moment a session ended is the first one.
+
+        ONLY WHEN `disabled` IS TRUTHY. Re-enabling must not terminate
+        anything -- and it does not resurrect anything either: a session ended
+        by a revocation stays ended, and the restored credential must be used
+        to obtain a new one.
+
+        POINT-IN-TIME, NOT CONTINUOUS -- AND THE RESIDUE IS REAL. This method
+        ends the sessions that exist WHEN IT RUNS. Session validation is
+        unchanged: patient_session_valid still reads one row from
+        patient_sessions by primary key and never joins patient_logins. So a
+        `disabled` flag set by ANY OTHER ROUTE -- direct SQL, a restore, a
+        future bootstrap -- leaves that credential's live sessions valid until
+        their own idle or absolute window closes. Closing that residue means
+        teaching session validation to read the principal row on every
+        request, which is a different change to the hottest path in the layer.
+        It was not made here. The residue is proved, not merely described, by
+        test_w133_revocation.py::TestTheResidueIsReal.
+
+        THE WAY BACK IS NARROW, and a caller should know it before revoking: a
+        disabled credential cannot be deleted (nothing deletes), cannot be
+        replaced (patient_logins_one_per_patient, and enrol_patient_login
+        raises PatientAlreadyEnrolledError), and its password cannot be
+        changed (no principal in this repository has a password-change
+        method). Re-enabling the same credential, with the same hash, is the
+        only route back today.
+
+        Raises NotFoundError carrying PATIENT_NOT_FOUND -- the module
+        constant, never an f-string naming the id -- for a credential that
+        does not exist IN THIS ORGANISATION, which is byte for byte the
+        refusal for one that does not exist anywhere.
+        """
+        self._require_role(session, "Administrator")
+
+        # The org predicate is bound from the session and never from an
+        # argument, and it is here TWICE on purpose. Without this read a
+        # cross-organisation attempt would update zero rows and return
+        # successfully, and the caller could not tell a refusal from a
+        # no-op. With it the caller gets NotFoundError; the AND org_id on the
+        # statements below is what makes the layer being wrong insufficient.
+        existing = self._query_one(
+            "SELECT patient_login_id FROM patient_logins WHERE patient_login_id = %s AND org_id = %s",
+            (target_patient_login_id, session.org_id),
+        )
+        if existing is None:
+            raise NotFoundError(PATIENT_NOT_FOUND)
+
+        now = self._clock.now()
+        self._execute(
+            "UPDATE patient_logins SET disabled = %s, updated_at = %s WHERE patient_login_id = %s AND org_id = %s",
+            (disabled, now, target_patient_login_id, session.org_id),
+        )
+
+        if disabled:
+            self._execute(
+                "UPDATE patient_sessions SET terminated_at = %s, terminated_by = %s "
+                "WHERE patient_login_id = %s AND org_id = %s AND terminated_at IS NULL",
+                (now, session.user_id, target_patient_login_id, session.org_id),
+            )
 
     @auditable(
         action="order_read",
@@ -1972,7 +4523,19 @@ class DataAccess:
         """
         Create a sequencing run for a sample.
         Validates that the sample exists in this organisation.
+
+        Requires the Lab technician role (w129 phase B): the run is
+        laboratory processing performed on a specimen, and `created_by` is
+        stamped from the session.
+
+        This does NOT gate the automatic pipeline. record_pipeline_result is
+        the System principal's path and does not call this method -- counted,
+        `self.create_sequencing_run(` occurs zero times in this file -- and
+        the ruling names System an internal principal that must not be
+        treated as a normal human staff role.
         """
+        self._require_role(session, "Lab technician")
+
         # Validate sample exists in this org
         sample = self._query_one(
             "SELECT sample_id FROM samples WHERE sample_id = %s AND org_id = %s",
@@ -2043,7 +4606,26 @@ class DataAccess:
         and clinical/retention.py's module docstring. Every downstream
         artefact (interpretation, report, amendment) inherits this same
         value at ITS OWN creation rather than recomputing it.
+
+        Requires the Lab technician role (w129 phase B): the VCF is the
+        artefact the sequencing run produced, registered against it with
+        `created_by` stamped from the session. Same exclusion as
+        create_sequencing_run -- the automatic path does not come through
+        here (`self.create_vcf(` occurs zero times in this file).
+
+        w129 reported here that record_fastq_set and find_fastq_set_by_checksums
+        were NOT gated because "they take a raw org_id and no session, so there
+        is no session whose roles could be consulted". THAT IS NO LONGER TRUE
+        and the gap it reported is closed: w129c gave both a caller-supplied
+        `Session`, and `record_fastq_set` now requires the `System` role. It is
+        gated on the INTERNAL principal rather than on Lab technician, because
+        detection is the platform observing a directory and not a member of
+        laboratory staff. The read keeps its existing authorisation posture --
+        no role gate, still non-auditable -- and only stopped naming its own
+        organisation.
         """
+        self._require_role(session, "Lab technician")
+
         # Validate sequencing_run exists in this org
         run = self._query_one(
             "SELECT id FROM sequencing_runs WHERE id = %s AND org_id = %s",
@@ -3700,11 +6282,33 @@ class DataAccess:
 
         ⚠️ AUTHENTICATION BYPASS BY DESIGN
         ──────────────────────────────────
-        This method creates a session WITHOUT authentication. It is called only from
-        the automatic submission path and MUST NOT be callable from any request-handling
-        context or endpoint. If called from anywhere else, it is an authentication bypass.
+        This method creates a session WITHOUT authentication, and the session_id it
+        mints is a real row in `sessions` and therefore a valid bearer credential for
+        clinical/endpoints.py::_get_session. It MUST NOT be called from any
+        request-handling context or endpoint. If it is, that is an authentication
+        bypass.
 
-        An AST test enforces that this method is called from exactly one location.
+        THE CALL SITES, AND WHY THIS PARAGRAPH USED TO BE FALSE (w129 GAP-5).
+        It used to say "an AST test enforces that this method is called from exactly
+        one location". Both halves were wrong. The test read only data_access.py and
+        matched only `self._create_system_session(`, of which there are none, so it
+        asserted 0 <= 1 and had never examined a call site. And the real number is not
+        one: there are FOUR, all spelled `self.data_access._create_system_session`,
+        all outside this file --
+
+            geper/api/exception_retry_worker.py  ExceptionRetryWorker._process_all_orgs
+            geper/api/submission_worker.py       InterpretationWorker._create_submission_failure_exception
+            geper/api/submission_worker.py       InterpretationWorker._clinical_preflight
+            geper/api/submission_worker.py       InterpretationWorker.reconcile_interrupted_submissions
+
+        THE RULE IS ABOUT WHERE, NOT HOW MANY. Every call site must sit inside a
+        background worker class in geper/api/ that runs as its own process, has no
+        human actor, and is not reachable from any served route -- counted: neither
+        worker class is referenced by geper/api/main.py, clinical/app.py or
+        clinical/endpoints.py, and each is instantiated only by its own module's
+        main(). The four sites are pinned BY NAME in
+        clinical/tests/test_identity.py::TestStructuralIsolation, so a fifth fails
+        the suite and so does narrowing the scan back to this file.
         """
         now = self._clock.now()
         system_email = f"system+{org_id}@platform"
@@ -3873,9 +6477,9 @@ class DataAccess:
             events = self._query(
                 "SELECT id, action, actor, timestamp, action_note "
                 "FROM exception_events "
-                "WHERE exception_id = %s "
+                "WHERE exception_id = %s AND org_id = %s "
                 "ORDER BY timestamp ASC",
-                (exc_id,),
+                (exc_id, session.org_id),
             )
 
             event_dtos = [
@@ -3945,9 +6549,9 @@ class DataAccess:
             events = self._query(
                 "SELECT id, action, actor, timestamp, action_note "
                 "FROM exception_events "
-                "WHERE exception_id = %s "
+                "WHERE exception_id = %s AND org_id = %s "
                 "ORDER BY timestamp ASC",
-                (exc_id,),
+                (exc_id, session.org_id),
             )
 
             event_dtos = [
@@ -4000,8 +6604,50 @@ class DataAccess:
         resolution_note: str,
         actor: str,
     ) -> None:
-        """Resolve an exception, recording the resolution event and updating status."""
+        """
+        Resolve an exception, recording the resolution event and updating status.
+
+        w129 GAP-1. This method used to have an asymmetry inside its own body:
+        the UPDATE bound org_id, the INSERT did not. `_execute` returns None and
+        never inspects rowcount, so when the UPDATE matched zero rows -- which is
+        exactly what happens when the caller names another organisation's
+        exception -- nothing stopped execution falling through into an INSERT
+        that appended a 'resolve' row to the victim's append-only history. The
+        method RETURNED NORMALLY. Measured, not reasoned.
+
+        Two changes, and they are deliberately both here rather than either one
+        alone:
+
+          1. The exception is resolved org-scoped FIRST and a miss raises
+             NotFoundError. A zero-row UPDATE must not be a silent success, and
+             refusing here is also what makes the endpoint's two refusals
+             identical -- a foreign id and an invented id both arrive at this
+             same NotFoundError with the same message shape (w129 GAP-2).
+          2. The event INSERT binds org_id from the session, and the schema's
+             composite foreign key (exception_id, org_id) -> exceptions (id,
+             org_id) makes the cross-tenant row inexpressible rather than merely
+             unwritten. The guard above is the clean refusal; the key is the
+             guarantee that survives the next person editing this method.
+
+        ONE METHOD, NOT A COMPOSITION. The read, the UPDATE and the INSERT are
+        written inline rather than delegated to get_exception_by_id or any other
+        decorated method: @auditable commits after each audit row, so composing
+        transactional work out of decorated methods destroys atomicity silently
+        (the w128 lesson).
+        """
         now = self._clock.now()
+
+        # Org-scoped existence check. NOT get_exception_by_id -- see the
+        # docstring's note on composition.
+        target = self._query_one(
+            "SELECT id FROM exceptions WHERE id = %s AND org_id = %s",
+            (exception_id, session.org_id),
+        )
+        if target is None:
+            # Identical for an id belonging to another organisation and an id
+            # that exists nowhere. Telling them apart is a cross-tenant
+            # existence oracle; the endpoint's 404 carries this message for both.
+            raise NotFoundError(f"Exception {exception_id} not found")
 
         # Update exception status and resolution
         self._execute(
@@ -4014,10 +6660,11 @@ class DataAccess:
 
         # Record the resolution event (transactional with status update)
         self._execute(
-            "INSERT INTO exception_events (id, exception_id, actor, timestamp, action, action_note) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "INSERT INTO exception_events (id, org_id, exception_id, actor, timestamp, action, action_note) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 uuid.uuid4(),
+                session.org_id,
                 exception_id,
                 actor,
                 now,
@@ -4068,10 +6715,11 @@ class DataAccess:
             exc_id = existing[0]
             # Reopen: write REOPEN event
             self._execute(
-                "INSERT INTO exception_events (id, exception_id, actor, timestamp, action, action_note) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
+                "INSERT INTO exception_events (id, org_id, exception_id, actor, timestamp, action, action_note) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (
                     uuid.uuid4(),
+                    session.org_id,
                     exc_id,
                     actor,
                     now,
@@ -4102,10 +6750,11 @@ class DataAccess:
 
         # Write OPEN event
         self._execute(
-            "INSERT INTO exception_events (id, exception_id, actor, timestamp, action, action_note) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "INSERT INTO exception_events (id, org_id, exception_id, actor, timestamp, action, action_note) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 uuid.uuid4(),
+                session.org_id,
                 exc_id,
                 actor,
                 now,
@@ -4304,9 +6953,9 @@ class DataAccess:
         events = self._query(
             "SELECT id, action, actor, timestamp, action_note "
             "FROM exception_events "
-            "WHERE exception_id = %s "
+            "WHERE exception_id = %s AND org_id = %s "
             "ORDER BY timestamp ASC",
-            (exc_id,),
+            (exc_id, session.org_id),
         )
 
         event_dtos = [
@@ -5266,13 +7915,43 @@ class DataAccess:
         being handed to this consumer. The duplication onto release_events is
         still deliberate, per that table's own schema comment -- it lets a
         reader learn what was delivered without joining back to reports.
+
+        AUTHORITY (w129 phase B). Release is gated exactly the way approval is
+        gated, twice over and for the same reason:
+
+          - `_require_role(session, 'Approver')` gates the SESSION.
+          - the identity recorded in `release_events.released_by` -- actor_id
+            -- is separately checked to hold Approver itself.
+
+        Before w129 this method checked only that actor_id named a user IN
+        THIS ORGANISATION: membership, not authority. That is the identity
+        half of the `_approve_report` pattern with the authority half missing,
+        and it meant a session holding only Auditor -- a read-only role by
+        intent -- could hand an approved report to an arbitrary named consumer
+        and record any colleague as having released it. `released_by` is read
+        as an authority claim the same way `reports.approver_id` is, so it
+        gets the same check; see `_approve_report`'s docstring for the full
+        argument, which this method now shares rather than restates.
+
+        Approver, not a new Releaser role: the ruling of 2026-09-14 gives
+        Approver "review/approval", release acts only on an already-approved
+        report, and inventing an eighth role for one operation would be the
+        broad RBAC redesign the same ruling forbids.
         """
+        self._require_role(session, "Approver")
+
         actor = self._query_one(
             "SELECT 1 FROM users WHERE org_id = %s AND user_id = %s",
             (session.org_id, actor_id),
         )
         if actor is None:
             raise NotFoundError(f"No such user in this organisation: {actor_id}")
+
+        actor_roles = {a.role for a in self.get_user_roles(session, target_user_id=actor_id)}
+        if "Approver" not in actor_roles:
+            raise AuthorizationError(
+                f"User {actor_id} does not hold the Approver role and cannot be recorded as releasing this report."
+            )
 
         if consumer is None or not str(consumer).strip():
             raise ValueError("A release must name its consumer (spec 13.4).")
@@ -5342,31 +8021,25 @@ class DataAccess:
         consumer requesting the same already-released report is not a reason
         to refuse it.
 
-        RETRACTION DOES NOT REFUSE HERE -- HUMAN RULING E3. A retracted report
-        is still returned, carrying the fact (E7). Refusing would not stop the
-        retracted document reaching people; it would stop the PLATFORM from
-        being the thing that hands it over, which pushes the copy into email
-        and out of the record -- no banner, no release_events row, an
-        uncontrolled copy produced by the control. And the document is
-        evidence: a clinician who treated on it and now needs to understand
-        what changed must be able to obtain the thing that was retracted.
+        AUTHORITY (w129 phase B). This gate is now an authority gate as well
+        as a state gate: the session must hold Approver. Before w129 it
+        answered only "is this report approved" and had no opinion about who
+        was asking, so the one gate every delivery path calls could be
+        satisfied by any authenticated session in the organisation.
 
-        What the gate does instead, and it is not nothing:
+        The state refusal is NOT replaced by the role refusal. An Approver
+        asking about a draft report still gets the spec 13.4 ValueError; the
+        two conditions are independent and both are tested.
 
-          - It RETURNS whether the report is retracted, so a delivery path
-            that calls the gate (which is every delivery path, by spec 13.4)
-            cannot remain unaware of it. Previously `-> None`; a caller
-            written against the old signature is unaffected.
-          - It FAILS CLOSED on a retraction that cannot be stated (R7). A
-            retraction with an unusable reason would render no banner a
-            reader could act on, and E3's whole bargain is that the retraction
-            TRAVELS with the document. A retraction that cannot travel is not
-            a permitted delivery.
-
-        The machine-readable half of E3 lives in the rendered document, not
-        here: `normalize_report_revision` puts `is_retracted` in the JSON so a
-        consumer that reads structure rather than prose has something to check.
+        NOTE for whoever wires the first delivery path -- there is none today
+        (`require_release` has zero non-test callers at 36fe487, counted). A
+        delivery path driven by a principal that is not an Approver will fail
+        here, by design: the authority to hand a report to a consumer and the
+        authority to release it are the same authority, and splitting them
+        would be the second mechanism this wave is forbidden to build.
         """
+        self._require_role(session, "Approver")
+
         report = self._query_one(
             "SELECT state FROM reports WHERE id = %s AND org_id = %s",
             (report_id, session.org_id),
@@ -5380,36 +8053,82 @@ class DataAccess:
                 f"Report is in '{state}' state -- spec 13.4: no report leaves the platform without approval."
             )
 
-        retraction = self._read_retraction_row(session, report_id)
-        if retraction is None:
-            return False
-        if not (retraction[3] or "").strip():
-            raise BrokenRevisionRecordError(
-                f"Report {report_id} is retracted but the retraction carries no reason; the retraction "
-                "cannot travel with the document, so the document does not leave (human ruling E3)."
-            )
-        return True
-
-    # ─── w122: Retraction (model 3, human-approved 2026-09-13) ─────────────
+    # ─── w156 (WAVE 6): report retraction ───────────────────────────────────
+    #
+    # WRITTEN FRESH, NOT LIFTED, AND THE DISTINCTION IS THE WAVE'S OWN
+    # QUESTION. Migration `0003` lifted DDL from the held branch
+    # `w122-retraction` (a4907d3) MECHANICALLY, under an approved schema
+    # decision, and its header says so at length. No decision approved
+    # importing that branch's APPLICATION code, and application code is more
+    # decision-laden than DDL: a4907d3 predates the w129 phase-B authority
+    # rework, the `REPORT_NOT_FOUND` constant, the patient `is_retracted`
+    # projection this tip already carries, and the whole administrative
+    # surface. The held branch was READ (`git show`, never merged, never
+    # modified) and is cited below where it CORROBORATES a ruling. Where the
+    # shape below matches it, that is because the schema and the recorded
+    # rulings force the shape, not because bytes were copied -- and it is
+    # said here rather than left for a reader to wonder about.
+    #
+    # WHAT THE SCHEMA ALREADY DECIDED, so that nothing below is a fresh
+    # invention. Every one of these is in THIS tree, in
+    # `clinical/migrations/0003_report_retraction.sql` and `clinical/schema.sql`:
+    #
+    #   E1  `retracted_from_state TEXT NOT NULL CHECK (... IN ('approved',
+    #       'released'))` -- which states may be retracted, AND that the row
+    #       records which. The precondition below is the CHECK, moved earlier
+    #       so the caller gets a sentence instead of an integrity error.
+    #   E4  `replacement_report_id UUID` (nullable) plus
+    #       `retraction_replacement_is_not_itself` -- a replacement is
+    #       optional and may not be the report itself.
+    #   E5  "retraction is NOT reversible in this wave and no reversal is
+    #       built" -- so there is no `withdraw_retraction` here, and a second
+    #       retraction of the same report is refused rather than appended.
+    #   E6  `retraction_notifications`, `status CHECK (status =
+    #       'notification_owed')`, `UNIQUE (org_id, retraction_id, consumer)`
+    #       -- one DEBT per distinct consumer, never a transmission, and it
+    #       does not block the retraction.
+    #   E7/E3 (`data_access.py` above, lines ~3020-3350) -- a retraction
+    #       FLAGS and never FILTERS; the patient surfaces return the single
+    #       boolean `is_retracted` and nothing else.
+    #   E8  cascade-tombstone with the report; no retention change. Nothing
+    #       below touches the retention clock.
+    #
+    # THE ONE QUESTION THE TREE DOES NOT RECORD, AND HOW IT IS ANSWERED
+    # WITHOUT INVENTING A WORKFLOW ENGINE. Which role may retract. This tree
+    # names rulings E1 and E3-E8 but not E2. It is NOT left open, and it is
+    # not guessed either: the DECISION RULE in force is "the smallest
+    # architecture-consistent choice; preserve existing patterns". Every
+    # existing verb that acts on an APPROVED report in this file is gated on
+    # Approver and on nothing else -- `_approve_report`, `_release_report`,
+    # `require_release` and `create_amendment`, all four measured by SYNTAX
+    # TREE rather than by eye, and no line numbers are quoted here because a
+    # line number in a comment is a claim that rots on the next insertion. A
+    # retraction acts on an approved-or-released report, so it takes the same
+    # gate. Inventing an eighth role for one operation is what
+    # `_release_report`'s own docstring already refused to do, citing the
+    # ruling of 2026-09-14. The held branch records this as human ruling E2 --
+    # "any Approver in the org may retract; no new role" -- which is
+    # CORROBORATION that the human already ruled it, not the authority for it.
+    # If the human wants a different gate, this is the one line to change.
 
     def _read_retraction_row(self, session: Session, report_id: uuid.UUID) -> Optional[tuple]:
         """
-        THE ONE PLACE retraction is read from the database.
+        The live retraction of one report in this organisation, or None.
 
-        Every composer below -- the delivery gate, the release recorder, the
-        revision reader, get_report -- goes through here rather than writing
-        its own SELECT, so "does this reader compose retraction" is a question
-        with a mechanical answer, which is what
-        clinical/tests/test_report_state_is_a_control.py's enumeration asks
-        (human ruling E10).
+        NOT `@auditable` AND NOT `@transactional`, and both absences are
+        load-bearing rather than tidiness. `@auditable` COMMITS after each
+        audit row it writes (the standing hazard), so a decorated read called
+        from inside `retract_report` would commit mid-operation and split one
+        atomic act into two. A plain private helper composes safely; a
+        decorated one does not.
 
-        Returns the raw row or None. No interpretation: the callers differ in
-        what they do with it, and a helper that decided for them would be the
-        per-path discretion spec 13.4 exists to close.
+        Org-bound from the session, like every other read here. There is no
+        `org_id` parameter for a caller to supply.
         """
         return self._query_one(
-            "SELECT id, retracted_at, retracted_by, reason, retracted_from_state, replacement_report_id "
-            "FROM report_retractions WHERE org_id = %s AND report_id = %s",
+            "SELECT id, retracted_at, retracted_by, retracted_from_state "
+            "FROM report_retractions WHERE org_id = %s AND report_id = %s "
+            "ORDER BY retracted_at LIMIT 1",
             (session.org_id, report_id),
         )
 
@@ -5417,44 +8136,35 @@ class DataAccess:
         self,
         session: Session,
         retraction_id: uuid.UUID,
-        consumers: Sequence[str],
+        consumers: List[str],
         reason: str,
-        now: Any,
+        now: "_datetime.datetime",
     ) -> None:
         """
-        HUMAN RULING E6: notification of a retraction is OWED, is RECORDED,
-        and does NOT BLOCK.
+        One `retraction_notifications` row per consumer that already received
+        this report (human ruling E6).
 
-        PER CONSUMER, NOT PER ROLE -- the human's words. create_amendment
-        hardcodes `delivered_to_role = 'ordering_clinician'`, but
-        release_events.consumer is free text and may name a LIMS, and a role
-        is an abstraction over people that a LIMS is not. One debt per
-        DISTINCT consumer named in release_events for the retracted report.
+        A ROW HERE ASSERTS A DEBT, NEVER A TRANSMISSION. There is no delivery
+        transport anywhere in this platform, so `status` has exactly one
+        legal value, `'notification_owed'`, and the schema's CHECK says so.
+        This method deliberately does NOT borrow `create_amendment`'s
+        "Recorded as sent" phrasing, which asserts something the sentence
+        before it says did not happen.
 
-        Delivery mechanism (email, SMS, etc.) is not implemented anywhere in
-        this platform. This method records that notification is OWED to each
-        recipient named in `release_events` for the retracted report; it does
-        not record that anything was sent, and nothing in this platform sends
-        it. The obligation is written as outstanding and stays outstanding:
-        discharging it is a future transport's job, and until that exists
-        every one of these rows is a debt the lab still owes.
+        `ON CONFLICT DO NOTHING` on the schema's own
+        `uk_retraction_notification_consumer`: re-delivery to the same
+        consumer is ONE debt, not two, and saying that here as well as in the
+        constraint keeps a second delivery path from raising instead of
+        being absorbed.
 
-        DELIBERATELY NOT "Recorded as sent" (create_amendment's phrasing, and
-        the thing this wave must not inherit): that sentence asserts a
-        transmission the same docstring's previous sentence says did not
-        happen, and an auditor reading those rows would conclude recipients
-        were informed. `status = 'notification_owed'` makes "which retractions
-        have unnotified recipients" a query with a correct answer on day one.
+        Plain and undecorated for the same atomicity reason as
+        `_read_retraction_row` above.
         """
         for consumer in consumers:
             self._execute(
                 "INSERT INTO retraction_notifications "
                 "(org_id, id, retraction_id, consumer, reason_for_retraction, status, created_at, created_by) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-                # A consumer already carrying a debt for this retraction is
-                # not a second debt: uk_retraction_notification_consumer says
-                # so and this says the same thing to the second delivery path
-                # rather than letting it raise.
                 "ON CONFLICT (org_id, retraction_id, consumer) DO NOTHING",
                 (
                     session.org_id,
@@ -5474,7 +8184,9 @@ class DataAccess:
         requires_session=True,
         auditable=True,
         resource_id_param="report_id",
-        reason="retraction is a deliberate safety act on a report that was validly approved; the record must name which",
+        reason=(
+            "retraction is a deliberate safety act on a report that was validly approved; the record must name which"
+        ),
         details_builder=lambda params, result: {
             "report_id": str(params.get("report_id")),
             "retraction_id": str(result) if result else None,
@@ -5492,46 +8204,59 @@ class DataAccess:
         replacement_report_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
         """
-        Record that a report must not be acted on. Writes ONE row in
+        Record that a report must NOT be acted on. Writes ONE row in
         `report_retractions`, plus one notification debt per prior recipient
         (E6), AND NOT ONE UPDATE ANYWHERE.
 
-        THE APPROVED `reports` ROW IS NOT TOUCHED, AND THAT IS THE DESIGN.
-        A report approved on 1 March and retracted on 5 April WAS approved:
-        `state`, `approver_id`, `approved_at` and `content_hash` still say
-        exactly what they said, `signing_identity_for_report` still retrieves
-        the approver (ISO 15189 7.4.1.5 c) after retraction as well as
-        before), and `verify_report_integrity` still returns True -- because
-        retraction says "do not act on this", not "this is not what was
-        approved". A sixth state would have made the record deny an approval
-        that happened.
+        THE APPROVED `reports` ROW IS NOT TOUCHED, AND THAT IS THE DESIGN,
+        not an omission. A report approved on 1 March and retracted on 5
+        April WAS approved: `state`, `approver_id`, `approved_at` and
+        `content_hash` still say exactly what they said,
+        `signing_identity_for_report` still retrieves the approver (ISO 15189
+        7.4.1.5 c)) after retraction as well as before, and
+        `verify_report_integrity` still returns True -- because retraction
+        says "do not act on this", not "this is not what was approved". A
+        sixth `reports.state` value would have made the record deny an
+        approval that happened, and the database forbids it anyway
+        (`enforce_content_immutability`).
 
-        PRECONDITIONS
-          - E1: the report is 'approved' or 'released' -- and the row records
-            WHICH, in retracted_from_state, so a report approved but never
-            issued is never later described to a clinician as having been
-            issued. Retraction below approval is meaningless: a draft,
-            under_review or returned report has no standing to withdraw.
-          - E2: any Approver in the org may retract; no new role. The session
-            gate IS the actor gate here, unlike `_approve_report` -- this
-            method takes no separate actor_id, so it is structurally
-            impossible to record an unqualified colleague as the retractor,
-            and the second check that method needs has nothing to check.
-          - reason is required and non-empty (schema NOT NULL as well).
+        PRECONDITIONS, each one traceable to something already in this tree:
+          - THE ROLE GATE IS THE FIRST STATEMENT. Approver, per the note
+            above this method. It runs before the report is looked up, so an
+            unauthorised caller's refusal cannot vary with whether the
+            identifier names anything -- the same ordering rule the
+            administrative surface's `_target` was rewritten to preserve.
+          - E1: the report is 'approved' or 'released', and the row records
+            WHICH in `retracted_from_state`. A draft, under_review or
+            returned report has no standing to withdraw.
+          - `reason` is required and non-empty (the schema says NOT NULL; an
+            empty string would satisfy the column and say nothing).
+          - E5: a report already retracted is REFUSED rather than retracted
+            twice. Not a reversal question -- E5 rules retraction
+            irreversible and none is built here -- but a reader question:
+            two retraction rows for one report cannot both be stated, so a
+            reader would have to pick, and picking is guessing.
           - E4: `replacement_report_id` is OPTIONAL. A report issued against
-            the wrong patient's sample has nothing to replace it with, and a
-            retracted report may still be amended.
+            the wrong patient's sample has nothing to replace it with. When
+            supplied it must name a report IN THIS ORGANISATION, resolved
+            through the session's own `org_id`; a cross-organisation
+            replacement is refused here AND is structurally impossible,
+            because `fk_retraction_replacement` is composite.
 
-        ALREADY RETRACTED IS REFUSED. Not a reversal question (E5 ruled
-        retraction is not reversible and none is built): two retraction rows
-        for one report cannot be stated in one banner, so a reader would have
-        to pick, and picking is guessing -- R7 says refuse. Refusing at the
-        write is refusing earlier than refusing at the render.
+        WHAT THE PATIENT SEES, WHICH IS WHY THIS METHOD CHANGES NO READER.
+        The patient surfaces already project `is_retracted` as a scalar
+        EXISTS sub-select bound on both `org_id` and the patient's own
+        report (w148, human decisions 1 and 2). This method makes those rows
+        real; it does not touch them. The reason, the retractor, the
+        timestamp, the from-state and the replacement identifier are all
+        written here and NONE of them reaches a patient surface.
 
-        Returns the retraction id. The audit row names the REPORT
-        (resource_id_param) and carries the retraction id in `details`: an
-        audit entry about a report that named a retraction id instead would
-        be the w120 defect in a new costume.
+        THE AUDIT ROW NAMES THE REPORT (`resource_id_param="report_id"`) and
+        carries the retraction id in `details`. An audit entry about a report
+        that named a retraction id as its resource would be the w120 defect
+        in a new costume.
+
+        Returns the retraction id.
         """
         self._require_role(session, "Approver")
 
@@ -5585,9 +8310,11 @@ class DataAccess:
             ),
         )
 
-        # E6. Every party release_events records as having received this
-        # report is owed a notification, in the same transaction, and the
-        # retraction is recorded whether or not there are any.
+        # E6. Every party `release_events` records as having received this
+        # report is owed a notification, in the SAME transaction, and the
+        # retraction is recorded whether or not there are any. A lab that has
+        # discovered a dangerous report must never be prevented from
+        # recording that fact because a debt could not be written.
         consumers = [
             row[0]
             for row in self._query(
@@ -5639,6 +8366,7 @@ class DataAccess:
         the fact of the notification is recorded).
 
         Preconditions:
+          - Session holds Approver (w129 phase B; see below)
           - Original report must exist in this org
           - Original report must be approved or released (not in draft/under_review/returned)
           - Reason for amendment is NOT NULL
@@ -5650,8 +8378,29 @@ class DataAccess:
         reviewer_claims.supersedes chains. NULL means this is the first
         amendment of this original.
 
+        AUTHORITY (w129 phase B). The session must hold Approver. An
+        amendment is the one sanctioned corrective act on a record that has
+        ALREADY BEEN SIGNED -- this method refuses any original that is not
+        approved or released -- so its authority is the authority that signed
+        it. Before w129 it checked neither the session's roles nor anything
+        about the actor at all, so any authenticated session in the
+        organisation could open an amendment against a colleague's approved
+        report and notify the ordering clinician of it.
+
+        Only the session is checked, not a second recorded actor: unlike
+        `_approve_report` and `_release_report`, this method takes no
+        actor_id. `reports.created_by` on the amendment is written from
+        session.user_id, which the session gate has already qualified. The
+        amendment it creates is a DRAFT, and must still pass
+        `submit_for_review` (Interpreter) and `_approve_report` (Approver on
+        both session and recorded actor) before it can itself be released, so
+        the signing authority on the amended content is checked there, where
+        the signature is actually recorded.
+
         Returns: tuple of (amendment_report_id, notification_id)
         """
+        self._require_role(session, "Approver")
+
         # retention_days: INHERITED from the original report (which itself
         # inherited it from its interpretation, which inherited it from its
         # vcf) -- human ruling D2 (2026-09-09). An amendment IS a new report
@@ -6193,10 +8942,10 @@ class DataAccess:
         auditable=False,
         action="find_fastq_set_by_checksums",
         resource_type="fastq_set",
-        requires_session=False,
+        requires_session=True,
         reason="idempotency probe on every scan; auditing it would bury the detections in noise",
     )
-    def find_fastq_set_by_checksums(self, org_id: uuid.UUID, r1_checksum: str, r2_checksum: str) -> Optional[uuid.UUID]:
+    def find_fastq_set_by_checksums(self, session: Session, r1_checksum: str, r2_checksum: str) -> Optional[uuid.UUID]:
         """
         The existing row for this exact pair of file contents, if any.
 
@@ -6205,22 +8954,31 @@ class DataAccess:
         observation; a reused path with new content is a DIFFERENT one. This is
         why `fastq_sets` deliberately carries no `UNIQUE (org_id, r1_path)`: a
         path-based constraint would have been wrong in both directions.
-        Scoped to org_id like every other read here.
+
+        w129c: THE ORGANISATION IS READ OFF THE SESSION, NOT OFF AN ARGUMENT.
+        This used to take a raw `org_id`, which made the tenant scope a CLAIM
+        the caller asserted rather than a property of an authenticated
+        principal -- and a checksum probe that can name any organisation is an
+        existence oracle over another tenant's file contents. The ruling left
+        the READ PATH's AUTHORISATION alone and it is left alone: no role gate,
+        still `auditable=False` for the reason above. Only the source of the
+        org_id changed, which is what `Session`'s own docstring already
+        requires of every call that takes one.
         """
         row = self._query_one(
             "SELECT fastq_set_id FROM fastq_sets WHERE org_id = %s AND r1_checksum = %s AND r2_checksum = %s",
-            (org_id, r1_checksum, r2_checksum),
+            (session.org_id, r1_checksum, r2_checksum),
         )
         return None if row is None else row[0]
 
     @auditable(
         action="fastq_set_detected",
         resource_type="fastq_set",
-        requires_session=False,
+        requires_session=True,
     )
     def record_fastq_set(
         self,
-        org_id: uuid.UUID,
+        session: Session,
         sample_id: uuid.UUID,
         r1_path: str,
         r2_path: str,
@@ -6239,18 +8997,46 @@ class DataAccess:
         caller which sample ids exist elsewhere. So the resolution below
         filters on org_id and the caller cannot tell the two cases apart.
 
-        No `session` argument: a scheduled scan has no logged-in user. The
-        audit row is written by `@auditable(requires_session=False)`, which
-        takes `org_id` from the bound parameters and leaves the actor null --
-        the existing provisioning-method path, not a second one. An earlier
-        draft called `self._audit` by hand as well and would have written TWO
-        rows per detection; `test_every_public_method_has_auditable_decorator`
-        is what caught the missing decorator, and the duplicate was the thing
-        that fix removed.
+        w129c: IT TAKES A SESSION AND THE SESSION MUST HOLD `System`.
+
+        This paragraph used to read "No `session` argument: a scheduled scan
+        has no logged-in user", and reached for the PROVISIONING audit path
+        (org_id off the bound parameters, actor null). That was DRIFT, not
+        architecture. "No logged-in user" is precisely the condition the System
+        principal exists to answer -- `record_pipeline_result` in this same
+        file already has the shape: it takes a `Session` and the worker mints
+        it. Two precedents were available and the provisioning one was picked
+        in passing, never argued. Three things were wrong as a result: the
+        organisation was a caller-supplied CLAIM rather than a property of an
+        authenticated principal; every detection was audited with a NULL
+        ACTOR; and this was the only `requires_session=False` method in the
+        file that writes a tenant-scoped row -- a category of one.
+
+        THE ROLE GATE IS `System`, NOT `Lab technician`. Detection is the
+        platform observing a directory, not a member of laboratory staff
+        receiving a specimen, and w129 forbids treating an internal principal
+        as a normal human staff role. A human session holding Administrator,
+        Interpreter, Orderer AND Lab technician is refused here.
+
+        THE SESSION COMES FROM THE CALLER. Neither this method nor
+        `clinical/ingestion.py` mints one. `_create_system_session` is an
+        authentication bypass whose invariant is about WHERE, not how many:
+        every call site sits in a background worker class in `geper/api/`.
+        Minting one in the scanner would be a FIFTH site in a non-worker module
+        and test_identity.py's
+        `test_create_system_session_call_sites_are_the_four_pinned_worker_sites`
+        would fail -- correctly. The not-yet-written scheduler is the thing
+        that has to be explicit about which principal it runs as.
+
+        The audit row still comes from `@auditable` and only from it: an
+        earlier draft called `self._audit` by hand as well and would have
+        written TWO rows per detection.
         """
+        self._require_role(session, "System")
+
         sample = self._query_one(
             "SELECT sample_id FROM samples WHERE sample_id = %s AND org_id = %s",
-            (sample_id, org_id),
+            (sample_id, session.org_id),
         )
         if sample is None:
             raise NotFoundError(f"Sample {sample_id} not found")
@@ -6260,7 +9046,7 @@ class DataAccess:
             "INSERT INTO fastq_sets (fastq_set_id, org_id, sample_id, r1_path, r2_path, "
             "r1_checksum, r2_checksum, detected_at, state) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'detected')",
-            (fastq_set_id, org_id, sample_id, r1_path, r2_path, r1_checksum, r2_checksum, detected_at),
+            (fastq_set_id, session.org_id, sample_id, r1_path, r2_path, r1_checksum, r2_checksum, detected_at),
         )
         return fastq_set_id
 

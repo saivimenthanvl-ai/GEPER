@@ -74,6 +74,38 @@ def _admin(dao, conn, org_id, email):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)),
+        )
+        # w129 phase B: create_amendment (and _release_report /
+        # require_release) now require Approver, the way _approve_report
+        # always has. This file's single staff account does every job in its
+        # organisation, amendment included, so it holds the role for the work
+        # it performs. Roles are additive -- it is still an Administrator, and
+        # nothing here asserts that it is not an Approver.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at, basis) "
+            "VALUES (%s, %s, 'Approver', %s, %s, %s)",
+            (
+                user_id,
+                org_id,
+                user_id,
+                datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc),
+                "w129 test fixture: amends the reports it signs",
+            ),
+        )
     conn.commit()
     return dao.login(email, org_id, "password")
 

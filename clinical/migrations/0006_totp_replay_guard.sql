@@ -1,0 +1,84 @@
+-- clinical/migrations/0006_totp_replay_guard.sql
+-- ────────────────────────────────────────────────
+-- ONE COLUMN, AND IT IS THE ONLY PLACE ONE-TIME USE OF A TOTP CODE CAN LIVE.
+--
+-- WHY A MIGRATION WAS REQUIRED, STATED PLAINLY. The human's ruling lists
+-- "replay / one-time use" among the properties MFA must have, and a TOTP code
+-- is valid for a whole 30-second step (three steps, with the one-step skew
+-- allowance `PyOtpVerifier` has always carried). Refusing a code that has
+-- already been accepted therefore means REMEMBERING which step was spent, and
+-- there is nowhere in this schema to remember it: `users` carries
+-- `totp_secret` and `totp_enrolled_at` and nothing else about the second
+-- factor, and `totp_backup_codes` is a different credential with its own
+-- `used_at`. An in-process memo would not survive a restart and would not be
+-- shared between replicas, which is the same defect one worker deep.
+--
+-- RFC 6238 §5.2 names this exactly: "the verifier MUST NOT accept the second
+-- attempt of the OTP generated for the same time-step". The column is the
+-- verifier's memory of that.
+--
+-- WHY A STEP NUMBER AND NOT THE CODE. Storing the last accepted CODE would be
+-- storing a credential, and it would be weaker besides: it refuses only the
+-- code it saw, so the PREVIOUS step's code -- still inside `valid_window=1`
+-- and still cryptographically valid -- would be admitted after it. A step
+-- counter is monotonic, so every step at or before the last accepted one is
+-- refused at once. BIGINT because a step is `unix_seconds / 30`, which leaves
+-- INTEGER in 2038 and BIGINT effectively never.
+--
+-- NULLABLE, with no default. NULL means "no code has been accepted yet",
+-- which is the correct state for every account that exists today and for
+-- every newly enrolled one -- `enrol_totp` sets it back to NULL, so
+-- re-enrolling does not inherit the old authenticator's spent steps.
+--
+-- ADDITIVE, AND THEREFORE NOT THE DESTRUCTIVE SHAPE 0005 WAS. `ADD COLUMN`
+-- with no DEFAULT and no NOT NULL is a catalogue-only change in PostgreSQL 11
+-- and later: no table rewrite, no row visited, no existing statement
+-- invalidated. Nothing is dropped, nothing is narrowed, and every row already
+-- in `users` satisfies it the instant it lands. `clinical/migrate.py::_apply`
+-- sends the file as one `cur.execute` and commits once, so the column and the
+-- history row land together or neither does.
+--
+-- NO GRANT CHANGE IS NEEDED AND NONE IS MADE. `clinical/schema.sql`'s GRANT
+-- block gives `clinical_app` SELECT, INSERT, UPDATE on `users` at TABLE level,
+-- and a new column inherits a table-level privilege. A column-level grant here
+-- would be a second, narrower answer to a question that already has one.
+--
+--
+-- ─── THE POST-CONDITION, AND WHY IT IS THIS ONE ──────────────────────────────
+--
+-- w160 made declaring one MANDATORY (`_refuse_undeclared`). A
+-- `to_regclass('users')` probe would satisfy the rule and prove NOTHING: the
+-- table exists in every generation of this schema there has ever been, so the
+-- expression would be true before this migration and true after, and could not
+-- tell an applied migration from an unapplied one.
+--
+-- So the assertion reads the COLUMN out of `pg_catalog` -- `pg_attribute`
+-- joined to `pg_type`, never `information_schema`, which is privilege-filtered
+-- and which `/readyz` evaluates as the deliberately narrowed `clinical_app`.
+-- It is FALSE on every generation before this one and TRUE after. It asserts
+-- three things, and each corresponds to a wrong version that was built and
+-- run:
+--
+--   * the attribute EXISTS on `users`                -- catches the version
+--     that adds the column to the wrong table, where every UPDATE would raise
+--     42703 at the first successful second factor;
+--   * `NOT attisdropped AND attnum > 0`              -- catches a dropped
+--     column's tombstone and the system attributes, either of which would make
+--     the probe true against a database that does not have the column;
+--   * the type is `int8`                             -- catches the version
+--     that declares INTEGER, which accepts every step this decade and
+--     overflows in 2038 on a system whose whole point is refusing a code
+--     twice.
+--
+-- ONE CHANNEL, NOT TWO. `clinical/migrate.py`'s `_GENERATION_INVARIANTS` map
+-- exists for migrations whose own bytes cannot carry their strongest
+-- post-condition -- `0002_baseline.sql`, frozen against `schema.sql`'s stamp.
+-- This file's bytes are not frozen against anything and the expression below
+-- is the strongest statement there is to make about it, so `migrate.py` is NOT
+-- edited by this wave, exactly as 0005 was not.
+--
+-- MIGRATION-ASSERT: EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = to_regclass('users') AND a.attname = 'totp_last_used_step' AND NOT a.attisdropped AND a.attnum > 0 AND t.typname = 'int8')
+
+
+ALTER TABLE users
+    ADD COLUMN totp_last_used_step BIGINT;

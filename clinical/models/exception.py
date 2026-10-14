@@ -27,11 +27,16 @@ Schema:
 
   CREATE TABLE exception_events (
     id UUID PRIMARY KEY,
-    exception_id UUID NOT NULL REFERENCES exceptions(id),
+    org_id UUID NOT NULL REFERENCES organisations(org_id),
+    exception_id UUID NOT NULL,
     actor TEXT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
     action TEXT NOT NULL,
-    action_note TEXT
+    action_note TEXT,
+    -- w129 GAP-1: composite, so a cross-tenant event row is inexpressible
+    -- rather than merely unwritten. The single-column FK it replaces was
+    -- satisfied by a row that existed in ANY organisation.
+    FOREIGN KEY (exception_id, org_id) REFERENCES exceptions(id, org_id)
   );
 
 Exception methods belong in clinical/data_access.py following the existing
@@ -194,11 +199,39 @@ REASON_CODE_TO_CATEGORY = {
 
 
 class ExceptionEventAction(str, enum.Enum):
-    """What happened to the exception."""
+    """
+    What happened to the exception. THE MIRROR OF THE `action` COLUMN'S CHECK
+    CONSTRAINT, and it has to stay one.
+
+    WHY THIS MEMBER IS PART OF MIGRATION 0005's COMMIT AND NOT A LATER ONE.
+    This enum is a DECLARATION OF THE COLUMN'S DOMAIN -- which strings
+    `exception_events.action` admits -- and nothing else. It is not a
+    dispatcher: no branch, no match, no loop over its members exists anywhere
+    in the tree (measured, w161: three non-test references, all of the form
+    `ExceptionEventAction.<MEMBER>.value` as a SQL parameter). Adding a member
+    therefore adds no code path and no behaviour, and the amendment VERB is
+    still absent: nothing in this repository writes `'amend_resolution'`.
+
+    What splitting it across two commits WOULD add is a window in which the
+    database admits four values and this module names three -- the drift the
+    schema and the code are supposed to be immune to. `clinical/tests/
+    test_w161_migration_0005_vocabulary.py` asserts the two agree by reading
+    the CHECK's token set out of a real database and comparing it to this
+    enum's values, so the pairing is enforced rather than remembered.
+
+    THE TOKEN: from the held branch `w126-reresolve-amendment` (95a33be),
+    whose own `ExceptionEventAction` writes exactly
+    `AMEND_RESOLUTION = "amend_resolution"`. See
+    `clinical/migrations/0005_exception_amendment_vocabulary.sql` for the full
+    derivation and for the three other sources that were read.
+    """
 
     OPEN = "open"
     RESOLVE = "resolve"
     REOPEN = "reopen"
+    # w161 (migration 0005). WRITABLE, AND UNWRITTEN: the column accepts it,
+    # and the verb that would produce it is the next authorisation's.
+    AMEND_RESOLUTION = "amend_resolution"
 
 
 class ExceptionStatus(str, enum.Enum):

@@ -90,6 +90,21 @@ def _admin_session(dao, conn, org_id, email):
             "VALUES (%s, %s, 'Administrator', %s, %s)",
             (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
         )
+        # w129 phase B: the ordering operations require Orderer and the
+        # sample / laboratory / QC operations require Lab technician. This
+        # fixture's account is the whole staff of its organisation -- it
+        # orders, receives, runs and reviews -- so it holds the roles for
+        # the work it performs. Roles are additive; still an Administrator.
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Orderer', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        cur.execute(
+            "INSERT INTO role_assignments (user_id, org_id, role, assigned_by, assigned_at) "
+            "VALUES (%s, %s, 'Lab technician', %s, %s)",
+            (user_id, org_id, user_id, datetime.datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
     conn.commit()
     return dao.login(email, org_id, "password")
 
@@ -204,7 +219,7 @@ class TestAmendmentDoesNotFalselyTamperTheOriginal:
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
         assert dao.verify_report_integrity(approver_a, original) is True
 
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
 
         # The amendment's own reviewer claim: the clinical reason it exists.
         dao._record_disagreement(
@@ -262,7 +277,7 @@ class TestAmendmentDoesNotFalselyTamperTheOriginal:
             cur.execute("SELECT content_hash FROM reports WHERE id = %s", (original,))
             before = cur.fetchone()[0]
 
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
         dao._record_accept(
             session_a,
             interpretation_id=interp_a,
@@ -295,7 +310,7 @@ class TestAReportCarriesItsOwnClaimsAndOnlyItsOwn:
         self, dao, conn, session_a, interpreter_a, approver_a, interp_a
     ):
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
         dao._record_disagreement(
             session_a,
             interpretation_id=interp_a,
@@ -329,7 +344,7 @@ class TestAReportCarriesItsOwnClaimsAndOnlyItsOwn:
         case the old interpretation-scoped model could not represent.
         """
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
         dao._record_accept(
             session_a,
             interpretation_id=interp_a,
@@ -354,7 +369,7 @@ class TestAReportCarriesItsOwnClaimsAndOnlyItsOwn:
         original's reviewer -- who never read it.
         """
         original = _approved_original(dao, session_a, interpreter_a, approver_a, interp_a)
-        amendment, _ = dao.create_amendment(session_a, original, "ClinVar reclassified the variant")
+        amendment, _ = dao.create_amendment(approver_a, original, "ClinVar reclassified the variant")
 
         with pytest.raises(ValueError, match="no reviewer claim of its own"):
             dao.submit_for_review(interpreter_a, amendment)

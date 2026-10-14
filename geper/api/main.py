@@ -231,7 +231,27 @@ async def _require_organisation(x_api_key: str = Header(default="")) -> uuid.UUI
 
 # Scoped 2026-09-12: this app serves only GEPER (AlphaFold structure lookups,
 # and VCF submissions that api/submission_worker.py runs through geper/main.py).
-app = FastAPI(title=f"{COMPONENT_NAME} Structures API")
+# w132 fix A, applied here as well as on the clinical service and for the same
+# reason: FastAPI mounts /openapi.json, /docs, /docs/oauth2-redirect and /redoc
+# by default, nobody declared them, so nobody decided they were public. This
+# app's disclosure is smaller than the clinical one -- structure lookups, not
+# patient data -- but /openapi.json still publishes the whole submission API,
+# including the routes behind _require_organisation, to a caller with no key.
+# Consistency is itself the point: one house rule, two apps, so that "are the
+# docs public here?" has one answer rather than two.
+#
+# `app.openapi()` still builds the schema on demand (geper/tests/
+# test_geper_component_naming.py reads it that way), so nothing about the
+# documentation is deleted -- only the anonymous route is unmounted.
+_DOCS_ENV = "GEPER_ENABLE_DOCS"
+_DOCS_ENABLED = os.environ.get(_DOCS_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+app = FastAPI(
+    title=f"{COMPONENT_NAME} Structures API",
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 
 # CORS — restrict origins in production via GEPER_CORS_ORIGINS env var
 _cors_origins = (_CORS_ORIGINS_ENV or "*").split(",")

@@ -19,6 +19,7 @@ import os
 import tempfile
 import unittest
 
+from report.clinical_report_builder import _variant_hgvs_or_locus
 from report.summary import generate_pdf
 from report.summary_short import (
     _build_identity_block,
@@ -27,7 +28,6 @@ from report.summary_short import (
     _confidence_text,
     _ordered_variants,
     _short_interpretation,
-    _variant_hgvs,
     _build_short_stylesheet,
     generate_short_pdf,
 )
@@ -81,7 +81,7 @@ def _variant_result(chrom="17", pos=100, ref="A", alt="T", gene="BRCA1", clinica
     result = {
         "variant": {"chrom": chrom, "pos": pos, "ref": ref, "alt": alt},
         "interpretation_result": {"gene_symbol": gene},
-        "clinical_report": _clinical() if clinical is None else clinical,
+        "candidate_interpretation": _clinical() if clinical is None else clinical,
     }
     result.update(extra)
     return result
@@ -110,16 +110,22 @@ def _document(n_variants=4):
 
 class TestFieldExtraction(unittest.TestCase):
     def test_hgvs_c_preferred(self):
+        # Card T3-F4: this fallback chain moved to
+        # `report/clinical_report_builder.py::_variant_hgvs_or_locus` so
+        # the full Markdown and full PDF headings can share it instead
+        # of each growing their own copy -- see that function's
+        # docstring. `summary_short.py::_build_variant_block` now calls
+        # the same shared function these tests exercise directly.
         vr = _variant_result(normalization={"hgvs_c": "NM_1.2:c.5A>T", "hgvs_g": "NC_1.2:g.99A>T"})
-        self.assertEqual(_variant_hgvs(vr), "NM_1.2:c.5A>T")
+        self.assertEqual(_variant_hgvs_or_locus(vr), "NM_1.2:c.5A>T")
 
     def test_falls_back_to_hgvs_g(self):
         vr = _variant_result(normalization={"hgvs_c": None, "hgvs_g": "NC_1.2:g.99A>T"})
-        self.assertEqual(_variant_hgvs(vr), "NC_1.2:g.99A>T")
+        self.assertEqual(_variant_hgvs_or_locus(vr), "NC_1.2:g.99A>T")
 
     def test_falls_back_to_locus_when_no_hgvs_at_all(self):
         vr = _variant_result(chrom="17", pos=100, ref="A", alt="T")
-        self.assertEqual(_variant_hgvs(vr), "17:100 A>T")
+        self.assertEqual(_variant_hgvs_or_locus(vr), "17:100 A>T")
 
     def test_classification_missing_is_not_classified(self):
         self.assertEqual(_classification_text(None), "Not classified")
@@ -156,6 +162,56 @@ class TestShortInterpretation(unittest.TestCase):
         self.assertIn("full report", _short_interpretation(_clinical(executive_summary="")))
 
 
+# The real `_executive_summary` (`report/clinical_report_builder.py`)
+# shape that reproduces the truncation Kelly found in the five-variant
+# run: the not-evaluated clause's `e.g.` (from
+# `NotEvaluatedReason.CONSEQUENCE_INAPPLICABLE`'s label) sits inside
+# what is really the third sentence, and the old regex treated the "e.g."
+# period as a sentence end, so `_INTERPRETATION_SENTENCES = 3` cut the
+# excerpt off mid-parenthetical instead of after the real third
+# sentence.
+_ABBREVIATION_BUG_SUMMARY = (
+    "Variant 17:100 A>T in BRCA1 was classified as **Pathogenic** (evidence completeness: High). "
+    "Assigned Urgent review priority. "
+    "Of 28 ACMG/AMP criteria evaluated: 7 triggered, 2 checked but not triggered, 19 could not be "
+    "evaluated (9 no data source GEPER integrates for any variant; 2 inapplicable given this "
+    "variant's own already-determined protein consequence (e.g. a frameshift, nonsense, or canonical "
+    "splice-site change, for which computational predictors are moot); 8 a missing/unavailable "
+    "evidence source for this specific variant). "
+    "Additional follow-up is recommended given the evidence gaps noted above."
+)
+
+
+class TestShortInterpretationAbbreviations(unittest.TestCase):
+    def test_eg_inside_the_third_sentence_does_not_truncate_mid_parenthetical(self):
+        text = _short_interpretation(_clinical(executive_summary=_ABBREVIATION_BUG_SUMMARY))
+        # The bug: the old regex split right after "(e.g." and the
+        # excerpt ended there, with the parenthetical never closed.
+        self.assertNotIn("(e.g. [...]", text)
+        self.assertFalse(text.rstrip().endswith("(e.g."))
+        # The fix: the third real sentence -- the whole ACMG/AMP
+        # accounting clause, parenthetical closed -- is kept whole, and
+        # only the fourth (follow-up) sentence is dropped.
+        self.assertIn(
+            "8 a missing/unavailable evidence source for this specific variant).",
+            text,
+        )
+        self.assertTrue(text.endswith("evidence source for this specific variant). [...]"))
+        self.assertNotIn("Additional follow-up", text)
+
+    def test_ie_etc_cf_vs_approx_do_not_split_sentences_either(self):
+        from report.summary_short import _split_sentences
+
+        second_sentence = (
+            "Second sentence uses several abbreviations: i.e. shorthand forms, e.g. real ones, "
+            "etc. more examples, cf. related shorthand, vs. contrasting cases, and approx. "
+            "estimates, none of which end it."
+        )
+        text = "First sentence stands alone. " + second_sentence
+        sentences = _split_sentences(text)
+        self.assertEqual(sentences, ["First sentence stands alone.", second_sentence])
+
+
 class TestOrdering(unittest.TestCase):
     def test_vcf_order_when_no_case_prioritization(self):
         variants = [_variant_result(pos=1), _variant_result(pos=2)]
@@ -173,7 +229,7 @@ class TestFlowableBuilders(unittest.TestCase):
     def test_identity_block_shows_deidentified_label_by_default(self):
         from report.summary import _parse_patient_meta
 
-        table = _build_identity_block(_parse_patient_meta(None), "S1", "R1", "GRCh38", 3, _STYLES)
+        table = _build_identity_block(_parse_patient_meta(None), "S1", "R1", "GRCh38", 3, None, _STYLES)
         text = " ".join(cell.text for row in table._cellvalues for cell in row)
         self.assertIn("De-identified", text)
         self.assertIn("S1", text)
@@ -187,7 +243,7 @@ class TestFlowableBuilders(unittest.TestCase):
             "physician": "Dr Who",
             "deidentified": False,
         }
-        table = _build_identity_block(patient, "S1", "R1", "GRCh38", 3, _STYLES)
+        table = _build_identity_block(patient, "S1", "R1", "GRCh38", 3, None, _STYLES)
         text = " ".join(cell.text for row in table._cellvalues for cell in row)
         self.assertIn("Test Patient", text)
         self.assertIn("Date of Birth", text)
@@ -259,12 +315,15 @@ class TestGenerateShortPdf(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "short.pdf")
-            # `_offline_sources_caveat_text` is imported by reference
-            # into `report.summary_short`'s namespace but its body still
-            # runs in `report.summary`'s module scope, so patching
-            # `report.summary.HEALTH` is enough -- no need to patch the
-            # imported name itself.
-            with mock.patch("report.summary.HEALTH", registry):
+            # `_offline_sources_caveat_text` lives in
+            # `report.clinical_report_builder` (relocated 2026-08-21, see
+            # that module's own "Shared run-level caveat helpers" note)
+            # and is imported by reference into both PDF renderers'
+            # namespaces, but its body still runs in
+            # `clinical_report_builder`'s module scope, so patching
+            # `report.clinical_report_builder.HEALTH` is enough -- no
+            # need to patch either renderer's imported name itself.
+            with mock.patch("report.clinical_report_builder.HEALTH", registry):
                 generate_short_pdf(_document(), out, companion_filename="geper_report_full.pdf")
             text = "\n".join(p.extract_text() for p in PdfReader(out).pages)
         self.assertIn("IndiGenomes", text)
@@ -291,6 +350,57 @@ class TestGenerateShortPdf(unittest.TestCase):
             self.assertNotIn("Supporting Evidence", text)
             self.assertNotIn("Mean Coverage Depth", text)
             self.assertNotIn("Very Strong", text)  # criteria-table strength column
+
+    @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")
+    def test_references_appear_when_run_used_that_source(self):
+        # AM-04/#10 ruling: a sign-off document must show what the
+        # classification rests on. `references` is read straight off
+        # `candidate_interpretation` -- the same list
+        # `report/clinical_report_builder.py::_references()` already
+        # gates on `evidence_sources` -- never a static catalogue this
+        # module invents on its own.
+        #
+        # Heading REPLACED per ruling (A) on the references-list card
+        # (2026-09-11): the gated list is now labelled "Evidence sources
+        # used in this run", separate from the "Data attribution" block
+        # of fixed licence notices.
+        alphamissense_ref = (
+            "AlphaMissense -- Cheng et al. 2023, Science (DOI: 10.1126/science.adg7492); "
+            "Copyright (2023) DeepMind Technologies Limited, available under CC-BY-4.0."
+        )
+        clinical = _clinical()
+        clinical["references"] = [alphamissense_ref]
+        doc = {**_document(1)}
+        doc["variants"][0]["candidate_interpretation"] = clinical
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "short.pdf")
+            generate_short_pdf(doc, out)
+            text = "\n".join(p.extract_text() for p in PdfReader(out).pages)
+        self.assertNotIn("References:", text)
+        flat = " ".join(text.split())
+        self.assertIn("Evidence sources used in this run:", flat)
+        self.assertIn("AlphaMissense", flat)
+        self.assertLess(flat.index("Evidence sources used in this run:"), flat.index("AlphaMissense"))
+        self.assertLess(flat.index("AlphaMissense"), flat.index("Data attribution:"))
+
+    @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")
+    def test_references_absent_when_run_never_used_that_source(self):
+        # Same renderer, same document shape, only the upstream-computed
+        # `references` list differs (here: empty, as a run that never
+        # queried AlphaMissense would produce) -- proving this is a
+        # dynamic read of that field, not a fixed bibliography the
+        # short PDF prints regardless of what the run actually did.
+        clinical = _clinical()
+        clinical["references"] = []
+        doc = {**_document(1)}
+        doc["variants"][0]["candidate_interpretation"] = clinical
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "short.pdf")
+            generate_short_pdf(doc, out)
+            text = "\n".join(p.extract_text() for p in PdfReader(out).pages)
+        flat = " ".join(text.split())
+        self.assertIn("Evidence sources used in this run: No evidence sources contributed", flat)
+        self.assertNotIn("AlphaMissense", flat)
 
 
 @unittest.skipUnless(_PYPDF_AVAILABLE, "pypdf not installed in this environment")

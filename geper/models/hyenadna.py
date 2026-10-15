@@ -29,6 +29,7 @@ function, scoped to GEPER's configured model and without the
 unconditional call.
 """
 
+import collections
 import importlib.util
 import json
 import os
@@ -64,6 +65,55 @@ def is_hyenadna_installed() -> bool:
 # is_available()/_load_impl() call (e.g. once per variant that routes
 # here). None = not attempted yet; True/False = outcome of that attempt.
 _AUTO_INSTALL_RESULT = None
+
+# Pinned commit for HazyResearch/hyena-dna (the SOURCE repo, cloned for
+# `standalone_hyenadna.py`/the character tokenizer -- see
+# `install_hyenadna_colab` below). No tags or releases exist upstream
+# (verified live via `git ls-remote --tags`, empty, 2026-08-27), so this
+# pins to the exact commit that was `main`'s tip at verification time --
+# the closest reproducibility guarantee available without one. An
+# unpinned `--depth 1` clone of a moving branch means every fresh
+# environment can silently get a different `standalone_hyenadna.py`
+# than the one this integration was tested against.
+_HYENADNA_REPO_COMMIT = "d553021b483b82980aa4b868b37ec2d4332e198a"
+
+# Where the vendored HazyResearch/hyena-dna checkout lives, RESOLVED FROM
+# THIS FILE rather than from the process's working directory.
+#
+# This was `"./hyena-dna"` -- a bare CWD-relative path -- and that is a
+# defect rather than a style question. The Docker image ships the source at
+# /app/geper/hyena-dna and runs with WORKDIR=/app, so `./hyena-dna` pointed
+# at a directory that does not exist, the loader could not see the checkout
+# already sitting next to it, and under `docker run --network none` it fell
+# through to `git clone` and failed with
+#   fatal: unable to access 'https://github.com/HazyResearch/hyena-dna.git/':
+#   Could not resolve host: github.com
+# The image was only offline-capable because an `ENV PYTHONPATH` entry made
+# `find_spec("standalone_hyenadna")` succeed before this path was consulted
+# -- i.e. offline BY ACCIDENT, and only when launched from the right
+# directory. Resolving from `__file__` makes it a property of the checkout
+# instead of a property of whoever invoked the process.
+#
+# This file is geper/models/hyenadna.py, so two dirnames up is the `geper/`
+# package root and the vendored checkout is its sibling of `models/`. That
+# is the SAME location the Dockerfile already installs to; the path is not
+# being moved, it is being addressed correctly.
+#
+# It is also the clone DESTINATION when the source is genuinely absent, and
+# that fixes a second instance of the same bug: a clone into the CWD is
+# invisible to the next process started from anywhere else, so the "already
+# cloned by a previous run" branch below could never fire and every run
+# re-cloned. Now the clone lands where the next process will look.
+_VENDORED_REPO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hyena-dna")
+
+# Pinned HuggingFace revision (commit SHA) for each supported
+# HYENADNA_MODEL_NAME's checkpoint repo (huggingface.co/LongSafari/
+# {model_name}), verified live via `git ls-remote <repo-url> HEAD`,
+# 2026-08-27. See `_load_hyenadna_checkpoint` below for why this is
+# keyed by model_name rather than a single constant.
+_HYENADNA_CHECKPOINT_REVISIONS = {
+    "hyenadna-medium-450k-seqlen": "820fe013ec58c0f87f8caba21af0c48fdc8d0ddd",
+}
 
 
 def ensure_hyenadna_available(checkpoint_dir: str = None) -> bool:
@@ -116,7 +166,7 @@ def install_hyenadna_colab(checkpoint_dir: str = None) -> bool:
     the clone happens) rather than relying on the automatic trigger.
     """
     checkpoint_dir = checkpoint_dir or CONFIG.models.HYENADNA_CHECKPOINT_DIR
-    repo_dir = "./hyena-dna"
+    repo_dir = _VENDORED_REPO_DIR
     try:
         if not is_hyenadna_installed():
             if os.path.isdir(repo_dir):
@@ -127,14 +177,19 @@ def install_hyenadna_colab(checkpoint_dir: str = None) -> bool:
                 # so just make the existing checkout importable
                 # instead of re-cloning it.
                 logger.info(
-                    f"Found existing '{repo_dir}' from a previous run; "
-                    "adding it to sys.path instead of re-cloning."
+                    f"Found existing '{repo_dir}' from a previous run; adding it to sys.path instead of re-cloning."
                 )
             else:
-                logger.info("Cloning HazyResearch/hyena-dna for HyenaDNA support...")
+                logger.info(f"Cloning HazyResearch/hyena-dna @ {_HYENADNA_REPO_COMMIT} for HyenaDNA support...")
+                # Full clone, not --depth 1: checking out a specific
+                # historical commit (there are no tags to shallow-clone
+                # by) needs the commit's history to be present locally.
                 subprocess.run(
-                    ["git", "clone", "--quiet", "--depth", "1",
-                     "https://github.com/HazyResearch/hyena-dna.git", repo_dir],
+                    ["git", "clone", "--quiet", "https://github.com/HazyResearch/hyena-dna.git", repo_dir],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", repo_dir, "checkout", "--quiet", _HYENADNA_REPO_COMMIT],
                     check=True,
                 )
             if repo_dir not in sys.path:
@@ -183,13 +238,17 @@ def _build_character_tokenizer(model_max_length: int):
     from transformers.tokenization_utils import AddedToken, PreTrainedTokenizer
 
     class _PatchedCharacterTokenizer(CharacterTokenizer):
-        def __init__(self, characters: Sequence[str], model_max_length: int,
-                     padding_side: str = "left", **kwargs):
+        def __init__(self, characters: Sequence[str], model_max_length: int, padding_side: str = "left", **kwargs):
             self.characters = characters
             self.model_max_length = model_max_length
             self._vocab_str_to_int = {
-                "[CLS]": 0, "[SEP]": 1, "[BOS]": 2, "[MASK]": 3,
-                "[PAD]": 4, "[RESERVED]": 5, "[UNK]": 6,
+                "[CLS]": 0,
+                "[SEP]": 1,
+                "[BOS]": 2,
+                "[MASK]": 3,
+                "[PAD]": 4,
+                "[RESERVED]": 5,
+                "[UNK]": 6,
                 **{ch: i + 7 for i, ch in enumerate(characters)},
             }
             self._vocab_int_to_str = {v: k for k, v in self._vocab_str_to_int.items()}
@@ -202,10 +261,18 @@ def _build_character_tokenizer(model_max_length: int):
             mask_token = AddedToken("[MASK]", lstrip=True, rstrip=False)
 
             PreTrainedTokenizer.__init__(
-                self, bos_token=bos_token, eos_token=sep_token, sep_token=sep_token,
-                cls_token=cls_token, pad_token=pad_token, mask_token=mask_token,
-                unk_token=unk_token, add_prefix_space=False,
-                model_max_length=model_max_length, padding_side=padding_side, **kwargs,
+                self,
+                bos_token=bos_token,
+                eos_token=sep_token,
+                sep_token=sep_token,
+                cls_token=cls_token,
+                pad_token=pad_token,
+                mask_token=mask_token,
+                unk_token=unk_token,
+                add_prefix_space=False,
+                model_max_length=model_max_length,
+                padding_side=padding_side,
+                **kwargs,
             )
 
         def get_vocab(self):
@@ -214,6 +281,88 @@ def _build_character_tokenizer(model_max_length: int):
     return _PatchedCharacterTokenizer(
         characters=["A", "C", "G", "T", "N"],
         model_max_length=model_max_length,
+    )
+
+
+def _allow_lightning_checkpoint_globals() -> None:
+    """
+    Registers the classes the official HyenaDNA `weights.ckpt` contains
+    on PyTorch's strict-unpickling allowlist, so it loads with
+    `weights_only` left at PyTorch's own default. Idempotent -- safe to
+    call on every load.
+
+    WHAT TRIPS THE NEWER DEFAULT. PyTorch 2.6 flipped `torch.load`'s
+    `weights_only` default from `False` to `True`. This checkpoint is a
+    PyTorch Lightning one, so its non-tensor payload is a Lightning
+    training envelope (`epoch`, `global_step`, `loops`, `callbacks`,
+    `optimizer_states`, `hyper_parameters`, ...) wrapped around the
+    `state_dict` this loader actually uses. PyTorch names one rejected
+    class at a time:
+
+        WeightsUnpickler error: Unsupported global: GLOBAL
+        omegaconf.listconfig.ListConfig was not an allowed global by
+        default.
+
+    Iterating that message to exhaustion against the pinned checkpoint
+    gives exactly the ten classes below, after which the file loads
+    with `weights_only=True`. THIS SET WAS ESTABLISHED BY PROBE, NOT BY
+    ANALOGY: RNA-FM's equivalent problem is a single `argparse.Namespace`
+    (see rna_fm.py), and NOT ONE OF THESE TEN IS THAT CLASS -- a
+    different producer puts different things in the file, so the set
+    has to be measured per checkpoint rather than assumed.
+
+    WHY ALLOWLISTING THESE IS NARROW. Five are builtins/typing
+    (`list`, `dict`, `int`, `collections.defaultdict`, `typing.Any`);
+    the other five are omegaconf's config containers, which is a
+    configuration library, not a code carrier. And omegaconf is ALREADY
+    a hard requirement for reading this file at all -- unpickling the
+    embedded config imports it either way, which is exactly why
+    requirements.txt pins it (see the `omegaconf==2.3.1` note there).
+    So this permits a fixed, inspected list of data holders instead of
+    `weights_only=False`, which permits ANY global in the file.
+
+    WHAT IT STILL PERMITS, STATED RATHER THAN GLOSSED: allowlisting a
+    class lets the unpickler construct it, so omegaconf's own
+    `__setstate__`/constructor runs during the load. That is a real
+    surface -- far smaller than arbitrary globals, but not zero.
+
+    CAVEAT, ACCEPTED KNOWINGLY: `add_safe_globals` is process-global.
+    Once called, any `torch.load` in this process will also accept
+    these ten classes.
+
+    SCOPE: this set is the set for the PINNED checkpoint revision this
+    module downloads (see `_HYENADNA_CHECKPOINT_REVISIONS`). A different
+    variant or a re-pinned revision could contain more, and the failure
+    mode if so is a loud `UnpicklingError` naming the missing class --
+    not a silent wrong answer.
+    """
+    try:
+        from omegaconf.base import ContainerMetadata, Metadata
+        from omegaconf.dictconfig import DictConfig
+        from omegaconf.listconfig import ListConfig
+        from omegaconf.nodes import AnyNode
+    except ImportError as exc:  # pragma: no cover - dependency is pinned
+        raise ModelLoadError(
+            "Reading the HyenaDNA checkpoint requires the 'omegaconf' "
+            "package (it is embedded in the checkpoint's Lightning "
+            "hyper-parameters and is needed to deserialize it at all, "
+            "with or without weights_only) -- install it with "
+            "`pip install omegaconf==2.3.1`."
+        ) from exc
+
+    torch.serialization.add_safe_globals(
+        [
+            ListConfig,
+            DictConfig,
+            AnyNode,
+            ContainerMetadata,
+            Metadata,
+            Any,
+            list,
+            dict,
+            int,
+            collections.defaultdict,
+        ]
     )
 
 
@@ -231,15 +380,35 @@ def _load_hyenadna_checkpoint(path: str, model_name: str, device: str):
     if not os.path.isdir(pretrained_dir):
         hf_url = f"https://huggingface.co/LongSafari/{model_name}"
         os.makedirs(path, exist_ok=True)
-        logger.info(f"Downloading HyenaDNA checkpoint '{model_name}' from {hf_url}...")
+        # Pinned by model_name, not a single global constant: the
+        # checkpoint lives in a model-name-specific HF repo
+        # (huggingface.co/LongSafari/{model_name}), so a commit verified
+        # against one variant's history has no meaning against another's.
+        # CONFIG.models.HYENADNA_MODEL_NAME is a plain class attribute
+        # today (not env-configurable, unlike HYENADNA_CHECKPOINT_DIR
+        # right above it in config.py) -- but the moment it becomes one,
+        # an unmapped variant should fail loudly here, not silently fall
+        # back to an unpinned clone and defeat the point of pinning.
+        revision = _HYENADNA_CHECKPOINT_REVISIONS.get(model_name)
+        if revision is None:
+            raise ModelLoadError(
+                f"No pinned HuggingFace revision is recorded for HyenaDNA "
+                f"checkpoint '{model_name}'. Verify the exact commit to use "
+                f"(e.g. `git ls-remote {hf_url} HEAD`), add it to "
+                "_HYENADNA_CHECKPOINT_REVISIONS in models/hyenadna.py, and "
+                "retry -- refusing to download an unpinned checkpoint."
+            )
+        logger.info(f"Downloading HyenaDNA checkpoint '{model_name}' @ {revision} from {hf_url}...")
         try:
             subprocess.run(["git", "lfs", "install"], check=True, cwd=path)
             subprocess.run(["git", "clone", hf_url], check=True, cwd=path)
+            subprocess.run(["git", "-C", pretrained_dir, "checkout", "--quiet", revision], check=True)
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             raise ModelLoadError(
-                f"Failed to download HyenaDNA checkpoint '{model_name}' via "
-                f"git-lfs clone from {hf_url}: {exc}. git-lfs must be "
-                "installed (apt-get install git-lfs) for this download."
+                f"Failed to download HyenaDNA checkpoint '{model_name}' @ "
+                f"{revision} via git-lfs clone from {hf_url}: {exc}. "
+                "git-lfs must be installed (apt-get install git-lfs) for "
+                "this download."
             ) from exc
 
     config_path = os.path.join(pretrained_dir, "config.json")
@@ -255,10 +424,13 @@ def _load_hyenadna_checkpoint(path: str, model_name: str, device: str):
         hyena_config = json.load(f)
 
     scratch_model = _HyenaDNABackbone(**hyena_config, use_head=False, n_classes=2)
+    # Strict unpickling stays ON; the ten data classes this official
+    # checkpoint contains are allowlisted instead of disabling it (see
+    # `_allow_lightning_checkpoint_globals` for the full reasoning).
+    _allow_lightning_checkpoint_globals()
     loaded_ckpt = torch.load(
         weights_path,
         map_location=torch.device(device),
-        weights_only=False,  # official PyTorch Lightning checkpoint (trusted source)
     )
 
     # "State dict surgery": the checkpoint's keys are prefixed with
@@ -336,8 +508,7 @@ class HyenaDNAModel(BaseGenomicModel):
         max_len = CONFIG.models.HYENADNA_MAX_LENGTH
         if len(sequence) > max_len:
             self.logger.warning(
-                f"Sequence length {len(sequence)} exceeds HyenaDNA max "
-                f"{max_len}; truncating to model limit."
+                f"Sequence length {len(sequence)} exceeds HyenaDNA max {max_len}; truncating to model limit."
             )
             sequence = sequence[:max_len]
 

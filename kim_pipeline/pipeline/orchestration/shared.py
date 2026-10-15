@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List, Optional
 
 logger = logging.getLogger("geper.pipeline.orchestration.shared")
 
@@ -33,12 +32,12 @@ def _availability_fields(
     gene: str,
     gene_unavailable_reason: str,
     clinvar_enabled: bool,
-    clinvar_significance: Optional[str],
+    clinvar_significance: str | None,
     gnomad_enabled: bool,
-    gnomad_af: Optional[float],
-    gnomad_af_popmax: Optional[float],
-    gnomad_af_absent: Optional[bool],
-) -> Dict:
+    gnomad_af: float | None,
+    gnomad_af_popmax: float | None,
+    gnomad_af_absent: bool | None,
+) -> dict:
     """FIX (Issue 7): build the reporting-facing availability/reason fields
     for one variant's gene / ClinVar / gnomAD annotation, so downstream
     reports never have to silently render a null as a blank cell — every
@@ -59,10 +58,39 @@ def _availability_fields(
     if not gnomad_enabled:
         gnomad_status, gnomad_reason = "disabled", "gnomAD lookup skipped (disabled)"
     elif gnomad_af is None and gnomad_af_popmax is None:
-        if gnomad_af_absent:
+        # `gnomad_af_absent` is `bool | None` and carries THREE states, so it
+        # is compared explicitly rather than tested for truth: `if
+        # gnomad_af_absent:` reads False (checked, variant IS present) and
+        # None (never checked) as the same answer, and they are not.
+        if gnomad_af_absent is True:
             gnomad_status, gnomad_reason = "absent", "Confirmed absent from gnomAD"
+        elif gnomad_af_absent is False:
+            # THIS BRANCH BECAME REACHABLE ONLY WITH THE gnomad/lookup.py
+            # CHANGE THAT LANDED ALONGSIDE IT. Before that, a PRESENT hit
+            # always carried a number (an absent/unparseable AF was coerced
+            # to 0.0), so it could never reach this `elif` at all and the
+            # False/None collapse above was latent.
+            #
+            # test_gnomad_lookup_failure_not_absent.py's own CORRECTION note
+            # predicted this in as many words: the safety "depended entirely
+            # on PM2's own unrelated af-is-None guard holding forever. A
+            # future criterion that reads the flag directly, without that
+            # guard in front of it, would inherit the wrong answer." The
+            # thing that read it directly turned out to be a fix. THE SHIELD
+            # IS GONE -- this branch is what replaces it.
+            #
+            # Reporting "unavailable (network/tabix error)" here would send a
+            # reader to debug a network that is fine, for a lookup that
+            # succeeded and found the variant.
+            gnomad_status, gnomad_reason = (
+                "found_no_frequency",
+                "Found in gnomAD; no allele frequency reported for this variant",
+            )
         else:
-            gnomad_status, gnomad_reason = "unavailable", "gnomAD lookup unavailable (network/tabix error)"
+            gnomad_status, gnomad_reason = (
+                "unavailable",
+                "gnomAD lookup unavailable (network/tabix error)",
+            )
     else:
         gnomad_status, gnomad_reason = "found", None
 
@@ -86,12 +114,12 @@ def _availability_fields(
 
 
 def run_acmg_evidence_batch(
-    ann_variants: List[Dict],
-    cfg: Dict,
+    ann_variants: list[dict],
+    cfg: dict,
     sample_id: str = "SAMPLE",
-    pedigree_data: Optional[Dict] = None,
-    global_inheritance: Optional[str] = None,
-) -> List[Dict]:
+    pedigree_data: dict | None = None,
+    global_inheritance: str | None = None,
+) -> list[dict]:
     """Run ClinVar + gnomAD + constraint/hotspot + AI lookups, build
     VariantEvidence for every annotated variant, classify with ACMG, and
     aggregate the final evidence score.
@@ -118,11 +146,12 @@ def run_acmg_evidence_batch(
         variant — a single bad variant never aborts the whole batch).
     """
     from pipeline.acmg.classifier import AcmgClassifier, VariantEvidence
-    from pipeline.evidence.aggregator import EvidenceAggregator
+    from pipeline.annotation.stage import consequence_classes_disagree
+    from pipeline.clingen.lookup import ClinGenDosageLookup
     from pipeline.clinvar.lookup import ClinVarLookup
-    from pipeline.gnomad.lookup import GnomadLookup, GnomadHit, GnomadLookupOutcome
-    from pipeline.omim.lookup import OmimLookup
     from pipeline.constraint.lookup import GnomadConstraintLookup
+    from pipeline.evidence.aggregator import EvidenceAggregator
+    from pipeline.gnomad.lookup import GnomadHit, GnomadLookup, GnomadLookupOutcome
     from pipeline.hotspot.lookup import HotspotLookup
 
     pedigree_data = pedigree_data or {}
@@ -138,18 +167,24 @@ def run_acmg_evidence_batch(
     # untouched — they simply become cache hits against what was just
     # prefetched here, so this is a purely additive change to orchestration.
     try:
-        gnomad_lkp.lookup_batch([
-            (v.get("chrom", ""), int(v.get("pos", 0)), v.get("ref", ""), v.get("alt", ""))
-            for v in ann_variants
-        ])
+        gnomad_lkp.lookup_batch(
+            [
+                (v.get("chrom", ""), int(v.get("pos", 0)), v.get("ref", ""), v.get("alt", ""))
+                for v in ann_variants
+            ]
+        )
     except Exception as batch_exc:
         # A prefetch failure must never abort the run — the per-variant
         # loop below still works correctly (just without the network
         # speedup), each falling back to its own individual lookup().
-        logger.warning("[%s] gnomAD batch prefetch failed (continuing per-variant): %s", sample_id, batch_exc)
-    omim_lkp = OmimLookup(cfg=cfg)
-    constraint_lkp = GnomadConstraintLookup(cfg=cfg, omim_fallback=omim_lkp)
-    hotspot_lkp = HotspotLookup(cfg=cfg, omim_fallback=omim_lkp)
+        logger.warning(
+            "[%s] gnomAD batch prefetch failed (continuing per-variant): %s", sample_id, batch_exc
+        )
+    # ClinGen Dosage Sensitivity: LoF-intolerance fallback for genes with
+    # no gnomAD pLI/LOEUF coverage (see pipeline/clingen/lookup.py).
+    clingen_lkp = ClinGenDosageLookup(cfg=cfg)
+    constraint_lkp = GnomadConstraintLookup(cfg=cfg, clingen_fallback=clingen_lkp)
+    hotspot_lkp = HotspotLookup(cfg=cfg)
 
     # FIX (Issue 7): reports must never silently show "gene = null" or a
     # bare unexplained blank for ClinVar/gnomAD — every unavailable field
@@ -164,6 +199,7 @@ def run_acmg_evidence_batch(
     # actually resolves/loads one, or the reason shown here could
     # contradict what annotation actually did.
     from pipeline.annotation.mt_gff3_bootstrap import resolve_gff3_source
+
     _gff_path, gff_provenance = resolve_gff3_source(cfg)
     if not vep_enabled:
         gene_unavailable_reason = "VEP disabled"
@@ -176,17 +212,20 @@ def run_acmg_evidence_batch(
             "'rna_analysis.refseq_gff' to a full-genome GFF3 for nuclear-genome variants"
         )
     else:
-        gene_unavailable_reason = "Variant not resolved to a known gene (intergenic or annotation gap)"
+        gene_unavailable_reason = (
+            "Variant not resolved to a known gene (intergenic or annotation gap)"
+        )
 
     # ── AI engine (optional) ──────────────────────────────────────────
     _ai_engine = None
     try:
         from pipeline.ai.engine import AiEngine
+
         _ai_engine = AiEngine(cfg=cfg)
     except Exception:
         pass  # torch/transformers not installed — AI stream disabled
 
-    acmg_batch: List[Dict] = []
+    acmg_batch: list[dict] = []
     _total_variants = len(ann_variants)
 
     for _variant_idx, variant in enumerate(ann_variants, start=1):
@@ -197,30 +236,59 @@ def run_acmg_evidence_batch(
         alt_v = variant.get("alt", "")
         logger.info(
             "[PIPELINE:VARIANT] START idx=%d/%d %s:%s %s>%s",
-            _variant_idx, _total_variants, chrom, pos_v, ref_v, alt_v,
+            _variant_idx,
+            _total_variants,
+            chrom,
+            pos_v,
+            ref_v,
+            alt_v,
         )
         gene = variant.get("gene_name") or variant.get("gene") or ""
         consequence = variant.get("consequence", "").lower()
 
-        # gnomAD lookup — returns GnomadHit, ABSENT, or UNAVAILABLE
+        # gnomAD lookup — returns GnomadHit, ABSENT, or UNAVAILABLE.
+        #
+        # None = absence NOT EVALUATED (the backend was unreachable, or the
+        # lookup raised). It must not be read as "checked, and not absent",
+        # which is what `False` means here — see
+        # pipeline/acmg/classifier.py::_pm2 / STATUS_NOT_EVALUATED. Same
+        # sentinel convention as `in_hotspot` below, and the shape d500f32
+        # established for PM1 when hotspot data was unavailable.
+        #
+        # GnomadLookupOutcome's own docstring calls these "the three states
+        # that the caller needs to differentiate"; collapsing two of them
+        # into `False` is what this distinction exists to prevent.
         gnomad_af = None
         gnomad_af_popmax = None
-        gnomad_af_absent: Optional[bool] = False
+        gnomad_af_absent: bool | None = None
         try:
             gn_result = gnomad_lkp.lookup(chrom, pos_v, ref_v, alt_v)
             if isinstance(gn_result, GnomadHit):
                 gnomad_af = gn_result.af
                 gnomad_af_popmax = gn_result.af_popmax
+                # A real answer: the variant was found, so it is not absent.
                 gnomad_af_absent = False
             elif gn_result == GnomadLookupOutcome.ABSENT:
                 gnomad_af_absent = True
-            else:  # UNAVAILABLE
-                gnomad_af_absent = False
+            else:  # UNAVAILABLE — nothing was checked, so nothing is known.
+                gnomad_af_absent = None
         except Exception as gnomad_exc:
-            gnomad_af_absent = False
-            logger.debug(
-                "[%s] gnomAD lookup failed for %s:%s %s>%s: %s",
-                sample_id, chrom, pos_v, ref_v, alt_v, gnomad_exc,
+            # Stays None (not evaluated) — the lookup itself failed, so this
+            # variant's presence in gnomAD is unknown, not disproved.
+            gnomad_af_absent = None
+            # WARNING, not debug: this determines whether gnomAD evidence
+            # reaches ACMG at all, so an operator must see it without
+            # re-running at debug level.
+            logger.warning(
+                "[%s] gnomAD lookup failed for %s:%s %s>%s — gnomAD evidence "
+                "not evaluated for this variant: %s: %s",
+                sample_id,
+                chrom,
+                pos_v,
+                ref_v,
+                alt_v,
+                type(gnomad_exc).__name__,
+                gnomad_exc,
             )
 
         # ClinVar lookup
@@ -237,7 +305,12 @@ def run_acmg_evidence_batch(
         except Exception as clinvar_exc:
             logger.debug(
                 "[%s] ClinVar lookup failed for %s:%s %s>%s: %s",
-                sample_id, chrom, pos_v, ref_v, alt_v, clinvar_exc,
+                sample_id,
+                chrom,
+                pos_v,
+                ref_v,
+                alt_v,
+                clinvar_exc,
             )
 
         is_lof = consequence in {
@@ -250,21 +323,29 @@ def run_acmg_evidence_batch(
         }
         is_missense = consequence == "missense_variant"
         lof_intolerant = False
-        in_hotspot = False
+        # None = hotspot status not evaluated (lookup raised, or neither
+        # ClinVar TSV nor UniProt domains BED was loaded) — must NOT be
+        # read as a confirmed "not a hotspot" by PM1 (see
+        # pipeline/acmg/classifier.py::_pm1 / STATUS_NOT_EVALUATED).
+        in_hotspot = None
         _missense_constrained = False
         try:
             if gene:
                 lof_intolerant = constraint_lkp.is_lof_intolerant(gene)
                 _missense_constrained = constraint_lkp.is_missense_constrained(gene)
-            in_hotspot = (
-                hotspot_lkp.is_in_hotspot(chrom, pos_v, gene)
-                and is_missense
-            )
+            # hotspot_lkp.is_in_hotspot() returns None when hotspot status
+            # is unknown (no local data loaded) — `None and is_missense`
+            # short-circuits to None, correctly preserving "not evaluated"
+            # rather than collapsing it into a false "not met".
+            in_hotspot = hotspot_lkp.is_in_hotspot(chrom, pos_v, gene) and is_missense
         except Exception as constraint_exc:
             logger.debug(
                 "[%s] gnomAD constraint/hotspot lookup failed for gene %s: %s",
-                sample_id, gene, constraint_exc,
+                sample_id,
+                gene,
+                constraint_exc,
             )
+            # in_hotspot stays None (not evaluated) — the lookup itself failed.
 
         # ── PS1 / PM5: codon-level ClinVar evidence ────────────────────
         same_aa_pathogenic = variant.get("same_aa_pathogenic")
@@ -283,13 +364,18 @@ def run_acmg_evidence_batch(
             except Exception as ps1_pm5_exc:
                 logger.debug(
                     "[%s] PS1/PM5 codon lookup failed for %s:%s %s>%s: %s",
-                    sample_id, chrom, pos_v, ref_v, alt_v, ps1_pm5_exc,
+                    sample_id,
+                    chrom,
+                    pos_v,
+                    ref_v,
+                    alt_v,
+                    ps1_pm5_exc,
                 )
 
         in_repeat_region = variant.get("in_repeat_region")
 
         _ped_variant_key = f"{chrom}:{pos_v}:{ref_v}:{alt_v}"
-        _ped_v: Dict = pedigree_data.get(_ped_variant_key, {})
+        _ped_v: dict = pedigree_data.get(_ped_variant_key, {})
         _confirmed_de_novo = _ped_v.get("confirmed_de_novo")
         _assumed_de_novo = _ped_v.get("assumed_de_novo")
         _segregates_with_disease = _ped_v.get("segregates_with_disease")
@@ -333,16 +419,33 @@ def run_acmg_evidence_batch(
             in_trans_or_cis_with_pathogenic_unexpected=_in_trans_or_cis,
             alternate_molecular_basis_found=_alternate_molecular,
             inheritance_pattern=_inheritance,
+            # Fixed 2026-08-22, found while removing SpliceAI (licence):
+            # `(x or 0.0)` treated an ABSENT spliceai_score identically to
+            # a CONFIRMED "no splice impact" score of 0.0, so BP7
+            # (`pipeline/acmg/classifier.py::_bp7`) would fire on this
+            # signal alone for every synonymous/intronic variant once
+            # SpliceAI's plugin is removed upstream and spliceai_score is
+            # always absent. Requiring the score to actually be present
+            # matches the fail-safe direction every other "missing
+            # evidence" check in this codebase already uses (see PP3/BP4's
+            # own STATUS_NOT_EVALUATED-on-no-votes) -- absence must not
+            # read as a confirmed favorable result. Net effect once
+            # SpliceAI is fully removed: this condition is always False,
+            # so synonymous_or_intronic no longer fires on splice-safety
+            # grounds at all (a real, disclosed behaviour change, not
+            # silently absorbed -- see the SpliceAI-removal report).
             synonymous_or_intronic=(
                 consequence in {"synonymous_variant", "intron_variant"}
-                and (variant.get("spliceai_score") or 0.0) < 0.2
+                and variant.get("spliceai_score") is not None
+                and variant.get("spliceai_score") < 0.2
             ),
             bp1_reputable_source_benign=(
                 clinvar_significance is not None
                 and "benign" in clinvar_significance.lower()
                 and clinvar_stars >= 1
                 and not clinvar_conflicting
-            ) or None,
+            )
+            or None,
             missense_constrained=_missense_constrained,
         )
 
@@ -351,6 +454,17 @@ def run_acmg_evidence_batch(
 
             # ── AI scoring (per-variant, failure-isolated) ──────────────
             ai_score = None
+            # HUMAN-DECISION-kim-s-TWO-AI-MODELS-ARE-LIVE...-ruled-(C), 2026-09-11:
+            # "the report should disclose which models contributed, because a
+            # score whose inputs vary silently is not reproducible from the
+            # report." DNABERT-2 and ESM-2 fire independently per variant
+            # (DNABERT-2 needs ref/alt sequence; ESM-2 needs wildtype/mutant
+            # amino acids) -- a run-level "AI available" flag would still
+            # hide a variant where only one of the two, or neither, actually
+            # produced a score. Built from the same ref_seq/alt_seq/wt_aa/
+            # mt_aa checks below, not a static list, so it reflects THIS
+            # variant's actual call, not the engine's availability.
+            ai_models_used: list[str] = []
             if _ai_engine is not None:
                 try:
                     ai_dna_score = None
@@ -362,19 +476,30 @@ def run_acmg_evidence_batch(
                     if ref_seq and alt_seq:
                         logger.info(
                             "[PIPELINE:VARIANT] %s:%s %s>%s -> calling AI:DNABERT-2",
-                            chrom, pos_v, ref_v, alt_v,
+                            chrom,
+                            pos_v,
+                            ref_v,
+                            alt_v,
                         )
                         ai_dna_score = _ai_engine.score_dna(ref_seq, alt_seq)
+                        if ai_dna_score is not None:
+                            ai_models_used.append("DNABERT-2")
                     if wt_aa and mt_aa:
                         logger.info(
                             "[PIPELINE:VARIANT] %s:%s %s>%s -> calling AI:ESM-2",
-                            chrom, pos_v, ref_v, alt_v,
+                            chrom,
+                            pos_v,
+                            ref_v,
+                            alt_v,
                         )
                         ai_protein_score = _ai_engine.score_protein(wt_aa, mt_aa)
+                        if ai_protein_score is not None:
+                            ai_models_used.append("ESM-2")
                     ai_score = _ai_engine.combined_score(ai_dna_score, ai_protein_score)
                 except Exception as _ai_exc:
                     logger.debug("AI scoring failed for variant %s:%s: %s", chrom, pos_v, _ai_exc)
                     ai_score = None
+                    ai_models_used = []
 
             comp_score = EvidenceAggregator.compute_computational_score(
                 cadd_phred=variant.get("cadd_phred"),
@@ -395,43 +520,81 @@ def run_acmg_evidence_batch(
                 ai_score=ai_score,
             )
 
-            acmg_batch.append({
-                **acmg_res.to_dict(),
-                **ev_res.to_dict(),
-                **_availability_fields(
-                    gene=gene,
-                    gene_unavailable_reason=gene_unavailable_reason,
-                    clinvar_enabled=clinvar_lkp.enabled,
-                    clinvar_significance=clinvar_significance,
-                    gnomad_enabled=gnomad_lkp.enabled,
-                    gnomad_af=gnomad_af,
-                    gnomad_af_popmax=gnomad_af_popmax,
-                    gnomad_af_absent=gnomad_af_absent,
-                ),
-            })
+            # T3-F3 (finding: andy), ruled (b) REPORT CAVEAT, 2026-09-11:
+            # "a disagreement isn't an inability to evaluate ... Disclose it
+            # and let the reviewer weigh it." `consequence` (kim's own
+            # derivation) is the only term the ACMG gates above read; VEP's
+            # most-severe CSQ term may be keyed to a different transcript.
+            # Recorded here for the report to disclose -- deliberately
+            # computed AFTER classification and fed into nothing, so it can
+            # never change the call. None = nothing to disclose: the classes
+            # agree, or there was no VEP term to compare against.
+            kim_term = variant.get("consequence", "")
+            vep_term = variant.get("vep_consequence", "")
+            consequence_disagreement = (
+                {"kim_consequence": kim_term, "vep_consequence": vep_term}
+                if consequence_classes_disagree(kim_term, vep_term)
+                else None
+            )
+
+            acmg_batch.append(
+                {
+                    **acmg_res.to_dict(),
+                    **ev_res.to_dict(),
+                    "ai_models_used": ai_models_used,
+                    "consequence_disagreement": consequence_disagreement,
+                    **_availability_fields(
+                        gene=gene,
+                        gene_unavailable_reason=gene_unavailable_reason,
+                        clinvar_enabled=clinvar_lkp.enabled,
+                        clinvar_significance=clinvar_significance,
+                        gnomad_enabled=gnomad_lkp.enabled,
+                        gnomad_af=gnomad_af,
+                        gnomad_af_popmax=gnomad_af_popmax,
+                        gnomad_af_absent=gnomad_af_absent,
+                    ),
+                }
+            )
             logger.info(
                 "[PIPELINE:VARIANT] END idx=%d/%d %s:%s %s>%s elapsed=%.2fs",
-                _variant_idx, _total_variants, chrom, pos_v, ref_v, alt_v,
+                _variant_idx,
+                _total_variants,
+                chrom,
+                pos_v,
+                ref_v,
+                alt_v,
                 time.monotonic() - _variant_t0,
             )
 
         except Exception as _var_exc:
             logger.error(
                 "[%s] ACMG classify failed for %s:%d %s>%s: %s",
-                sample_id, chrom, pos_v, ref_v, alt_v, _var_exc,
+                sample_id,
+                chrom,
+                pos_v,
+                ref_v,
+                alt_v,
+                _var_exc,
             )
-            acmg_batch.append({
-                "chrom": chrom,
-                "pos": pos_v,
-                "ref": ref_v,
-                "alt": alt_v,
-                "gene": gene or None,
-                "gene_unavailable_reason": None if gene else gene_unavailable_reason,
-                "error": str(_var_exc),
-            })
+            acmg_batch.append(
+                {
+                    "chrom": chrom,
+                    "pos": pos_v,
+                    "ref": ref_v,
+                    "alt": alt_v,
+                    "gene": gene or None,
+                    "gene_unavailable_reason": None if gene else gene_unavailable_reason,
+                    "error": str(_var_exc),
+                }
+            )
             logger.info(
                 "[PIPELINE:VARIANT] END (error) idx=%d/%d %s:%s %s>%s elapsed=%.2fs",
-                _variant_idx, _total_variants, chrom, pos_v, ref_v, alt_v,
+                _variant_idx,
+                _total_variants,
+                chrom,
+                pos_v,
+                ref_v,
+                alt_v,
                 time.monotonic() - _variant_t0,
             )
 

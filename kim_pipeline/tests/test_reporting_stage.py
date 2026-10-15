@@ -12,26 +12,43 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pipeline.reporting.stage import ReportingStage
+from pipeline.reporting.stage import ReportingStage, _acmg_to_html_table, _variants_to_html_table
 
 
 def _fake_qc() -> dict:
-    return {"path": "r1.fastq", "total_records": 1000, "min_read_length": 100,
-            "max_read_length": 100, "mean_read_length": 100.0, "is_gzipped": False}
+    return {
+        "path": "r1.fastq",
+        "total_records": 1000,
+        "min_read_length": 100,
+        "max_read_length": 100,
+        "mean_read_length": 100.0,
+        "is_gzipped": False,
+    }
 
 
 def _fake_align() -> dict:
-    return {"sample_id": "S01", "aligner_used": "bwa", "total_reads": 2000,
-            "mapped_reads": 1980, "pct_mapped": 99.0, "mean_depth": 25.0}
+    return {
+        "sample_id": "S01",
+        "aligner_used": "bwa",
+        "total_reads": 2000,
+        "mapped_reads": 1980,
+        "pct_mapped": 99.0,
+        "mean_depth": 25.0,
+    }
 
 
 def _fake_vc() -> dict:
-    return {"sample_id": "S01", "caller": "freebayes", "total_variants": 10,
-            "pass_variants": 8, "snvs_pass": 7, "indels_pass": 1}
+    return {
+        "sample_id": "S01",
+        "caller": "freebayes",
+        "total_variants": 10,
+        "pass_variants": 8,
+        "snvs_pass": 7,
+        "indels_pass": 1,
+    }
 
 
 def _fake_annotation() -> dict:
@@ -41,11 +58,23 @@ def _fake_annotation() -> dict:
         "annotated_count": 7,
         "unannotated_count": 1,
         "variants": [
-            {"chrom": "chr17", "pos": 43057051, "ref": "A", "alt": "T",
-             "qual": 200.0, "filter_field": "PASS", "gene_name": "BRCA1",
-             "transcript_id": "NM_007294.4", "hgvs": "NM_007294.4:g.43057051A>T",
-             "zygosity": "Heterozygous", "gt": "0/1", "dp": "25", "ad": "15,10",
-             "info": ".", "genotype": "0/1"},
+            {
+                "chrom": "chr17",
+                "pos": 43057051,
+                "ref": "A",
+                "alt": "T",
+                "qual": 200.0,
+                "filter_field": "PASS",
+                "gene_name": "BRCA1",
+                "transcript_id": "NM_007294.4",
+                "hgvs": "NM_007294.4:g.43057051A>T",
+                "zygosity": "Heterozygous",
+                "gt": "0/1",
+                "dp": "25",
+                "ad": "15,10",
+                "info": ".",
+                "genotype": "0/1",
+            },
         ],
     }
 
@@ -55,27 +84,46 @@ def _fake_annotation() -> dict:
 # badges, variant dashboard, clinical interpretation, footer, ReportLab PDF.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestIssue3ClinicalReportOverhaul:
     def _run(self, tmp_path, **overrides):
         stage = ReportingStage({"reporting": {"generate_pdf": False}})
         kwargs = dict(
-            sample_id="S01", output_dir=str(tmp_path), qc_summary=_fake_qc(),
-            alignment_stats=_fake_align(), variant_stats=_fake_vc(),
+            sample_id="S01",
+            output_dir=str(tmp_path),
+            qc_summary=_fake_qc(),
+            alignment_stats=_fake_align(),
+            variant_stats=_fake_vc(),
             annotation_result=_fake_annotation(),
-            acmg_results=[{
-                "chrom": "chr17", "pos": 43057051, "ref": "A", "alt": "T",
-                "gene": "BRCA1", "classification": "Pathogenic", "score": 8,
-                "criteria_met": ["PVS1"], "criteria_unknown": [],
-                "gnomad_af": 0.0001, "gnomad_af_popmax": 0.0002,
-            }],
+            acmg_results=[
+                {
+                    "chrom": "chr17",
+                    "pos": 43057051,
+                    "ref": "A",
+                    "alt": "T",
+                    "gene": "BRCA1",
+                    "classification": "Pathogenic",
+                    "score": 8,
+                    "criteria_met": ["PVS1"],
+                    "criteria_unknown": [],
+                    "gnomad_af": 0.0001,
+                    "gnomad_af_popmax": 0.0002,
+                }
+            ],
         )
         kwargs.update(overrides)
         return stage.run(**kwargs)
 
     def test_patient_metadata_appears_in_html(self, tmp_path):
-        result = self._run(tmp_path, patient_metadata={
-            "name": "Jane Doe", "dob": "1990-01-01", "sex": "F", "physician": "Dr. Smith",
-        })
+        result = self._run(
+            tmp_path,
+            patient_metadata={
+                "name": "Jane Doe",
+                "dob": "1990-01-01",
+                "sex": "F",
+                "physician": "Dr. Smith",
+            },
+        )
         html = Path(result.html_path).read_text()
         assert "Jane Doe" in html
         assert "1990-01-01" in html
@@ -116,18 +164,40 @@ class TestIssue3ClinicalReportOverhaul:
 
     def test_footer_contains_disclaimer_reference_genome_version_timestamp(self, tmp_path):
         result = self._run(
-            tmp_path, reference_versions={"reference_genome": "GRCh38 (test)"},
+            tmp_path,
+            reference_versions={"reference_genome": "GRCh38 (test)"},
         )
         html = Path(result.html_path).read_text()
         assert "report-footer" in html
         assert "GRCh38 (test)" in html
-        assert "GEPER v8" in html
+        # Was "Bij AI v8" -- the whole-product name, superseded 2026-09-11
+        # (Option B): the version names the component, as the scope line does.
+        assert "Bij AI sequencing-analysis component v8" in html
         assert "Generated:" in html
 
-    def test_signature_block_rendered(self, tmp_path):
+    def test_signature_block_not_rendered(self, tmp_path):
+        """Inverted, not deleted, from the original `assert "Reviewing
+        Pathologist" in html`: that assertion encoded a claim -- "this
+        report carries a lab sign-off block" -- that the product now
+        rules false, rather than documenting a held defect (see
+        pipeline/reporting/stage.py's own history: the signature-block/
+        signature-line div pair implied a review process kim_pipeline
+        has never had anywhere in its code -- no review_status field,
+        no approve()/override(), no export gate). A control
+        indistinguishable from no control is worse than no control,
+        because it launders the absence of one; removing the artefact
+        and inverting this assertion to a reintroduction guard is the
+        correct pair, not two separate cleanups. Guarding this (rather
+        than just deleting the test, as a purely-cosmetic static-layout
+        removal like the PDF twin in cfba75e would only need) is
+        deliberate: the artefact has demonstrated, across both the PDF
+        and HTML report surfaces, that it recurs. If this assertion
+        starts failing, that means the block came back -- do not
+        "fix" it by reverting to `in html`.
+        """
         result = self._run(tmp_path)
         html = Path(result.html_path).read_text()
-        assert "Reviewing Pathologist" in html
+        assert "Reviewing Pathologist" not in html
 
     def test_html_still_contains_backward_compatible_markers(self, tmp_path):
         """Preserve the original test's own assertions: BRCA1, S01, a table."""
@@ -150,14 +220,18 @@ class TestIssue3ClinicalReportOverhaul:
     def test_reportlab_pdf_generated_by_default(self, tmp_path):
         stage = ReportingStage({"reporting": {"generate_pdf": True}})
         result = stage.run(
-            sample_id="S01", output_dir=str(tmp_path), qc_summary=_fake_qc(),
-            alignment_stats=_fake_align(), variant_stats=_fake_vc(),
+            sample_id="S01",
+            output_dir=str(tmp_path),
+            qc_summary=_fake_qc(),
+            alignment_stats=_fake_align(),
+            variant_stats=_fake_vc(),
             annotation_result=_fake_annotation(),
             patient_metadata={"name": "Jane Doe"},
         )
         assert result.pdf_path is not None
         assert Path(result.pdf_path).exists()
         from pypdf import PdfReader
+
         text = "".join(p.extract_text() for p in PdfReader(result.pdf_path).pages)
         assert "Jane Doe" in text
         assert "BRCA1" in text
@@ -172,7 +246,7 @@ class TestIssue3ClinicalReportOverhaul:
 
     def test_empty_run_still_works_with_new_sections(self, tmp_path):
         """Backward-compat / robustness: an empty run (no acmg, no patient
-        metadata, no pgx/ancestry) must not crash with the new sections."""
+        metadata, no ancestry) must not crash with the new sections."""
         stage = ReportingStage({"reporting": {"generate_pdf": False}})
         result = stage.run(sample_id="EMPTY", output_dir=str(tmp_path))
         assert Path(result.json_path).exists()
@@ -269,6 +343,7 @@ class TestReportingStage:
 # output_dir, NOT inside output_dir/<sample_id>/
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestFix1ReportingPathRegression:
     """Regression tests for: ReportingStage writes to wrong subdirectory."""
 
@@ -306,9 +381,7 @@ class TestFix1ReportingPathRegression:
         sample_id = "PATIENT42"
         self._run_stage(tmp_path, sample_id=sample_id)
         wrong_dir = tmp_path / sample_id
-        assert not wrong_dir.exists(), (
-            f"sample_id subdir should not exist: {wrong_dir}"
-        )
+        assert not wrong_dir.exists(), f"sample_id subdir should not exist: {wrong_dir}"
 
     def test_result_json_path_matches_actual_file(self, tmp_path):
         """ReportResult.json_path must point to the file that actually exists."""
@@ -323,3 +396,175 @@ class TestFix1ReportingPathRegression:
         assert Path(result.html_path).exists(), (
             f"ReportResult.html_path={result.html_path!r} does not exist on disk"
         )
+
+
+class TestAcmgCrashRowDoesNotFabricate:
+    """A per-variant result whose classification stage raised (shared.py's
+    per-variant Exception handler appends {..., "error": ...} with no
+    classification/clinvar_unavailable_reason/gnomad_unavailable_reason keys,
+    by construction) must render as a failure, never as a normal-looking
+    Uncertain_Significance / Found / Found row.
+    """
+
+    def _crashed_item(self):
+        return {
+            "chrom": "17",
+            "pos": 41244936,
+            "ref": "A",
+            "alt": "G",
+            "gene": "BRCA1",
+            "error": "IndexError: list index out of range",
+            "disclaimer": "Exploratory only.",
+        }
+
+    def _normal_item(self):
+        return {
+            "chrom": "13",
+            "pos": 32340000,
+            "ref": "C",
+            "alt": "T",
+            "gene": "BRCA2",
+            "classification": "Pathogenic",
+            "score": "8.5",
+            "criteria_met": ["PS1", "PM2"],
+            "criteria_unknown": [],
+            "clinvar_unavailable_reason": None,
+            "gnomad_af": 0.0001,
+            "gnomad_af_popmax": 0.0002,
+            "final_tier": "Tier1",
+            "composite_score": "0.95",
+            "disclaimer": "Exploratory only.",
+        }
+
+    def test_crashed_row_does_not_render_fabricated_defaults(self):
+        html = _acmg_to_html_table([self._crashed_item()])
+        assert "Uncertain_Significance" not in html, (
+            "a crashed variant must not render the real ACMG category "
+            "'Uncertain_Significance' as if it were a genuine classification"
+        )
+        assert ">Found<" not in html, (
+            "a crashed variant must not render a bare 'Found' for ClinVar/gnomAD "
+            "-- evidence gathering never ran"
+        )
+        assert "Found (frequency not available)" not in html, (
+            "a crashed variant must not render gnomAD's genuine-but-empty-AF "
+            "fallback text -- gnomAD was never queried"
+        )
+
+    def test_crashed_row_renders_the_captured_error(self):
+        html = _acmg_to_html_table([self._crashed_item()])
+        assert "Classification failed" in html
+        assert "IndexError: list index out of range" in html
+
+    def test_normal_row_unaffected_by_the_error_branch(self):
+        """Control: a variant with no `error` key renders exactly as before."""
+        html = _acmg_to_html_table([self._normal_item()])
+        assert "Pathogenic" in html
+        assert "Found" in html
+        assert "AF: 1.00e-04 (popmax: 2.00e-04)" in html
+        assert "Classification failed" not in html
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEFECT-zygosity-collapses-absent-and-malformed: caller wiring
+# ══════════════════════════════════════════════════════════════════════════════
+# `ZygosityExtractor` now distinguishes a malformed GT token from a valid
+# genotype of the same shape via `ZygosityResult.malformed` (see
+# tests/test_zygosity.py). This section proves the two named callers
+# actually surface it: `_variants_to_html_table` must not render a
+# malformed-derived category as a plain confident value, must not blank the
+# cell either (a blank cell reads as "nothing found" -- the fabricated-
+# absence defect this floor has spent the day removing), and must NOT
+# annotate a genuine no_call, which is a legitimate absence, not a failure.
+
+
+def _variant_row(**overrides) -> dict:
+    row = {
+        "chrom": "chr1",
+        "pos": 100,
+        "ref": "A",
+        "alt": "G",
+        "qual": 99,
+        "gene_name": "BRCA1",
+        "transcript_id": "ENST1",
+        "hgvs": "c.1A>G",
+        "consequence": "missense_variant",
+        "zygosity": "Hemizygous",
+        "gt": "1",
+        "dp": "30",
+        "ad": "0,30",
+        "zygosity_malformed": False,
+    }
+    row.update(overrides)
+    return row
+
+
+class TestZygosityMalformedDisclosure:
+    def test_valid_zygosity_renders_plain_value(self):
+        html = _variants_to_html_table([_variant_row()])
+        assert "<td>Hemizygous</td>" in html
+        assert "unreliable" not in html
+
+    def test_no_call_not_flagged_as_a_failure(self):
+        """The case that matters most: a legitimate absence must not start
+        looking like a failure just because malformed disclosure exists."""
+        html = _variants_to_html_table(
+            [_variant_row(zygosity="No_call", gt="./.", zygosity_malformed=False)]
+        )
+        assert "<td>No_call</td>" in html
+        assert "unreliable" not in html
+
+    def test_malformed_zygosity_discloses_value_and_reason_not_a_blank_cell(self):
+        html = _variants_to_html_table(
+            [_variant_row(zygosity="Hemizygous", gt="BAD", zygosity_malformed=True)]
+        )
+        # The category is still shown (not suppressed into a blank cell --
+        # that would read as "nothing found", the mirror defect).
+        assert "Hemizygous" in html
+        # And it says untrustworthy AND why, not just "do not trust".
+        assert "unreliable" in html
+        assert "GT field unparseable" in html
+        # It must not render as the same bare cell as the valid case.
+        assert "<td>Hemizygous</td>" not in html
+
+
+class TestZygosityMalformedWiredOntoAnnotatedVariant:
+    def test_malformed_gt_sets_zygosity_malformed_true(self):
+        from pipeline.annotation.stage import _iter_vcf
+        import tempfile
+        import os
+
+        vcf = (
+            "##fileformat=VCFv4.2\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS01\n"
+            "chr1\t100\t.\tA\tG\t99\tPASS\t.\tGT\tBAD\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".vcf")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(vcf)
+            variants = list(_iter_vcf(path))
+        finally:
+            os.unlink(path)
+        assert len(variants) == 1
+        assert variants[0].zygosity_malformed is True
+
+    def test_valid_gt_leaves_zygosity_malformed_false(self):
+        from pipeline.annotation.stage import _iter_vcf
+        import tempfile
+        import os
+
+        vcf = (
+            "##fileformat=VCFv4.2\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS01\n"
+            "chr1\t100\t.\tA\tG\t99\tPASS\t.\tGT\t0/1\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".vcf")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(vcf)
+            variants = list(_iter_vcf(path))
+        finally:
+            os.unlink(path)
+        assert len(variants) == 1
+        assert variants[0].zygosity_malformed is False

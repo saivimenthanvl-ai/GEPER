@@ -6,32 +6,83 @@ VEP (Ensembl Variant Effect Predictor) annotation stage (GAP 1).
 Shells out to the ``vep`` CLI with comprehensive flags to obtain:
   - Most-severe consequence term
   - HGVS c. and p. notations
-  - CADD_PHRED, REVEL, SpliceAI, AlphaMissense pre-computed scores
+  - CADD_PHRED, REVEL, AlphaMissense pre-computed scores (each requires its
+    plugin data file to be configured below -- see "Plugin data" note)
   - Gene symbol and transcript ID
+
+SpliceAI's VEP PLUGIN REMOVED (2026-08-22, licence): Illumina's SpliceAI
+plugin was requested unconditionally here and its score fed live ACMG
+evidence (PP3/BP4, and `pipeline/orchestration/shared.py`'s
+`synonymous_or_intronic` -> BP7), but its pretrained models are CC BY-NC
+4.0 (non-commercial) and its code GPL-3.0 -- the same class of licence
+blocker as OMIM, and never covered by `LICENSE_AUDIT.md`'s own "never
+integrated into GEPER" verdict for SpliceAI, which was scoped to
+`geper/` only. `spliceai_score` fields remain on
+`VEPVariantAnnotation`/downstream dataclasses rather than being deleted
+outright, so nothing that reads them via `.get(...)`/attribute access
+needs a separate null-check added -- see
+`orchestration/shared.py::synonymous_or_intronic`'s fix for the one place
+absence needed to be handled explicitly rather than relying on the
+default.
+
+**CORRECTED 2026-09-10**: this docstring previously said
+`spliceai_score` is "always `None` now". At the time that was FALSE and
+was corrected to say so: this module's removal only ever covered the
+VEP-CSQ path, while a separate fallback in
+`pipeline/annotation/stage.py` read SpliceAI's own `SpliceAI=`/`DS_AG`/
+`DS_AL`/`DS_DG`/`DS_DL` fields straight out of the input VCF's INFO and
+fed a live score to PP3/BP4. That same "always `None`" mistake was
+independently made twice more, citing this docstring as its evidence in
+one case (`docs/BIJ_AI_CAPABILITY_AUDIT.md`, `geper/LICENSE_AUDIT.md`).
+
+**UPDATED 2026-09-10 (SpliceAI input closed)**: those two fallback sites
+have since been REMOVED, so `spliceai_score` is now genuinely never
+populated by either path. *** THE CLAIM IS ONLY TRUE BECAUSE THE INPUT
+WAS CLOSED -- IT WAS NOT TRUE WHEN IT WAS FIRST WRITTEN, AND IT WOULD
+STOP BEING TRUE AGAIN THE MOMENT ANY READER OF THOSE INFO FIELDS COMES
+BACK. *** It is not a property of removing SpliceAI from VEP. What
+guards it now is
+`kim_pipeline/tests/test_spliceai_input_is_closed.py`, which asserts on
+ACMG OUTCOMES rather than on parsing, so a re-introduced input fails a
+classification assertion rather than merely a grep.
 
 Config section::
 
     vep:
       enabled: true
-      cache_dir: ""        # e.g. /data/vep_cache
-      fasta: ""            # reference FASTA for HGVS
-      extra_flags: ""      # any additional VEP flags
+      cache_dir: ""              # e.g. /data/vep_cache
+      dir_plugins: ""            # e.g. /opt/vep/Plugins (VEP's plugin .pm dir)
+      cadd_data: ""               # path to CADD's whole_genome_SNVs.tsv.gz
+      revel_data: ""              # path to REVEL's revel.tsv.gz
+      alphamissense_data: ""      # path to AlphaMissense_hg38.tsv.gz
+      fasta: ""                  # reference FASTA for HGVS
+      extra_flags: ""             # any additional VEP flags
       timeout: 600
+
+Plugin data: CADD, REVEL, and AlphaMissense are Ensembl VEP plugins that
+each require a separate, per-file data download -- installing the ``vep``
+binary and cache (docs/INSTALL_DEPENDENCIES.md) is not sufficient to get
+these scores. Unlike ``vep`` itself, a bare ``--plugin CADD`` with no data
+file is a hard VEP startup error, not a "run with defaults" request, so
+each plugin above is only requested when its ``*_data`` key is configured;
+left unset, VEP still runs but that score comes back absent (already
+tolerated downstream -- ``cadd_phred``/``revel_score``/``am_pathogenicity``
+are ``Optional[float]``, checked ``is not None`` before voting in
+``acmg/classifier.py``). See docs/INSTALL_DEPENDENCIES.md for where to
+obtain each data file.
 
 Checkpoint key: ``vep_annotation``
 """
+
 from __future__ import annotations
 
 import gzip
 import logging
-import os
-import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-from pipeline.fastq.errors import FastqPipelineError, _require
+from pipeline.fastq.errors import FastqPipelineError, _require, _run
 
 logger = logging.getLogger("geper.pipeline.vep.stage")
 
@@ -39,19 +90,41 @@ _STAGE = "vep_annotation"
 
 # Consequences ordered roughly by severity (most severe first)
 _SEVERITY_ORDER = [
-    "transcript_ablation", "splice_acceptor_variant", "splice_donor_variant",
-    "stop_gained", "frameshift_variant", "stop_lost", "start_lost",
-    "transcript_amplification", "inframe_insertion", "inframe_deletion",
-    "missense_variant", "protein_altering_variant", "splice_region_variant",
-    "incomplete_terminal_codon_variant", "start_retained_variant",
-    "stop_retained_variant", "synonymous_variant", "coding_sequence_variant",
-    "mature_miRNA_variant", "5_prime_UTR_variant", "3_prime_UTR_variant",
-    "non_coding_transcript_exon_variant", "intron_variant",
-    "NMD_transcript_variant", "non_coding_transcript_variant",
-    "upstream_gene_variant", "downstream_gene_variant", "TFBS_ablation",
-    "TFBS_amplification", "TF_binding_site_variant",
-    "regulatory_region_ablation", "regulatory_region_amplification",
-    "feature_elongation", "regulatory_region_variant", "feature_truncation",
+    "transcript_ablation",
+    "splice_acceptor_variant",
+    "splice_donor_variant",
+    "stop_gained",
+    "frameshift_variant",
+    "stop_lost",
+    "start_lost",
+    "transcript_amplification",
+    "inframe_insertion",
+    "inframe_deletion",
+    "missense_variant",
+    "protein_altering_variant",
+    "splice_region_variant",
+    "incomplete_terminal_codon_variant",
+    "start_retained_variant",
+    "stop_retained_variant",
+    "synonymous_variant",
+    "coding_sequence_variant",
+    "mature_miRNA_variant",
+    "5_prime_UTR_variant",
+    "3_prime_UTR_variant",
+    "non_coding_transcript_exon_variant",
+    "intron_variant",
+    "NMD_transcript_variant",
+    "non_coding_transcript_variant",
+    "upstream_gene_variant",
+    "downstream_gene_variant",
+    "TFBS_ablation",
+    "TFBS_amplification",
+    "TF_binding_site_variant",
+    "regulatory_region_ablation",
+    "regulatory_region_amplification",
+    "feature_elongation",
+    "regulatory_region_variant",
+    "feature_truncation",
     "intergenic_variant",
 ]
 _SEVERITY_RANK = {c: i for i, c in enumerate(_SEVERITY_ORDER)}
@@ -60,6 +133,7 @@ _SEVERITY_RANK = {c: i for i, c in enumerate(_SEVERITY_ORDER)}
 @dataclass
 class VEPVariantAnnotation:
     """Per-variant fields extracted from VEP output."""
+
     chrom: str = ""
     pos: int = 0
     ref: str = ""
@@ -78,6 +152,7 @@ class VEPVariantAnnotation:
 @dataclass
 class VEPAnnotationResult:
     """Result returned by VEPAnnotationStage.run()."""
+
     annotated_vcf_path: str = ""
     variants: List[VEPVariantAnnotation] = field(default_factory=list)
     variant_count: int = 0
@@ -135,26 +210,25 @@ class VEPAnnotationStage:
         cmd = self._build_vep_cmd(vep_bin, filtered_vcf_path, annotated_vcf)
         timeout = int(self._vep_cfg.get("timeout", 600))
 
+        # Routed through the shared _run() helper (not a direct
+        # subprocess.run) so a VEP annotation in progress -- which can run
+        # for minutes on a large VCF -- is reachable by DELETE the same way
+        # every other stage's subprocess is. See
+        # pipeline/utils/process_control.py.
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
+            _run(cmd, stage=_STAGE, timeout_seconds=timeout)
+        except FastqPipelineError as exc:
+            if "timed out" in exc.message:
+                raise FastqPipelineError(
+                    f"vep timed out after {timeout}s on {filtered_vcf_path}",
+                    stage=_STAGE,
+                    tool="vep",
+                ) from exc
             raise FastqPipelineError(
-                f"vep timed out after {timeout}s on {filtered_vcf_path}",
+                f"vep failed: {exc.message}",
                 stage=_STAGE,
                 tool="vep",
-            )
-
-        if proc.returncode != 0:
-            raise FastqPipelineError(
-                f"vep failed (exit {proc.returncode}).\nstderr: {proc.stderr.strip()[:2000]}",
-                stage=_STAGE,
-                tool="vep",
-            )
+            ) from exc
 
         variants = self._parse_vep_vcf(annotated_vcf)
         logger.info("[%s] VEP annotated %d variants", sample_id, len(variants))
@@ -169,23 +243,31 @@ class VEPAnnotationStage:
         """Construct the vep command line."""
         cmd = [
             vep_bin,
-            "--input_file", input_vcf,
-            "--output_file", output_vcf,
-            "--format", "vcf",
+            "--input_file",
+            input_vcf,
+            "--output_file",
+            output_vcf,
+            "--format",
+            "vcf",
             "--vcf",
             "--everything",
-            "--fork", "4",
+            "--fork",
+            "4",
             "--cache",
             "--offline",
             "--hgvs",
-            "--sift", "b",
-            "--polyphen", "b",
+            "--sift",
+            "b",
+            "--polyphen",
+            "b",
             "--af",
             "--af_gnomadg",
-            "--plugin", "CADD",
-            "--plugin", "REVEL",
-            "--plugin", "SpliceAI",
-            "--plugin", "AlphaMissense",
+            # SpliceAI REMOVED (licence): Ensembl VEP's official SpliceAI
+            # plugin wraps Illumina's own precomputed scores, GPL-3.0
+            # code / CC BY-NC 4.0 pretrained models as of Illumina's Dec
+            # 2023 relicense -- the same class of commercial-licence
+            # blocker as OMIM, and untenable for a commercial product.
+            # See LICENSE_AUDIT.md's "SpliceAI (Illumina)" row.
             "--no_stats",
             "--force_overwrite",
         ]
@@ -193,6 +275,31 @@ class VEPAnnotationStage:
         cache_dir = self._vep_cfg.get("cache_dir", "")
         if cache_dir:
             cmd += ["--dir_cache", str(cache_dir)]
+
+        dir_plugins = self._vep_cfg.get("dir_plugins", "")
+        if dir_plugins:
+            cmd += ["--dir_plugins", str(dir_plugins)]
+
+        # CADD, REVEL, and AlphaMissense all require a per-file data
+        # argument -- `--plugin CADD` with no data file is not a "use
+        # defaults" request, it's a VEP startup error. Request each plugin
+        # only when its data file is configured; otherwise omit it and let
+        # that score come back absent (cadd_phred/revel_score/
+        # am_pathogenicity are Optional[float], already tolerated as
+        # `is not None` checks by the ACMG classifier -- see
+        # docs/INSTALL_DEPENDENCIES.md's VEP section for how to obtain
+        # each data file).
+        cadd_data = self._vep_cfg.get("cadd_data", "")
+        if cadd_data:
+            cmd += ["--plugin", f"CADD,{cadd_data}"]
+
+        revel_data = self._vep_cfg.get("revel_data", "")
+        if revel_data:
+            cmd += ["--plugin", f"REVEL,{revel_data}"]
+
+        alphamissense_data = self._vep_cfg.get("alphamissense_data", "")
+        if alphamissense_data:
+            cmd += ["--plugin", f"AlphaMissense,file={alphamissense_data}"]
 
         fasta = self._vep_cfg.get("fasta", "")
         if fasta:
@@ -223,6 +330,7 @@ class VEPAnnotationStage:
                     fmt_part = ""
                     # Try to find "Format: ..." in the Description value
                     import re as _re
+
                     m = _re.search(r'Format:\s*([^"]+)', line)
                     if m:
                         fmt_part = m.group(1).strip().rstrip('">').strip()
@@ -315,12 +423,10 @@ class VEPAnnotationStage:
 
         ann.cadd_phred = _float(best_entry.get("CADD_PHRED", ""))
         ann.revel_score = _float(best_entry.get("REVEL", ""))
-        # SpliceAI_pred_DS_AG,DS_AL,DS_DG,DS_DL — take max delta score
-        spliceai_raw = best_entry.get("SpliceAI_pred", "") or best_entry.get("SpliceAI", "")
-        if spliceai_raw and spliceai_raw != ".":
-            parts = spliceai_raw.split("|") if "|" in spliceai_raw else [spliceai_raw]
-            scores = [_float(p) for p in parts if _float(p) is not None]
-            ann.spliceai_score = max(scores) if scores else None
+        # SpliceAI parsing REMOVED (licence) -- the plugin is no longer
+        # requested (see _build_vep_cmd), so this field would never be
+        # present in VEP's output anyway. ann.spliceai_score keeps its
+        # dataclass default of None.
         ann.am_pathogenicity = _float(
             best_entry.get("AM_PATHOGENICITY", "") or best_entry.get("am_pathogenicity", "")
         )

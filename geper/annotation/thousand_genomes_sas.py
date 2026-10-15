@@ -151,9 +151,13 @@ def _get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     if HEALTH.is_offline("Ensembl"):
         HEALTH.note_skip("Ensembl")
-        raise ExternalAPIError(
-            f"1000 Genomes SAS lookup via '{url}' skipped: Ensembl was confirmed offline at startup."
-        )
+        logger.warning(f"1000 Genomes SAS lookup via '{url}' skipped: Ensembl was confirmed offline at startup.")
+        # Round 23: the message actually raised (and, downstream, folded
+        # verbatim into `sas_error` and rendered into the clinical
+        # report -- see `report/clinical_report_builder.py::
+        # _indian_population_frequency`) must not embed `url`; full
+        # detail including the URL goes to the log line above only.
+        raise ExternalAPIError("Ensembl was confirmed offline at startup; 1000 Genomes SAS lookup skipped.")
 
     last_error: Optional[Exception] = None
     for attempt in range(1, CONFIG.thousand_genomes_sas.MAX_RETRIES + 1):
@@ -176,9 +180,12 @@ def _get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
             if attempt < CONFIG.thousand_genomes_sas.MAX_RETRIES:
                 time.sleep(CONFIG.thousand_genomes_sas.RETRY_BACKOFF_SECS * attempt)
     HEALTH.note_failure("Ensembl")
-    raise ExternalAPIError(
+    logger.warning(
         f"1000 Genomes SAS lookup via '{url}' failed after {CONFIG.thousand_genomes_sas.MAX_RETRIES} attempts: {last_error}"
     )
+    # Round 23: same rationale as the offline-skip branch above -- no
+    # url/last_error in what's raised, only in the log line above.
+    raise ExternalAPIError(f"Ensembl request failed after {CONFIG.thousand_genomes_sas.MAX_RETRIES} attempts")
 
 
 def _resolve_rsid(chrom: str, pos: int, ref: str, alt: str) -> Optional[str]:
@@ -195,8 +202,16 @@ def _resolve_rsid(chrom: str, pos: int, ref: str, alt: str) -> Optional[str]:
     indels whose anchor-base offset this simple check does not attempt
     to reconcile -- scoped to the common SNV case a fallback needs, not
     a full re-implementation of dbSNP's own allele normalization.
+
+    The mitochondrial contig needs its own case: Ensembl's REST API
+    wants 'MT', never bare 'M' (same convention already fixed for
+    `pipeline/ensembl/provider.py::_normalize_chrom` and
+    `pipeline/clingen/utils.py::_fetch_overlapping_genes` in round 14,
+    which this mirrors -- round 15 finding for this call site).
     """
     bare_chrom = chrom[3:] if chrom.lower().startswith("chr") else chrom
+    if bare_chrom.upper() in ("M", "MT"):
+        bare_chrom = "MT"
     url = f"{_rest_base()}/overlap/region/human/{bare_chrom}:{pos}-{pos}"
     try:
         candidates = _get(url, {"feature": "variation", "content-type": "application/json"})
@@ -309,18 +324,33 @@ class ThousandGenomesSASLookup:
             if not rsid:
                 rsid = _resolve_rsid(variant.chrom, variant.pos, variant.ref, variant.alt)
             if not rsid:
-                return {"skipped": False, "found": False, "rsid": None}
+                return {
+                    "skipped": False,
+                    "found": False,
+                    "rsid": None,
+                    "reason": "no dbSNP rsID could be resolved for this position/allele in Ensembl",
+                }
 
             frequencies = _fetch_population_frequencies(rsid, variant.alt)
         except ExternalAPIError as exc:
-            logger.warning(f"1000 Genomes SAS lookup failed for {variant.chrom}:{variant.pos}: {exc}")
-            return {"skipped": False, "found": False, "error": str(exc)}
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- fall back to the exception's type name
+            # rather than reporting a failure with nothing said about it.
+            detail = str(exc) or type(exc).__name__
+            logger.warning(f"1000 Genomes SAS lookup failed for {variant.chrom}:{variant.pos}: {detail}")
+            return {"skipped": False, "found": False, "error": detail, "reason": detail}
 
         pooled = frequencies.get(_POOLED_CODE)
         sub_populations = {code: frequencies[code] for code in _SUB_POPULATION_CODES if code in frequencies}
 
         if pooled is None and not sub_populations:
-            return {"skipped": False, "found": False, "rsid": rsid}
+            return {
+                "skipped": False,
+                "found": False,
+                "rsid": rsid,
+                "reason": f"rsID {rsid} resolved but has no 1000 Genomes SAS/sub-population "
+                "allele frequency recorded (monomorphic or unobserved in this cohort)",
+            }
 
         return {
             "skipped": False,

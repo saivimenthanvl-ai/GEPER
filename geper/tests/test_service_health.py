@@ -194,6 +194,222 @@ class TestRunStartupChecks(unittest.TestCase):
         self.assertTrue(self.registry.is_offline("Ensembl"))
 
 
+class TestRetryBeforeLatch(unittest.TestCase):
+    """
+    Regression tests for card `ensembl-health-probe-false-negative`:
+    a single failed/timed-out probe attempt must not be enough evidence
+    to latch a service Offline for the whole run -- only REPEATED
+    failure does. Motivating real-world incident: a genuine, successful
+    production Ensembl probe took 21931 ms (geper.log:11511, alongside
+    5 other real successful probes at 1432/1605/1777/2112/2699 ms) --
+    proof that "slow" and "down" are not the same thing, and that no
+    single-shot short timeout can tell them apart.
+
+    Written against `ServiceHealthRegistry`'s public, observable surface
+    (`run_startup_checks`, `is_offline`) rather than any private retry
+    helper -- valid regardless of exactly how many attempts the fix
+    uses or where the retry loop lives, per dispatch instructions. Uses
+    the real `CONFIG.health_check` (not the file's `_fake_config()`
+    mock) specifically so any new retry/backoff config field the fix
+    introduces gets a real, sensible value rather than an unconfigured
+    Mock -- these tests never go through `_http_probe`/`requests` at
+    all (the probe is a plain Python callable supplied directly), so
+    `CONFIG.health_check.TIMEOUT_SECS`'s actual value is irrelevant
+    here regardless.
+
+    `time.sleep` is patched to a no-op throughout: if the fix's retry
+    loop backs off between attempts (the scoping's own cost model
+    assumes ~0.5s x up to 3 attempts), these tests should not have to
+    pay that wall-clock cost to prove the *outcome* is correct.
+    """
+
+    def setUp(self):
+        self.registry = sh.ServiceHealthRegistry()
+
+    def test_single_failure_does_not_latch(self):
+        """One bad attempt (Timeout), then healthy -- must NOT end up
+        Offline. This is expected to fail against the pre-fix,
+        single-shot probe (which never gets a second attempt to
+        recover) and pass once retry-before-latch lands."""
+        calls = {"n": 0}
+
+        def probe():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return sh.ServiceStatus.OFFLINE, "Timeout"
+            return sh.ServiceStatus.HEALTHY, ""
+
+        with mock.patch("utils.service_health.time.sleep", return_value=None):
+            self.registry.run_startup_checks([sh.ServiceCheck("Ensembl", probe)])
+
+        self.assertFalse(self.registry.is_offline("Ensembl"))
+        self.assertGreaterEqual(calls["n"], 2, "expected at least one retry attempt after the initial failure")
+
+    def test_repeated_failures_do_latch(self):
+        """Every attempt fails -- must still end up Offline. This is
+        the test that proves the latch itself was not weakened or
+        removed by the fix, only the evidence required to trigger it."""
+        calls = {"n": 0}
+
+        def probe():
+            calls["n"] += 1
+            return sh.ServiceStatus.OFFLINE, "Timeout"
+
+        with mock.patch("utils.service_health.time.sleep", return_value=None):
+            self.registry.run_startup_checks([sh.ServiceCheck("Ensembl", probe)])
+
+        self.assertTrue(self.registry.is_offline("Ensembl"))
+        self.assertGreaterEqual(
+            calls["n"], 2, "expected the fix to actually attempt a retry, not just latch on attempt 1"
+        )
+
+    def test_slow_but_successful_probe_is_not_offline(self):
+        """A single attempt that succeeds -- however long it took --
+        must be Online, not Offline, independent of any timeout value
+        (the human explicitly deferred picking a timeout number:
+        'retry must carry the load, not the threshold'). Mirrors the
+        real 21931ms production probe (geper.log:11511): the probe
+        callable itself is the unit under test's only view of "how the
+        attempt went", and it reports success, so the actual duration
+        is irrelevant here and deliberately not simulated with a real
+        sleep (would just slow the suite down for no added coverage --
+        `record.latency_ms` genuinely reflects wall-clock time via
+        `time.perf_counter()`, this test only needs the classification
+        outcome, not to reproduce a specific number)."""
+
+        def probe():
+            return sh.ServiceStatus.HEALTHY, ""
+
+        with mock.patch("utils.service_health.time.sleep", return_value=None):
+            self.registry.run_startup_checks([sh.ServiceCheck("Ensembl", probe)])
+
+        self.assertFalse(self.registry.is_offline("Ensembl"))
+
+
+class TestMeasureLatchedServicesIsObservationOnly(unittest.TestCase):
+    """
+    Regression tests for `measure_latched_services()` (instrumentation
+    landed ahead of the bounded-reprobe feature itself, to produce the
+    log evidence the feature's N/T/cap need -- see that method's own
+    docstring). god's explicit instruction after reviewing the first
+    pass: 'Your current test passes whether or not the guarantee
+    holds, which is the same shape (green test, invalid assertion)
+    we've hit three times today [gnomAD sentinel, the LIMS review-
+    status gap, the caveat-parity proxies]. This directly asserts the
+    property.'
+
+    THE PROPERTY: `measure_latched_services()` is OBSERVATION ONLY --
+    it must not alter `startup_status`, `startup_detail`, `latency_ms`,
+    `skipped_count`, `failure_count`, or `success_count`, and must not
+    change `is_offline()`'s answer, regardless of what its own re-probe
+    finds. Asserted by snapshotting all six fields immediately before
+    calling it and comparing all six immediately after, on BOTH paths:
+
+    - the still-down path (cheap to get right -- nothing found, so
+      "don't touch state" costs nothing to satisfy accidentally)
+    - the recovery path (per god: 'where the service is reachable and
+      the code genuinely recovers it, the temptation to write is
+      highest -- that's the path that validates the guarantee'): the
+      internal re-probe genuinely succeeds, and a naive implementation
+      would be tempted to update `startup_status` to reflect what it
+      just learned. This method must resist that temptation completely
+      -- un-latching, if it ever happens, is the bounded-reprobe
+      feature's job, not this observation-only one's.
+
+    All six counters are seeded to distinct NON-ZERO values before the
+    snapshot (not left at their zero defaults) specifically so an
+    "unchanged" assertion is real evidence, not a coincidence of
+    nothing having been set yet.
+    """
+
+    def setUp(self):
+        self.registry = sh.ServiceHealthRegistry()
+
+    @staticmethod
+    def _controllable_probe():
+        """Fails OFFLINE until the test flips `state["healthy"] =
+        True` -- needed for the recovery-path test, where the same
+        probe must genuinely fail during startup (so the service
+        actually latches) and only later succeed when
+        measure_latched_services() re-invokes it."""
+        state = {"healthy": False}
+
+        def probe():
+            if state["healthy"]:
+                return sh.ServiceStatus.HEALTHY, ""
+            return sh.ServiceStatus.OFFLINE, "Timeout"
+
+        return probe, state
+
+    def _latch_with_seeded_counters(self, probe, name="Ensembl"):
+        with mock.patch("utils.service_health.time.sleep", return_value=None):
+            self.registry.run_startup_checks([sh.ServiceCheck(name, probe)])
+        self.assertTrue(self.registry.is_offline(name), "setup failed: service did not latch offline")
+        # Distinct non-zero values on every counter this method must
+        # leave untouched.
+        self.registry.note_skip(name)
+        self.registry.note_skip(name)
+        self.registry.note_skip(name)
+        self.registry.note_failure(name)
+        self.registry.note_success(name)
+        self.registry.note_success(name)
+
+    def _snapshot(self, name="Ensembl"):
+        record = self.registry._get(name)
+        return (
+            record.startup_status,
+            record.startup_detail,
+            record.latency_ms,
+            record.skipped_count,
+            record.failure_count,
+            record.success_count,
+        )
+
+    def test_still_down_path_changes_nothing(self):
+        """The re-probe genuinely fails again -- state must be
+        byte-identical before and after."""
+
+        def probe():
+            return sh.ServiceStatus.OFFLINE, "Timeout"
+
+        self._latch_with_seeded_counters(probe)
+        before = self._snapshot()
+
+        self.registry.measure_latched_services()
+
+        after = self._snapshot()
+        self.assertEqual(before, after, "measure_latched_services() must not alter any observable field")
+        self.assertTrue(self.registry.is_offline("Ensembl"))
+
+    def test_recovery_path_still_changes_nothing(self):
+        """THE PATH THAT VALIDATES THE GUARANTEE (god's own framing):
+        the re-probe genuinely succeeds this time -- a naive
+        implementation would be tempted to reflect that in
+        startup_status. It must not. This is observation-only
+        instrumentation, not the bounded-reprobe feature; un-latching
+        is explicitly not this method's job."""
+        probe, state = self._controllable_probe()
+        self._latch_with_seeded_counters(probe)  # genuinely fails during startup -> genuinely latches
+        before = self._snapshot()
+
+        state["healthy"] = True  # the service has now genuinely recovered
+        self.registry.measure_latched_services()
+
+        after = self._snapshot()
+        self.assertEqual(
+            before,
+            after,
+            "measure_latched_services() must not alter any observable field even when its own "
+            "re-probe finds the service genuinely healthy again -- writing state here is the "
+            "bounded-reprobe feature's job, not this observation-only method's",
+        )
+        self.assertTrue(
+            self.registry.is_offline("Ensembl"),
+            "a successful measurement re-probe must NOT un-latch the service -- that would make "
+            "this 'observation only' instrumentation silently behave like the real feature",
+        )
+
+
 class TestRuntimeTrackingAndSummary(unittest.TestCase):
     def setUp(self):
         self.registry = sh.ServiceHealthRegistry()

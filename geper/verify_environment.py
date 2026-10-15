@@ -1,4 +1,26 @@
 #!/usr/bin/env python3
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: GEPER environment / dependency checker
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 GEPER environment / dependency checker.
 
@@ -11,7 +33,10 @@ or `tensorflow`.
 Usage:
     python verify_environment.py
     python verify_environment.py --json          # machine-readable
-    python verify_environment.py --strict         # exit 1 on any FAIL
+
+Exit status: 1 if any check FAILs, else 0 (warnings alone exit 0). This is
+the default; `--strict`, which used to be required for it, is deprecated and
+has no effect.
 
 This script is READ-ONLY: it never installs, upgrades, or downgrades
 anything. `utils/auto_install.py` (used by the pipeline itself) is the
@@ -33,10 +58,11 @@ import os
 import platform
 import shutil
 import socket
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+from component_identity import COMPONENT_NAME, SHORT_NAME
 
 # --- version-compatibility ground truth ------------------------------------
 # Kept in exactly one place (here) and mirrored by the short summary in
@@ -48,8 +74,9 @@ EXPECTED = {
     "torch": "2.7.1",
     "torchvision": "0.22.1",
     "torchaudio": "2.7.1",
-    "transformers_min": "5.12.1",
-    "transformers_max_exclusive": "6.0.0",
+    # Exact, not a range: the version the shipped image runs (Dockerfile's
+    # last-wins pin; requirements.txt matches it -- human ruling 2026-09-11).
+    "transformers": "4.56.2",
     "accelerate_min": "1.14.0",
     "accelerate_max_exclusive": "2.0.0",
     "tensorflow_min": "2.16.0",
@@ -77,9 +104,7 @@ class Report:
         try:
             result = fn()
         except Exception as exc:  # noqa: BLE001 - a check itself must never crash the report
-            result = CheckResult(
-                name, "WARN", f"Check raised an unexpected error: {exc!r}", fix=None
-            )
+            result = CheckResult(name, "WARN", f"Check raised an unexpected error: {exc!r}", fix=None)
         self.results.append(result)
 
     def has_failures(self) -> bool:
@@ -125,32 +150,35 @@ def _is_importable(module_name: str) -> bool:
 # Individual checks
 # ---------------------------------------------------------------------------
 
+
 def check_python() -> CheckResult:
     current = sys.version_info[:2]
     lo, hi = EXPECTED["python_min"], EXPECTED["python_max_exclusive"]
     if lo <= current < hi:
         return CheckResult(
-            "Python", "PASS", f"Python {platform.python_version()} ({lo[0]}.{lo[1]}-{hi[0]}.{hi[1]-1} required)."
+            "Python", "PASS", f"Python {platform.python_version()} ({lo[0]}.{lo[1]}-{hi[0]}.{hi[1] - 1} required)."
         )
     return CheckResult(
         "Python",
         "FAIL",
-        f"Python {platform.python_version()} detected; GEPER requires "
+        f"Python {platform.python_version()} detected; {SHORT_NAME} requires "
         f"{lo[0]}.{lo[1]} <= python < {hi[0]}.{hi[1]} (evo2's own published "
         f"metadata is the binding constraint; torch/transformers/rna-fm "
         f"all separately accept a wider range).",
-        fix=f"Install Python {lo[0]}.{lo[1]} or {lo[0]}.{hi[1]-1} (e.g. via pyenv or "
-            f"a fresh Colab runtime) and re-create your virtualenv.",
+        fix=f"Install Python {lo[0]}.{lo[1]} or {lo[0]}.{hi[1] - 1} (e.g. via pyenv or "
+        f"a fresh Colab runtime) and re-create your virtualenv.",
     )
 
 
 def check_torch() -> CheckResult:
     if not _is_importable("torch"):
         return CheckResult(
-            "torch", "FAIL", "torch is not installed.",
+            "torch",
+            "FAIL",
+            "torch is not installed.",
             fix=f"pip install torch=={EXPECTED['torch']} "
-                f"(CUDA build: pip install torch=={EXPECTED['torch']} "
-                f"--index-url https://download.pytorch.org/whl/cu128)",
+            f"(CUDA build: pip install torch=={EXPECTED['torch']} "
+            f"--index-url https://download.pytorch.org/whl/cu128)",
         )
     import torch  # noqa: WPS433 - intentional lazy import, only after existence check
 
@@ -160,7 +188,7 @@ def check_torch() -> CheckResult:
     else:
         status = "WARN"
         detail = (
-            f"torch {torch.__version__} detected; GEPER is pinned/tested against "
+            f"torch {torch.__version__} detected; {SHORT_NAME} is pinned/tested against "
             f"exactly {EXPECTED['torch']} because Evo2's flash-attn dependency is "
             f"compiled from source against a specific torch+CUDA ABI. A different "
             f"torch version may still work for HyenaDNA/RNA-FM/ESM2/"
@@ -168,7 +196,9 @@ def check_torch() -> CheckResult:
             f"unverified."
         )
     return CheckResult(
-        "torch", status, detail,
+        "torch",
+        status,
+        detail,
         fix=None if status == "PASS" else f"pip install torch=={EXPECTED['torch']} --force-reinstall",
     )
 
@@ -176,7 +206,8 @@ def check_torch() -> CheckResult:
 def check_torchvision() -> CheckResult:
     if not _is_importable("torchvision"):
         return CheckResult(
-            "torchvision", "WARN",
+            "torchvision",
+            "WARN",
             "torchvision is not installed. Only required for HyenaDNA's "
             "StochasticDepth; RNA-FM/ESM2/AlphaMissense/MMSplice do not need it.",
             fix=f"pip install torchvision=={EXPECTED['torchvision']}",
@@ -186,8 +217,9 @@ def check_torchvision() -> CheckResult:
     if torchvision.__version__.split("+")[0] == EXPECTED["torchvision"]:
         return CheckResult("torchvision", "PASS", f"torchvision {torchvision.__version__} detected.")
     return CheckResult(
-        "torchvision", "WARN",
-        f"torchvision {torchvision.__version__} detected; GEPER pins "
+        "torchvision",
+        "WARN",
+        f"torchvision {torchvision.__version__} detected; {SHORT_NAME} pins "
         f"{EXPECTED['torchvision']} (PyTorch's own compatibility matrix pairing "
         f"for torch {EXPECTED['torch']}). A mismatched torch/torchvision pair is "
         f"the single most common cause of a cryptic 'undefined symbol' import "
@@ -213,8 +245,9 @@ def check_torchaudio() -> CheckResult:
     """
     if not _is_importable("torchaudio"):
         return CheckResult(
-            "torchaudio", "WARN",
-            "torchaudio is not installed. GEPER itself never imports it, but leaving "
+            "torchaudio",
+            "WARN",
+            f"torchaudio is not installed. {SHORT_NAME} itself never imports it, but leaving "
             "it absent/unpinned in a shared environment (e.g. Colab, which ships its "
             "own pre-installed torchaudio build) is exactly how a mismatched version "
             "gets pulled in later and crashes an unrelated import "
@@ -226,8 +259,9 @@ def check_torchaudio() -> CheckResult:
     if torchaudio.__version__.split("+")[0] == EXPECTED["torchaudio"]:
         return CheckResult("torchaudio", "PASS", f"torchaudio {torchaudio.__version__} detected.")
     return CheckResult(
-        "torchaudio", "FAIL",
-        f"torchaudio {torchaudio.__version__} detected; GEPER pins "
+        "torchaudio",
+        "FAIL",
+        f"torchaudio {torchaudio.__version__} detected; {SHORT_NAME} pins "
         f"{EXPECTED['torchaudio']} (PyTorch's own compatibility matrix pairing for "
         f"torch {EXPECTED['torch']}). A mismatched torch/torchaudio pair fails with "
         f"`OSError: undefined symbol: torch_library_impl` the moment torchaudio is "
@@ -241,25 +275,31 @@ def check_torchaudio() -> CheckResult:
 def check_transformers() -> CheckResult:
     if not _is_importable("transformers"):
         return CheckResult(
-            "transformers", "FAIL", "transformers is not installed.",
-            fix=f"pip install 'transformers>={EXPECTED['transformers_min']},<{EXPECTED['transformers_max_exclusive']}'",
+            "transformers",
+            "FAIL",
+            "transformers is not installed.",
+            fix=f"pip install transformers=={EXPECTED['transformers']}",
         )
     import transformers  # noqa: WPS433
 
-    if _in_range(transformers.__version__, EXPECTED["transformers_min"], EXPECTED["transformers_max_exclusive"]):
+    if transformers.__version__.split("+")[0] == EXPECTED["transformers"]:
         return CheckResult("transformers", "PASS", f"transformers {transformers.__version__} detected.")
     return CheckResult(
-        "transformers", "FAIL",
-        f"transformers {transformers.__version__} detected; GEPER requires "
-        f">={EXPECTED['transformers_min']},<{EXPECTED['transformers_max_exclusive']}.",
-        fix=f"pip install 'transformers>={EXPECTED['transformers_min']},<{EXPECTED['transformers_max_exclusive']}'",
+        "transformers",
+        "FAIL",
+        f"transformers {transformers.__version__} detected; {SHORT_NAME} pins "
+        f"{EXPECTED['transformers']} -- the version the shipped image runs "
+        f"(see requirements.txt for why).",
+        fix=f"pip install transformers=={EXPECTED['transformers']}",
     )
 
 
 def check_accelerate() -> CheckResult:
     if not _is_importable("accelerate"):
         return CheckResult(
-            "accelerate", "FAIL", "accelerate is not installed.",
+            "accelerate",
+            "FAIL",
+            "accelerate is not installed.",
             fix=f"pip install 'accelerate>={EXPECTED['accelerate_min']},<{EXPECTED['accelerate_max_exclusive']}'",
         )
     import accelerate  # noqa: WPS433
@@ -267,8 +307,9 @@ def check_accelerate() -> CheckResult:
     if _in_range(accelerate.__version__, EXPECTED["accelerate_min"], EXPECTED["accelerate_max_exclusive"]):
         return CheckResult("accelerate", "PASS", f"accelerate {accelerate.__version__} detected.")
     return CheckResult(
-        "accelerate", "WARN",
-        f"accelerate {accelerate.__version__} detected; GEPER requires "
+        "accelerate",
+        "WARN",
+        f"accelerate {accelerate.__version__} detected; {SHORT_NAME} requires "
         f">={EXPECTED['accelerate_min']},<{EXPECTED['accelerate_max_exclusive']}.",
         fix=f"pip install 'accelerate>={EXPECTED['accelerate_min']},<{EXPECTED['accelerate_max_exclusive']}'",
     )
@@ -277,7 +318,8 @@ def check_accelerate() -> CheckResult:
 def check_tensorflow() -> CheckResult:
     if not _is_importable("tensorflow"):
         return CheckResult(
-            "tensorflow", "WARN",
+            "tensorflow",
+            "WARN",
             "tensorflow is not installed; MMSplice (Keras-based) will be "
             "unavailable and skipped gracefully. Every other model is unaffected.",
             fix=f"pip install 'tensorflow>={EXPECTED['tensorflow_min']},<{EXPECTED['tensorflow_max_exclusive']}'",
@@ -287,8 +329,9 @@ def check_tensorflow() -> CheckResult:
     if _in_range(tf.__version__, EXPECTED["tensorflow_min"], EXPECTED["tensorflow_max_exclusive"]):
         return CheckResult("tensorflow", "PASS", f"tensorflow {tf.__version__} detected.")
     return CheckResult(
-        "tensorflow", "WARN",
-        f"tensorflow {tf.__version__} detected; GEPER requires "
+        "tensorflow",
+        "WARN",
+        f"tensorflow {tf.__version__} detected; {SHORT_NAME} requires "
         f">={EXPECTED['tensorflow_min']},<{EXPECTED['tensorflow_max_exclusive']}.",
         fix=f"pip install 'tensorflow>={EXPECTED['tensorflow_min']},<{EXPECTED['tensorflow_max_exclusive']}'",
     )
@@ -304,12 +347,14 @@ def check_mmsplice_availability() -> CheckResult:
     """
     if not _is_importable("tensorflow"):
         return CheckResult(
-            "MMSplice prerequisites", "WARN",
+            "MMSplice prerequisites",
+            "WARN",
             "tensorflow missing -> MMSplice cannot run (see 'tensorflow' check above).",
         )
     installed = _is_importable("mmsplice")
     return CheckResult(
-        "MMSplice prerequisites", "PASS",
+        "MMSplice prerequisites",
+        "PASS",
         f"tensorflow available; `mmsplice` package "
         f"{'already present' if installed else 'not yet installed (will be auto-provisioned --no-deps on first use)'}.",
     )
@@ -322,20 +367,22 @@ def check_cuda_gpu() -> CheckResult:
 
     if not torch.cuda.is_available():
         return CheckResult(
-            "CUDA / GPU", "WARN",
+            "CUDA / GPU",
+            "WARN",
             "No CUDA GPU detected. CPU fallback works for HyenaDNA/"
             "RNA-FM/ESM2/AlphaMissense/MMSplice (slower); Evo2 has no practical "
             "CPU path and is skipped entirely.",
         )
     name = torch.cuda.get_device_name(0)
     cap = torch.cuda.get_device_capability(0)
-    mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     min_cap = EXPECTED["cuda_min_compute_capability"]
     detail = f"GPU '{name}' detected, compute capability {cap[0]}.{cap[1]}, {mem_gb:.1f} GB VRAM."
     if cap >= min_cap:
         return CheckResult("CUDA / GPU", "PASS", detail)
     return CheckResult(
-        "CUDA / GPU", "WARN",
+        "CUDA / GPU",
+        "WARN",
         detail + f" This is below compute capability {min_cap[0]}.{min_cap[1]}, so "
         f"Evo2/flash-attn is unavailable here (this is expected and by design on "
         f"e.g. Tesla T4 -- see EVO2_T4_HARDWARE_FINDINGS.md; Evo2 is intentionally "
@@ -361,13 +408,15 @@ def check_internet() -> CheckResult:
         return CheckResult("Internet connectivity", "PASS", f"Reached: {', '.join(reachable)}.")
     if reachable:
         return CheckResult(
-            "Internet connectivity", "WARN",
+            "Internet connectivity",
+            "WARN",
             f"Reached {reachable}, could not reach {unreachable}. Model downloads "
             f"and/or ClinVar/dbSNP/Ensembl/gnomAD lookups touching an unreachable "
             f"host will fail gracefully (logged per-variant) rather than crash the run.",
         )
     return CheckResult(
-        "Internet connectivity", "WARN",
+        "Internet connectivity",
+        "WARN",
         f"Could not reach any of {[h for h, _ in hosts]}. First-run model downloads "
         f"will fail; ClinVar/dbSNP/Ensembl/gnomAD (GraphQL fallback) lookups will "
         f"all fail gracefully per-variant. AI-only, fully-offline runs with "
@@ -402,12 +451,14 @@ def check_blast() -> CheckResult:
 
     if not missing:
         return CheckResult(
-            "BLAST+ (blastn/makeblastdb/blastdbcmd)", "PASS",
+            "BLAST+ (blastn/makeblastdb/blastdbcmd)",
+            "PASS",
             f"All local BLAST+ command line tools found -- {version_lines}.",
         )
     if found:
         return CheckResult(
-            "BLAST+ (blastn/makeblastdb/blastdbcmd)", "WARN",
+            "BLAST+ (blastn/makeblastdb/blastdbcmd)",
+            "WARN",
             f"Found: {version_lines}. Missing from PATH: {', '.join(missing)}. "
             "Local BLAST features requiring a missing tool are unavailable "
             "(e.g. no blastn means no local search; no makeblastdb means no "
@@ -416,7 +467,8 @@ def check_blast() -> CheckResult:
             fix="apt-get install ncbi-blast+  (or: conda install -c bioconda blast)",
         )
     return CheckResult(
-        "BLAST+ (blastn/makeblastdb/blastdbcmd)", "WARN",
+        "BLAST+ (blastn/makeblastdb/blastdbcmd)",
+        "WARN",
         "No local BLAST+ command line tools found on PATH. Remote NCBI "
         "BLAST is used instead (slower, subject to NCBI's shared queue) "
         "unless GEPER_AI_ONLY=true, or BLAST is skipped gracefully if "
@@ -443,7 +495,8 @@ def check_blast_database() -> CheckResult:
 
     if configured_mode not in ("auto", "local", "remote"):
         return CheckResult(
-            "BLAST database / mode", "WARN",
+            "BLAST database / mode",
+            "WARN",
             f"GEPER_BLAST_MODE='{configured_mode}' is not one of "
             "auto/local/remote; BLASTClient will reject this at "
             "construction time.",
@@ -468,7 +521,8 @@ def check_blast_database() -> CheckResult:
     resolved = BLASTClient._resolve_auto_mode(db_path)
     if has_db:
         return CheckResult(
-            "BLAST database / mode", "PASS",
+            "BLAST database / mode",
+            "PASS",
             f"GEPER_BLAST_MODE='{configured_mode}'; local database detected "
             f"at '{db_path}' (auto-resolution -> '{resolved}').",
         )
@@ -485,11 +539,15 @@ def check_blast_database() -> CheckResult:
         return CheckResult("BLAST database / mode", "PASS", detail)
     status = "WARN" if configured_mode in ("auto", "local") else "PASS"
     return CheckResult(
-        "BLAST database / mode", status, detail,
+        "BLAST database / mode",
+        status,
+        detail,
         fix=(
             "Point GEPER_BLAST_DATABASE at an existing makeblastdb database, "
             "or set GEPER_BLAST_REFERENCE_FASTA to auto-build one."
-        ) if status == "WARN" else None,
+        )
+        if status == "WARN"
+        else None,
     )
 
 
@@ -498,10 +556,11 @@ def check_tabix() -> CheckResult:
     if binary:
         return CheckResult("tabix (htslib)", "PASS", f"Found tabix at '{binary}'.")
     return CheckResult(
-        "tabix (htslib)", "WARN",
+        "tabix (htslib)",
+        "WARN",
         "No 'tabix' binary on PATH. AlphaMissense and any locally-indexed "
         "gnomAD catalogue lookups are unavailable and will be skipped gracefully "
-        "until this is installed (GEPER auto-installs it via apt-get on Debian/"
+        f"until this is installed ({SHORT_NAME} auto-installs it via apt-get on Debian/"
         "Ubuntu the first time it's needed).",
         fix="apt-get install tabix  (or: conda install -c bioconda htslib)",
     )
@@ -525,7 +584,7 @@ def check_ram() -> CheckResult:
 
 def check_disk() -> CheckResult:
     usage = shutil.disk_usage(os.getcwd())
-    free_gb = usage.free / (1024 ** 3)
+    free_gb = usage.free / (1024**3)
     status = "PASS" if free_gb >= 15 else "WARN"
     detail = f"{free_gb:.1f} GB free on the filesystem containing {os.getcwd()}."
     if status == "WARN":
@@ -569,8 +628,9 @@ def check_installed_models() -> CheckResult:
 
     if not failed:
         return CheckResult(
-            "Model module imports", "PASS",
-            f"All 6 model wrapper modules import cleanly: {', '.join(ok)}. "
+            "Model module imports",
+            "PASS",
+            f"All {len(module_map)} model wrapper modules import cleanly: {', '.join(ok)}. "
             f"(Import success only -- see note on live load/inference verification.)",
         )
     detail = f"OK: {', '.join(ok) or 'none'}. Failed to import: " + "; ".join(
@@ -735,7 +795,7 @@ def run_all() -> Report:
 
 def print_human(report: Report) -> None:
     print("=" * 78)
-    print("GEPER Environment Verification")
+    print(f"{COMPONENT_NAME} Environment Verification")
     print("=" * 78)
     for r in report.results:
         icon = _STATUS_ICON.get(r.status, "?")
@@ -750,16 +810,32 @@ def print_human(report: Report) -> None:
     n_pass = sum(1 for r in report.results if r.status == "PASS")
     print(f"Summary: {n_pass} passed, {n_warn} warnings, {n_fail} failures.")
     if n_fail:
-        print("One or more required dependencies are missing or incompatible. "
-              "See the '-> Fix' lines above.")
+        print("One or more required dependencies are missing or incompatible. See the '-> Fix' lines above.")
     else:
-        print("No blocking issues detected. Warnings (if any) describe optional "
-              "features that will be skipped gracefully, not blocking failures.")
+        print(
+            "No blocking issues detected. Warnings (if any) describe optional "
+            "features that will be skipped gracefully, not blocking failures."
+        )
     print("=" * 78)
 
 
 def main() -> int:
-    strict = "--strict" in sys.argv
+    """Exit 1 when the verdict is FAIL, 0 otherwise (PASS, or WARN/SKIP only).
+
+    By default -- not only under --strict. Until 2026-09-12 this returned 0
+    on `overall: FAIL` unless --strict was passed, so anything gating on the
+    exit code was told a failing environment was fine. Human: "a check whose
+    failure exits success is a check nothing can act on."
+
+    --strict is RETIRED: still accepted, so existing commands keep working,
+    but it changes nothing (FAIL already exits 1) and says so on stderr. A
+    caller that deliberately wants the report without the gate must now say
+    so itself (e.g. `|| true`), where a reader can see it.
+    """
+    if "--strict" in sys.argv:
+        sys.stderr.write(
+            "verify_environment.py: --strict is deprecated and has no effect: a FAIL verdict now exits 1 by default.\n"
+        )
     as_json = "--json" in sys.argv
 
     report = run_all()
@@ -769,9 +845,7 @@ def main() -> int:
     else:
         print_human(report)
 
-    if strict and report.has_failures():
-        return 1
-    return 0
+    return 1 if report.has_failures() else 0
 
 
 if __name__ == "__main__":

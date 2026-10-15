@@ -1,4 +1,4 @@
-# GEPER Integrated Pipeline — Kim (FASTQ Engine) + Current GEPER (VCF Interpretation Engine)
+# Bij AI Integrated Pipeline — sequencing-analysis component (Kim) + variant-interpretation component (GEPER)
 
 This is **not a repository merge**. It is a bridge between two independent,
 unmodified-in-purpose projects:
@@ -14,17 +14,21 @@ Kim Pipeline                         (kim_pipeline/)
 filtered_variants.vcf
   │
   ▼
-Current GEPER                        (geper/)
+Variant-interpretation component (GEPER)   (geper/)
   Annotation → AI Models → Databases → Interpretation Engine → Clinical Report
 ```
+
+"Clinical Report" here denotes a draft classification: no output is clinically
+actionable before mandatory qualified human review and final sign-off (see
+`geper/review/signoff.py`).
 
 ## Directory layout
 
 ```
 geper_integrated/
-├── geper/            Project A — current GEPER. UNCHANGED. Remains the sole,
+├── geper/            Project A — the Bij AI variant-interpretation component (GEPER). UNCHANGED. Remains the sole,
 │                     authoritative implementation for Annotation, AI Models
-│                     (DNABERT-2, HyenaDNA, RNA-FM, ESM2, AlphaMissense, Evo 2,
+│                     (HyenaDNA, RNA-FM, ESM2, AlphaMissense, Evo 2,
 │                     MMSplice), ClinVar, dbSNP, gnomAD, ClinGen, UniProt,
 │                     InterPro, Pfam, AlphaFold DB, BLAST+, ACMG automation,
 │                     confidence engine, variant prioritization, conflict
@@ -93,7 +97,7 @@ python main.py analyze --r1 R1.fastq.gz --ref GRCh38.fasta \
 # -> ./work/sample01/filtered_variants.vcf, Kim's own annotation/report skipped
 ```
 
-### 3. Run GEPER directly against an existing VCF (unchanged)
+### 3. Run the variant-interpretation component (GEPER) directly against an existing VCF (unchanged)
 ```bash
 cd geper
 python main.py --vcf existing.vcf --output-dir ./geper_output
@@ -139,10 +143,17 @@ python bridge/run_combined.py \
 |---|---|
 | GEPER annotation / AI models / databases / ACMG / report generation | **Unchanged** |
 | Kim FASTQ validation / QC / alignment / variant calling | **Unchanged** |
-| Kim's own annotation / ACMG / AI / PGx / ancestry / reporting stages | **Unchanged**, simply not invoked in the combined workflow |
+| Kim's own annotation / ACMG / AI / ancestry / reporting stages | **Unchanged**, simply not invoked in the combined workflow |
 | Kim `PipelineRunner.run()` | **+2 optional params**: `mode` (default `"full"`), `stop_after` (default `None`) |
 | Kim `main.py analyze` / `run_pipeline.py` CLI | **+2 optional flags**: `--mode`, `--stop-after` |
 | New `bridge/` package | **New**, zero duplication of either project's logic |
+
+**[CORRECTED 2026-09-10 (angela-mszpsmyw): the "Kim's own annotation / ACMG / AI / ancestry
+/ reporting stages" row above originally also listed "PGx" among Kim's own stages.
+`kim_pipeline/pipeline/pgx/` was deleted 2026-09-10 (merge `51320e1`, the human's ruling to
+remove pharmacogenomics from the clinical report and delete the computation) -- there is no
+PGx stage left to describe as "unchanged, simply not invoked." Removed from the row rather
+than left describing something that no longer exists.]**
 
 No duplicate interpretation ever occurs: Kim's annotation/ACMG/AI/reporting
 code paths are structurally unreachable once `mode="vcf_only"` triggers the

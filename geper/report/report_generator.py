@@ -6,13 +6,40 @@ for a researcher or clinician to skim, with embeddings and other raw
 numeric payloads deliberately summarized (not dumped) for readability.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from annotation.thousand_genomes_sas import DIASPORA_DISCLOSURE, SAMPLE_SIZE_DISCLOSURE
-from report.clinical_report_builder import EVIDENCE_COMPLETENESS_CAPTION
+from component_identity import SHORT_NAME
+from report.clinical_report_builder import (
+    candidate_interpretation_of,
+    _QC_METRIC_LABELS,
+    _QC_METRIC_ORDER,
+    _QC_METRIC_UNITS,
+    _parse_qc_metrics,
+    _qc_status,
+    _qc_threshold_pass_min,
+    ACMG_METHODOLOGY_STATEMENT,
+    EVIDENCE_COMPLETENESS_CAPTION,
+    ISO_RESEARCH_ELEMENT,
+    RESEARCH_USE_DISCLAIMER,
+    _consent_value_label,
+    _offline_sources_caveat_text,
+    _variant_hgvs_or_locus,
+    _variant_reviewer_flags,
+    variant_allele_fraction_text,
+    DATA_ATTRIBUTION_HEADING,
+    EVIDENCE_SOURCES_USED_HEADING,
+    NO_EVIDENCE_SOURCES_TEXT,
+    reference_blocks,
+    report_revision_banners,
+)
 from utils.logger import get_logger
 from utils.timezone_utils import format_ist_from_iso
+from pipeline.acmg_rules import mtdna_interpretation_disclaimer
+from pipeline.hgvs_utils import is_mitochondrial_chrom
 from pipeline.models.status import DISABLED, FAILED, SKIPPED, USED, render_status_table_lines
+from pipeline.provenance import RETRIEVAL_MODE_LABELS
+from pipeline.stage_schemas import StageStatus as _StageStatus
 
 logger = get_logger(__name__)
 
@@ -64,14 +91,171 @@ def _render_1000_genomes_sas_markdown(ipf: Dict[str, Any]) -> List[str]:
     return lines
 
 
-_DISCLAIMER = (
-    "> **Disclaimer:** GEPER is a research pipeline. Outputs are generated "
-    "by pretrained machine learning models and public database lookups and "
-    "are **not** a substitute for professional clinical genetic "
-    "interpretation, diagnosis, or advice. All findings should be reviewed "
-    "and confirmed by a qualified clinical geneticist or genetic counselor "
-    "before any medical decision is made."
+# Markdown presentation only -- the claim itself lives in
+# Design ruling 2026-09-03: ISO statement is now a separate element.
+# Each renderer composes the two pieces independently, eliminating per-renderer
+# transformations that had no enforcement. This is the same fix as the shared-function
+# ruling: one definition, consumers that cannot diverge.
+_DISCLAIMER = f"> **Disclaimer:** {RESEARCH_USE_DISCLAIMER}\n>\n> {ISO_RESEARCH_ELEMENT}"
+
+# Governance control (round 30 part 2): a one-line review-status banner,
+# sourced from `geper_results.json`'s own `review_status` field (see
+# `report/json_builder.py`) so Markdown never has to independently
+# decide draft/reviewed/overridden -- it just reports whatever
+# `review/signoff.py::approve()`/`override()` already wrote there.
+#
+# Deliberately NOT a second formal signature surface (that decision is
+# explicit for this round): no name/registration-number/hospital
+# fields, no visual sign-off block matching
+# `report/summary.py::_build_signoff_block`'s PDF-only two-role table.
+# The "reviewed"/"overridden" banners below say so explicitly ("see the
+# signed PDF report...") precisely so this banner is never mistaken for
+# carrying the same legal weight the PDF's footer/sign-off block does.
+_REVIEW_STATUS_DRAFT_BANNER = "> **DRAFT — NOT FOR PATIENT USE — AWAITING CLINICAL REVIEW**"
+_REVIEW_STATUS_REVIEWED_BANNER_TEMPLATE = (
+    "> **REVIEWED** by {reviewed_by} on {reviewed_at}. This banner is informational only -- see the signed "
+    "PDF report for the formal clinical sign-off."
 )
+_REVIEW_STATUS_OVERRIDDEN_BANNER = (
+    "> **OVERRIDDEN — NOT FOR PATIENT USE — AWAITING CLINICAL REVIEW.** A clinician has applied a "
+    "classification override to at least one finding in this run since it was last reviewed; a fresh "
+    "sign-off is required before this run is ready for use. See the signed PDF report and the audit log "
+    "for details."
+)
+
+
+def _render_review_status_banner(json_document: Dict[str, Any]) -> str:
+    """
+    One-line review-status banner text for `json_document`, sourced
+    from its `review_status` field. Any value other than the two
+    non-draft states this pipeline actually writes -- `"reviewed"` /
+    `"overridden"` (see `review/signoff.py`) -- including `"draft"`
+    itself, a missing key (any pre-round-30 file), `None`, or an
+    unrecognized string, renders as the DRAFT banner: the same
+    fail-toward-the-less-trusting-claim discipline
+    `JSONResultBuilder.run_complete`'s own docstring already
+    establishes for exactly this reason -- a report nobody has actually
+    signed off on must never look reviewed/overridden just because a
+    field is absent or unexpected.
+    """
+    status = json_document.get("review_status")
+    if status == "reviewed":
+        return _REVIEW_STATUS_REVIEWED_BANNER_TEMPLATE.format(
+            reviewed_by=json_document.get("reviewed_by") or "an unrecorded reviewer",
+            reviewed_at=json_document.get("reviewed_at") or "an unrecorded time",
+        )
+    if status == "overridden":
+        return _REVIEW_STATUS_OVERRIDDEN_BANNER
+    return _REVIEW_STATUS_DRAFT_BANNER
+
+
+def _render_qc_metrics(json_document: Dict[str, Any]) -> List[str]:
+    """
+    Run-level sequencing/alignment QC (A7 fix).
+
+    This section did not exist. QC only ever reached the PDF, as a
+    `generate_pdf(qc_metrics=...)` argument, so this renderer had nothing
+    to read and printed nothing -- not even an omission note. In a report
+    where "no QC section" is indistinguishable from "this run had no QC",
+    that silence is the defect: the full PDF showed a real coverage/Q30
+    table for the same run this file rendered blank.
+
+    Now QC lives on the document (`json_document["qc_metrics"]`), so both
+    renderers describe the same run from the same source. The labels,
+    units, thresholds and PASS/WARNING rule come from
+    `report/clinical_report_builder.py` rather than being restated here,
+    so the two tables cannot drift into disagreeing about what "PASS"
+    means.
+
+    The honest-absence contract is preserved exactly as the PDF states
+    it: a run with no `--qc-metrics-json` renders every metric as "Not
+    applicable" and prints the per-metric reasons, which say GEPER never
+    observed an upstream sequencing step -- a positive true statement,
+    not a gap to apologise for. `_parse_qc_metrics(None)` produces that
+    default, so this function never has to decide what missing means.
+    """
+    qc_metrics = _parse_qc_metrics((json_document or {}).get("qc_metrics"))
+
+    lines: List[str] = ["## Run Quality Control", ""]
+    lines.append("| Metric | Value | Threshold | Status |")
+    lines.append("| --- | --- | --- | --- |")
+
+    not_run_entries: List[Any] = []
+    error_entries: List[Any] = []
+
+    for key in _QC_METRIC_ORDER:
+        label = _QC_METRIC_LABELS[key]
+        unit = _QC_METRIC_UNITS[key]
+        threshold = _qc_threshold_pass_min(key)
+        entry = qc_metrics.get(key) or {}
+        status = entry.get("status")
+        value = entry.get("value")
+
+        if status == _StageStatus.FOUND.value and isinstance(value, (int, float)) and not isinstance(value, bool):
+            pass_status = _qc_status(key, value)
+            lines.append(f"| {label} | {value:g}{unit} | {threshold:g}{unit} | {pass_status} |")
+        elif status == _StageStatus.ERROR.value:
+            error_entries.append((label, entry))
+            lines.append(f"| {label} | Measurement failed | {threshold:g}{unit} | ERROR |")
+        else:
+            # Same collapse the PDF makes: NOT_RUN and anything that failed
+            # validation render identically, because `_parse_qc_metrics` has
+            # already turned malformed input into a validated status.
+            not_run_entries.append((label, entry))
+            lines.append(f"| {label} | Not applicable | {threshold:g}{unit} | N/A |")
+
+    lines.append("")
+
+    # Reasons are grouped by the exact reason string rather than by a fixed
+    # enum, for the reason the PDF states: callers pass their own reason
+    # through verbatim, so the set is open-ended.
+    for heading, entries in (("Not applicable this run", not_run_entries), ("Measurement failed", error_entries)):
+        if not entries:
+            continue
+        grouped: Dict[str, List[str]] = {}
+        for label, entry in entries:
+            reason = entry.get("reason") or "No reason recorded."
+            grouped.setdefault(reason, []).append(label)
+        clauses = "; ".join(f"{', '.join(labels)} -- {reason}" for reason, labels in grouped.items())
+        lines.append(f"*{heading}: {clauses}*")
+        lines.append("")
+
+    return lines
+
+
+def _render_consent_line(json_document: Dict[str, Any]) -> Optional[str]:
+    """
+    One-line DPDP Act 2023 consent statement, or `None` when no consent
+    object was supplied.
+
+    Returns `None` rather than a "Not stated" line in that case, matching
+    `report/summary.py::_consent_rows`' contract exactly: a run with no
+    consent data at all must not manufacture the appearance of a
+    compliance record. Within a consent object that WAS supplied, an
+    individual unset permission still renders honestly as "Not stated"
+    (via the shared `_consent_value_label`) -- absent-object and
+    absent-field are different facts and stay different here.
+    """
+    consent = json_document.get("patient_consent")
+    if not consent:
+        return None
+    parts = [
+        f"Clinical reporting: {_consent_value_label(consent.get('clinical_reporting'))}",
+        f"Research use: {_consent_value_label(consent.get('research'))}",
+    ]
+    timestamp = consent.get("timestamp")
+    if timestamp:
+        parts.append(f"Recorded: {timestamp}")
+    # Statutory citation removed pending counsel (human ruling, 2026-09-10):
+    # an unsourced legal claim inside a generated clinical report reads as
+    # verified because of where it sits. The consent VALUES below are this
+    # module's own recorded data and stay; only the Act name is withheld
+    # until counsel confirms it. Restore verbatim if confirmed -- the exact
+    # removed string is `"**Data processing consent (DPDP Act 2023):** "`.
+    return "**Data processing consent:** " + " · ".join(parts)
+
+
+from report.summary import SCOPE_LINE  # noqa: E402 -- one source of truth for the scope line
 
 
 class ReportGenerator:
@@ -79,22 +263,76 @@ class ReportGenerator:
 
     def generate(self, json_document: Dict[str, Any]) -> str:
         lines: List[str] = []
-        lines.append("# GEPER Variant Analysis Report")
+        lines.append(f"# {SHORT_NAME} Variant Analysis Report")
         lines.append("")
+        lines.append(_render_review_status_banner(json_document))
+        # WHAT THIS REPORT IS -- the same line the PDF renderers carry, from the
+        # same constant, so the three surfaces cannot drift. It sits AFTER the
+        # review-status banner deliberately: that banner is the most
+        # safety-critical line in the document and several governance tests
+        # read it by position, so nothing may be inserted above it.
+        lines.append("")
+        lines.append(f"*{SCOPE_LINE}*")
+        lines.append("")
+        # Revision traceability (amended / superseded / re-analysis): above
+        # every finding, below the line-3 review-status banner, which must
+        # stay where governance tests read it. None of the four states ->
+        # nothing printed. See `clinical_report_builder.report_revision_banners`.
+        for banner in report_revision_banners(json_document):
+            lines.append(f"> {banner}")
+            lines.append("")
         # Displayed in IST (report is for Indian hospitals); the
         # stored `generated_at` itself stays UTC (see
         # report/json_builder.py) -- only this human-facing line
         # converts it. See utils/timezone_utils.py.
         lines.append(f"**Generated:** {format_ist_from_iso(json_document.get('generated_at'))}")
         lines.append(f"**Input VCF:** `{json_document.get('input_vcf')}`")
+        # The build every coordinate in this report was resolved
+        # against. The full PDF has always printed it (summary.py's
+        # "Genome Reference Build" row and "Reference build:" line) and
+        # this surface did not, so the same report disclosed its build
+        # in one format and withheld it in another. Same wording and
+        # same "Not specified" fallback as the PDF, so the two cannot
+        # drift into saying different things.
+        # `assembly_note` fills the slot only when a run legitimately has no
+        # build (card #15, all-mitochondrial) -- it says the check was skipped
+        # and why, where "Not specified" would say nothing.
+        lines.append(
+            "**Genome reference build:** "
+            f"{json_document.get('assembly') or json_document.get('assembly_note') or 'Not specified'}"
+        )
         lines.append(f"**Variants analyzed:** {json_document.get('variant_count')}")
+        consent_line = _render_consent_line(json_document)
+        if consent_line:
+            lines.append(consent_line)
         lines.append("")
         lines.append(_DISCLAIMER)
+        lines.append("")
+        # Run-level caveats live together, immediately below the
+        # disclaimer that is itself one of them -- a reader who needs to
+        # know what qualifies this whole run finds all of it in one
+        # place, before any finding. The per-variant sections below
+        # carry their own caveats and are unaffected.
+        lines.append(f"*{ACMG_METHODOLOGY_STATEMENT}*")
         lines.append("")
         lines.append("---")
         lines.append("")
 
+        lines.extend(self._render_reviewer_attention(json_document))
+        lines.append("---")
+        lines.append("")
+
         lines.extend(self._render_provenance(json_document))
+        lines.append("---")
+        lines.append("")
+
+        lines.extend(self._render_data_freshness_warnings(json_document))
+        lines.append("---")
+        lines.append("")
+
+        # Run-level, like provenance above: describes the whole run rather
+        # than one finding, so it belongs before the per-variant sections.
+        lines.extend(_render_qc_metrics(json_document))
         lines.append("---")
         lines.append("")
 
@@ -119,6 +357,51 @@ class ReportGenerator:
         return output_path
 
     @staticmethod
+    def _render_reviewer_attention(json_document: Dict[str, Any]) -> List[str]:
+        """
+        Run-level triage: the short list of things a reviewer should look
+        at before sign-off, mirroring the full PDF's own "Reviewer
+        Attention" section (`report/summary.py`) so the two reports flag
+        the same findings for the same reasons.
+
+        Two sources, both shared rather than reimplemented here:
+        per-finding flags from `_variant_reviewer_flags` (evidence
+        conflicts, ambiguous gene resolution, findings with no clinical
+        interpretation at all), and the run-level offline-sources caveat
+        from `_offline_sources_caveat_text` -- which matters most of all,
+        because a source that was never queried must never be mistaken
+        for one queried and found empty.
+
+        Always renders, including when nothing is flagged: "nothing to
+        review" is a finding a reviewer needs stated, not an absence they
+        should have to infer from a missing section.
+
+        Narrower than the PDF's version in one respect: that one also
+        lists data sources whose version could not be pinned down
+        (`report/summary.py::_provenance_gap_sources`). That helper and
+        the constant it reads were left in the PDF renderer as out of
+        scope for this change, so they are not reflected here yet.
+        """
+        lines = ["## Reviewer Attention", ""]
+        attention: List[str] = []
+        for idx, variant_result in enumerate(json_document.get("variants", []), start=1):
+            flags = _variant_reviewer_flags(variant_result, candidate_interpretation_of(variant_result))
+            if flags:
+                v = variant_result.get("variant") or {}
+                locus = f"{v.get('chrom')}:{v.get('pos')} {v.get('ref')}>{v.get('alt')}"
+                attention.append(f"Finding {idx} ({locus}): {'; '.join(flags)}")
+        offline_caveat = _offline_sources_caveat_text(json_document)
+        if offline_caveat:
+            attention.append(offline_caveat)
+
+        if attention:
+            lines.extend(f"- **!** {item}" for item in attention)
+        else:
+            lines.append("*No conflicts, ambiguous gene resolution, or unreachable data sources flagged for this run.*")
+        lines.append("")
+        return lines
+
+    @staticmethod
     def _render_provenance(json_document: Dict[str, Any]) -> List[str]:
         """
         Data-source version pinning / run provenance (pipeline/provenance.py)
@@ -141,12 +424,29 @@ class ReportGenerator:
             "the exact data-source versions and code version below are what to match.*"
         )
         lines.append("")
-        lines.append(f"- **GEPER code version:** `{json_document.get('code_version') or 'unknown'}`")
+        lines.append(f"- **{SHORT_NAME} code version:** `{json_document.get('code_version') or 'unknown'}`")
         lines.append("")
 
         checkpoints = json_document.get("model_checkpoints") or {}
         lines.append("**AI model checkpoints:**")
         lines.append("")
+        # Round 17: `run_complete` is `False` (its honest default, and
+        # what an absent key -- any pre-round-17 file -- also reads as
+        # via `bool(...)`, never a bare `.get(..., True)`) for a
+        # geper_results.json left behind by a run that died mid-loop.
+        # Every checkpoint below is then still the bare config
+        # identifier `pipeline/provenance.py::get_model_checkpoint_
+        # identifiers` set at startup -- correct data, but rendering it
+        # with no caveat reads as "this model's status is unremarkable",
+        # not "unknown", which is the actual honest claim
+        # (ROUND_CANDIDATES.md, round 12).
+        if not bool(json_document.get("run_complete")):
+            lines.append(
+                "_This run did not complete (no post-loop status enrichment was recorded) -- the "
+                "identifiers below are configuration only. Whether each model actually ran, failed to "
+                "load, or was skipped this run is not yet known._"
+            )
+            lines.append("")
         if checkpoints:
             for name, value in sorted(checkpoints.items()):
                 # `value` is either the enriched
@@ -187,6 +487,15 @@ class ReportGenerator:
             status = record.get("status", "unknown")
             label = status_labels.get(status, status)
             lines.append(f"- **{record.get('source')}:** {label}")
+            # A SECOND, independent axis: where this run's data actually
+            # came from. Absent (None) for every source whose retrieval
+            # mode is not tracked -- rendered as nothing at all rather
+            # than as an implied "live", since claiming a source was
+            # contacted when nobody checked is the failure this line
+            # exists to fix.
+            retrieval = record.get("retrieval")
+            if retrieval:
+                lines.append(f"  - Retrieval: {RETRIEVAL_MODE_LABELS.get(retrieval, retrieval)}")
             if record.get("version"):
                 lines.append(f"  - Version: {record['version']}")
             if record.get("release_date"):
@@ -201,6 +510,48 @@ class ReportGenerator:
                 lines.append(f"  - Endpoint: {record['endpoint']}")
             if record.get("notes"):
                 lines.append(f"  - _{record['notes']}_")
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _render_data_freshness_warnings(json_document: Dict[str, Any]) -> List[str]:
+        """
+        Packaging Part 3 mechanism: surfaces every stale-cache fallback
+        this run hit (`pipeline/provenance.py::record_stale_fallback`,
+        called from the seven bootstrap modules' "Using stale cached
+        ... after a failed refresh" branches). Run-level, next to
+        `_render_provenance` above, for the same reason: it describes
+        the whole run, not one finding.
+
+        The standing rule this section exists to satisfy: a warning
+        nobody sees is not a warning, and for THIS finding that bar is
+        higher than a log level -- the reader needs to know an
+        interpretation was built on a snapshot from a DATE, not just
+        that a stale-cache event happened. `recorded_at` is therefore
+        always rendered, never dropped for brevity.
+        """
+        lines = ["## Data Freshness Warnings", ""]
+        warnings = json_document.get("data_freshness_warnings") or []
+        if not warnings:
+            lines.append(
+                "*No data-source cache fell back to a stale copy this run -- every "
+                "auto-fetched dataset this run consulted was either fresh or not consulted at all.*"
+            )
+            lines.append("")
+            return lines
+
+        lines.append(
+            "*The following data source(s) could not be refreshed this run and this report "
+            "was built using an existing, possibly-outdated local copy instead. This matters most for "
+            "sources that can REVISE a past conclusion (e.g. ClinVar reclassification) -- a stale copy "
+            "of those can make an interpretation actively wrong, not just incomplete.*"
+        )
+        lines.append("")
+        for warning in warnings:
+            lines.append(f"- **{warning.get('source')}:** stale cache used ({warning.get('reason')})")
+            lines.append(f"  - Recorded stale at (UTC): {warning.get('recorded_at')}")
+            if warning.get("path"):
+                lines.append(f"  - Cache file: `{warning['path']}`")
         lines.append("")
         return lines
 
@@ -220,7 +571,7 @@ class ReportGenerator:
         Deliberately NOT titled/framed as ACMG or clinical evidence:
         this table is a reviewer-triage aid only (which variant to
         read first), never a classification signal -- the explicit
-        callout below says so, and `## Clinical Interpretation Report`
+        callout below says so, and `## Candidate Interpretation`
         (per-variant, further down) is completely unaffected by
         anything here.
         """
@@ -244,7 +595,7 @@ class ReportGenerator:
             "phenotype profile matches the patient's observed symptoms, combined with each "
             "variant's existing priority score. This is a SEPARATE, additive signal: it never "
             "influences ACMG classification, PP4, confidence, or priority score below -- see "
-            'each variant\'s own "Clinical Interpretation Report" section for those.*'
+            'each variant\'s own "Candidate Interpretation" section for those.*'
         )
         lines.append("")
         lines.append("| Case Rank | Finding | Variant / Gene | Case Score | Phenotype Match | Why |")
@@ -287,31 +638,69 @@ class ReportGenerator:
         variant = result.get("variant", {})
         lines: List[str] = []
 
+        # Card T3-F4: the coordinate string is retained (it is the
+        # precise identifier) and HGVS is added alongside it (the
+        # identifier clinicians actually use, and the one the short PDF
+        # heading is built from -- see `summary_short.py::
+        # _build_variant_block`) via the same shared fallback helper
+        # both PDFs and the short PDF now call, so all three degrade the
+        # same way when neither hgvs_c nor hgvs_g is available (the
+        # helper falls back to the locus itself in that case, so the
+        # parenthetical below will then literally repeat the coordinate
+        # string just shown -- an accepted, intentional consequence of
+        # one shared fallback rather than a fourth, renderer-specific
+        # special case).
         header = (
             f"## Variant {idx}: {variant.get('chrom')}:{variant.get('pos')} {variant.get('ref')}>{variant.get('alt')}"
+            f" ({_variant_hgvs_or_locus(result)})"
         )
         lines.append(header)
         lines.append("")
         lines.append(f"- **Type:** {variant.get('variant_type')}")
         lines.append(f"- **VCF ID:** {variant.get('id') or 'n/a'}")
         lines.append(f"- **Filter status:** {variant.get('filter') or 'n/a'}")
+        # Within-sample read support (NABL 112A s.7.8.5(b)(iii)) -- NOT the
+        # gnomAD population allele frequency shown under Population
+        # Evidence, which is a different quantity that shares the name.
+        # Rendered through the shared helper (not the `or 'n/a'` idiom the
+        # three lines above use) because this value is a float: `0.0 or
+        # 'n/a'` would print a genuine 0% allele fraction as "n/a", and an
+        # absence and a real zero are exactly what must stay apart here.
+        lines.append(f"- **Allele fraction (this sample):** {variant_allele_fraction_text(result)}")
         lines.append("")
+
+        # Round 14, B2: per-finding, not report-level -- a reviewer reads
+        # findings, not preambles, and a chrM finding with a
+        # classification looks complete to anyone who skipped the header.
+        # Placed first, before any criteria/classification content.
+        if is_mitochondrial_chrom(variant.get("chrom")):
+            # Round 16: `not_evaluated_rules` (this finding's real
+            # per-criterion breakdown) is passed so the disclaimer's
+            # counts derive from the same data as the executive-summary
+            # accounting / Limitations text below -- see
+            # `mtdna_interpretation_disclaimer`'s own docstring for why
+            # the two surfaces used to be able to contradict each other.
+            not_evaluated_rules = (result.get("interpretation_result") or {}).get("not_evaluated_rules", [])
+            lines.append(f"> **{mtdna_interpretation_disclaimer(result.get('transcript'), not_evaluated_rules)}**")
+            lines.append("")
 
         out_of_scope = result.get("out_of_scope")
         if out_of_scope:
-            # Report review round 8: a chrM variant never entered any
-            # evidence-source stage or the ACMG engine at all (see
-            # `pipeline/orchestrator.py::GeperPipeline
-            # ._mitochondrial_out_of_scope_result`) -- rendering the
-            # normal Annotation Detail / audit-trail sections below
-            # would show a wall of "not found"/"skipped" boilerplate
-            # that reads as "checked, nothing there" when the honest
-            # statement is "never checked, by design". This is a
-            # distinct status, not a Variant of Uncertain Significance
-            # and not a stage failure.
+            # Generic "never assessed at all" rendering: rendering the
+            # normal Annotation Detail / audit-trail sections below for a
+            # variant this run genuinely never attempted would show a wall
+            # of "not found"/"skipped" boilerplate that reads as "checked,
+            # nothing there" when the honest statement is "never checked,
+            # by design". This is a distinct status, not a Variant of
+            # Uncertain Significance and not a stage failure. No current
+            # producer as of round 14, B2 (which replaced the
+            # mitochondrial compartment's whole-variant rejection with
+            # per-criterion gating -- see `pipeline/acmg_rules.py`) --
+            # kept as reusable infrastructure for a future genuinely-
+            # unassessable variant class.
             lines.append(f"**Status:** Out of scope ({out_of_scope.get('scope', 'unspecified')})")
             lines.append("")
-            lines.append(out_of_scope.get("reason") or "This variant is out of scope for this GEPER build.")
+            lines.append(out_of_scope.get("reason") or f"This variant is out of scope for this {SHORT_NAME} build.")
             lines.append("")
             lines.append(
                 "*No ACMG/AMP criteria were evaluated for this variant. This is not a Variant of "
@@ -322,7 +711,9 @@ class ReportGenerator:
 
         lines.extend(self._render_ai_model_status(result.get("ai_model_status", {})))
 
-        lines.extend(self._render_clinical_report(result.get("clinical_report"), result.get("interpretation", {})))
+        lines.extend(
+            self._render_clinical_report(candidate_interpretation_of(result), result.get("interpretation", {}))
+        )
 
         lines.append("### Annotation Detail (Audit Trail)")
         lines.append("")
@@ -371,14 +762,14 @@ class ReportGenerator:
         """
         if not clinical_report:
             return [
-                "## Clinical Interpretation Report",
+                "## Candidate Interpretation (requires clinician review)",
                 "",
-                "*Clinical report unavailable for this variant (interpretation aggregation did not "
+                "*Candidate interpretation unavailable for this variant (interpretation aggregation did not "
                 "complete). See Annotation Detail below for whatever raw stage output is available.*",
                 "",
             ]
 
-        lines = ["## Clinical Interpretation Report", ""]
+        lines = ["## Candidate Interpretation (requires clinician review)", ""]
 
         lines.append("### 1. Executive Summary")
         lines.append("")
@@ -390,6 +781,23 @@ class ReportGenerator:
         lines.append("")
         lines.append(f"**Classification:** {acmg.get('classification') or 'Not classified'}")
         lines.append("")
+        # Report review round 10: the real Tavtigian point total next
+        # to the classification it actually decided, with the
+        # threshold band it landed in -- see `pipeline/acmg_rules.py::
+        # CombineResult`'s docstring for why this was previously
+        # discarded. `None` only for BA1's stand-alone-benign
+        # short-circuit (no point tally ran) or an unclassified
+        # variant -- neither fabricates a number.
+        net_points = acmg.get("net_points")
+        if net_points is not None:
+            band = acmg.get("net_points_band")
+            band_text = f" -- threshold band: {band}" if band else ""
+            lines.append(
+                f"**Net points (Tavtigian 2018):** {net_points:g} "
+                f"(pathogenic {acmg.get('pathogenic_points', 0):g} − benign {acmg.get('benign_points', 0):g})"
+                f"{band_text}"
+            )
+            lines.append("")
         # Clinician override (geper/review/signoff.py's "override" command)
         # -- layered on top of, never substituting for, GEPER's own
         # classification above: both are shown, explicitly labelled,
@@ -558,7 +966,20 @@ class ReportGenerator:
         model_errors = ai.get("model_errors") or []
         if votes:
             for v in votes:
-                lines.append(f"- **{v.get('source')}:** {v.get('prediction')} (score={v.get('score')})")
+                source = v.get("source")
+                line = f"- **{source}:** {v.get('prediction')} (score={v.get('score')})"
+                # Same caveat wording `acmg_rules.py::_pp3_bp4` established,
+                # appended to this vote's own bullet rather than a separate
+                # line -- each bullet here is a self-contained per-model
+                # claim (MMSplice's bullet needs no AlphaMissense caveat),
+                # so the caveat has to travel with the specific bullet it
+                # qualifies, not sit once at the section level.
+                if source == "AlphaMissense":
+                    line += (
+                        " -- not clinically validated; not approved for clinical use. This is a raw model "
+                        "score, not a validated clinical pathogenicity measure."
+                    )
+                lines.append(line)
         elif not model_errors:
             lines.append("*No classifying AI model (AlphaMissense/MMSplice) produced a result.*")
         # `model_errors` is reported alongside `votes`, not only in its
@@ -589,6 +1010,8 @@ class ReportGenerator:
             lines.append(
                 f"- **UniProt:** _lookup failed (external service issue: {prot['uniprot_error']}) -- not evidence of a missing entry, see Annotation Detail below._"
             )
+        elif prot.get("uniprot_reason"):
+            lines.append(f"- **UniProt:** {prot['uniprot_reason']}")
         else:
             lines.append("- **UniProt:** no entry resolved.")
         if prot.get("interpro_available"):
@@ -612,6 +1035,8 @@ class ReportGenerator:
             lines.append(
                 f"- **InterPro/Pfam:** _lookup failed (external service issue: {prot['interpro_error']}) -- not evidence of an absent domain, see Annotation Detail below._"
             )
+        elif prot.get("interpro_reason"):
+            lines.append(f"- **InterPro/Pfam:** {prot['interpro_reason']}")
         else:
             lines.append("- **InterPro/Pfam:** no annotation available.")
         lines.append("")
@@ -623,17 +1048,36 @@ class ReportGenerator:
             band_label = (
                 f"at residue {struct.get('protein_position')} (transcript-verified)"
                 if struct.get("confidence_band_is_residue_specific")
-                else "whole-protein mean (variant residue position unknown)"
+                # `mapping_unavailable_reason` is the mapping gate's own
+                # specific verdict (mapping_gate.py names six distinct
+                # reasons) -- "variant residue position unknown" is only
+                # accurate for one of them, so it is now a fallback for
+                # the reason being absent, not the default explanation.
+                else f"whole-protein mean ({struct.get('mapping_unavailable_reason') or 'variant residue position unknown'})"
             )
             lines.append(
                 f"- **AlphaFold DB:** confidence band '{struct.get('confidence_band') or 'n/a'}' {band_label} (model {struct.get('model_version') or 'n/a'})"
             )
             if struct.get("pdb_url"):
                 lines.append(f"  - Structure: {struct['pdb_url']}")
-        elif struct.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4):
+        # `elif struct.get("error"):` missed an empty-but-present
+        # error, falling through to the "reason"/generic-negative
+        # branches below -- a confirmed negative, same class as this
+        # module's other provider-status branches. `struct["error"]` is
+        # `clinical_report_builder.py::_structural_knowledge`'s direct
+        # passthrough of `alphafold_result["error"]`, confirmed by
+        # reading that function -- the same field Batch 1 already fixed
+        # at the producer (orchestrator.py's AlphaFold stage /
+        # alphafold/provider.py). Safe today for that reason; fixed
+        # here anyway so the class cannot reopen if that producer
+        # regresses.
+        elif struct.get("error") is not None:
             lines.append(
                 f"*AlphaFold DB lookup failed (external service issue: {struct['error']}) -- not evidence of an unresolved structure, see Annotation Detail below.*"
             )
+        elif struct.get("reason"):
+            lines.append(f"*{struct['reason']}*")
         else:
             lines.append("*No AlphaFold DB structure resolved for this protein.*")
         lines.append("")
@@ -642,21 +1086,54 @@ class ReportGenerator:
         lines.append("### 10. Population Evidence")
         lines.append("")
         g = pop["gnomad"]
-        if g["queried"]:
+        if g.get("skip_reason"):
+            lines.append(f"- **gnomAD:** {g['skip_reason']}")
+        elif g.get("error") is not None:
+            # A genuine crash, not "gnomAD was never asked" -- see this
+            # section's own producer, `_population_evidence`, for why this
+            # branch exists (2026-09-11 fix: the field used to be dropped
+            # entirely, and both cases rendered as the generic "lookup
+            # unavailable" line below).
+            lines.append(
+                f"- **gnomAD:** _lookup failed (external service issue: {g['error']}) -- not evidence "
+                "of an absent variant, see Annotation Detail below._"
+            )
+        elif g["queried"]:
             lines.append(
                 f"- **gnomAD:** {'found, AF=' + str(g['global_af']) if g['found'] else 'variant not found (absent from gnomAD)'}"
             )
         else:
             lines.append("- **gnomAD:** lookup unavailable for this variant.")
         d = pop["dbsnp"]
-        lines.append(f"- **dbSNP:** {'catalogued as ' + d['rsid'] if d['found'] else 'not found'}")
+        if d.get("skip_reason"):
+            lines.append(f"- **dbSNP:** {d['skip_reason']}")
+        elif d.get("error") is not None:
+            # Same distinction and same fix as gnomAD above.
+            lines.append(
+                f"- **dbSNP:** _lookup failed (external service issue: {d['error']}) -- not evidence "
+                "of no dbSNP record, see Annotation Detail below._"
+            )
+        elif d["queried"]:
+            lines.append(f"- **dbSNP:** {'catalogued as ' + d['rsid'] if d['found'] else 'not found'}")
+        else:
+            lines.append("- **dbSNP:** lookup unavailable for this variant.")
         lines.append("")
 
         ipf = clinical_report.get("indian_population_frequency") or {}
         lines.append("### 11. Indian Population Frequency")
         lines.append("")
         gnomad_sas_af = ipf.get("gnomad_af_sas")
-        if ipf.get("gnomad_sas_queried"):
+        if ipf.get("gnomad_sas_error") is not None:
+            # Same distinction and same fix as Section 10's gnomAD line
+            # above -- this reads the identical gnomAD stage result for
+            # its South Asian subpopulation figure and had the same
+            # collapse (2026-09-11 fix).
+            lines.append(
+                f"- **gnomAD (South Asian, SAS):** _lookup failed (external service issue: "
+                f"{ipf['gnomad_sas_error']}) -- not evidence of no South Asian subpopulation data, "
+                "see Annotation Detail below._"
+            )
+        elif ipf.get("gnomad_sas_queried"):
             lines.append(
                 f"- **gnomAD (South Asian, SAS):** {'AF=' + str(gnomad_sas_af) if gnomad_sas_af is not None else 'no South Asian subpopulation data for this variant'}"
             )
@@ -664,9 +1141,16 @@ class ReportGenerator:
             lines.append("- **gnomAD (South Asian, SAS):** lookup unavailable for this variant.")
         if ipf.get("sas_shown"):
             lines.extend(_render_1000_genomes_sas_markdown(ipf))
-        threshold_pct = f"{ipf.get('common_af_threshold', 0.01):.0%}"
+        # Ruling #18 (2026-09-11): the number only when recorded; `:g` so a
+        # recorded 0.5% is not rounded to a "0%"/"1%" the pipeline never used.
+        recorded_threshold = ipf.get("common_af_threshold")
+        threshold_text = (
+            f"the {recorded_threshold * 100:g}% threshold"
+            if recorded_threshold is not None
+            else "the pipeline's configured threshold"
+        )
         if ipf.get("common_in_indian_population"):
-            lines.append(f"- **⚠ Common in Indian populations** (at or above the {threshold_pct} threshold).")
+            lines.append(f"- **⚠ Common in Indian populations** (at or above {threshold_text}).")
         lines.append("")
 
         clin = clinical_report["clinical_evidence"]
@@ -707,12 +1191,18 @@ class ReportGenerator:
         lines.append("")
         lines.append(f"- **Context models used:** {', '.join(seq.get('context_models_used') or []) or 'none'}")
         blast_error = seq["blast"].get("error")
-        if blast_error:
+        if blast_error is not None:
             lines.append(
                 f"- **BLAST:** _lookup failed ({blast_error}) -- not evidence of no homology, see Annotation Detail below._"
             )
+        elif seq["blast"].get("skipped"):
+            lines.append(
+                f"- **BLAST:** _not run for this variant ({seq['blast'].get('reason') or 'no reason recorded'}) -- not evidence of no homology._"
+            )
+        elif seq["blast"].get("hit_count") is None:
+            lines.append("- **BLAST:** _hit count not recorded -- not evidence of no homology._")
         else:
-            lines.append(f"- **BLAST:** {seq['blast'].get('hit_count', 0)} homology hit(s)")
+            lines.append(f"- **BLAST:** {seq['blast']['hit_count']} homology hit(s)")
         lines.append(f"- *{seq.get('ensembl_note')}*")
         lines.append("")
 
@@ -732,14 +1222,23 @@ class ReportGenerator:
             lines.append(f"- {lim}")
         lines.append("")
 
-        lines.append("### 16. References")
+        # Ruling (A), 2026-09-11: two blocks, two different claims -- what
+        # this run used (gated), then the fixed licence notices. Was a single
+        # "### 16. References" list mixing both.
+        evidence_refs, attribution = reference_blocks(clinical_report)
+        lines.append(f"### 16. {EVIDENCE_SOURCES_USED_HEADING}")
         lines.append("")
-        refs = clinical_report.get("references") or []
-        if refs:
-            for r in refs:
+        if evidence_refs:
+            for r in evidence_refs:
                 lines.append(f"- {r}")
         else:
-            lines.append("*No evidence sources contributed to this variant's interpretation.*")
+            lines.append(f"*{NO_EVIDENCE_SOURCES_TEXT}*")
+        lines.append("")
+
+        lines.append(f"### {DATA_ATTRIBUTION_HEADING}")
+        lines.append("")
+        for r in attribution:
+            lines.append(f"- {r}")
         lines.append("")
 
         lines.append("### 17. Evidence Sources")
@@ -875,6 +1374,20 @@ class ReportGenerator:
         if ir.get("acmg_classification"):
             lines.append(f"**ACMG Classification:** {ir['acmg_classification']}")
             lines.append("")
+        # Interpretation-outcome state (human ruling, 2026-09-09/10):
+        # rendered ALONGSIDE the ACMG classification above, never in
+        # place of it. See `pipeline/interpretation_outcome.py`.
+        if ir.get("interpretation_outcome"):
+            lines.append(f"**Interpretation Outcome:** {ir['interpretation_outcome']}")
+            lines.append("")
+        # Round 2 (RULED, 2026-09-09/10): review_required can fire for a
+        # genuine evidence disagreement, a Pathogenic/Likely Pathogenic
+        # call, or both -- named here so neither is silently lost behind
+        # the single "review_required" string above.
+        review_required_reasons = ir.get("review_required_reasons") or []
+        if review_required_reasons:
+            lines.append(f"**Review Required Because:** {', '.join(review_required_reasons)}")
+            lines.append("")
         if not ir.get("confidence_pending", True):
             lines.append(f"**Evidence Completeness:** {ir.get('confidence_score')}% ({ir.get('confidence_label')})")
             breakdown = (ir.get("confidence_breakdown") or {}).get("category_breakdown", [])
@@ -939,6 +1452,10 @@ class ReportGenerator:
             )
             lines.append("")
             return lines
+        if dbsnp and dbsnp.get("error") is not None:
+            lines.append(f"- **Status:** query failed ({dbsnp['error']})")
+            lines.append("")
+            return lines
         if not dbsnp or not dbsnp.get("found"):
             lines.append("_No dbSNP record found._")
             lines.append("")
@@ -962,7 +1479,14 @@ class ReportGenerator:
         # audit-trail listing can never again be read as "here are up
         # to 3 records about this variant" when some of them aren't.
         lines = ["### ClinVar", ""]
-        if clinvar and clinvar.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4):
+        # `if clinvar and clinvar.get("error"):` missed an empty-but-
+        # present error, falling through to whatever "no record found"
+        # text follows -- a confirmed negative. Safe today because
+        # orchestrator.py's ClinVar stage was already fixed pre-session
+        # (8df8b9f) to never emit an empty string; fixed here anyway so
+        # the class cannot reopen if that producer regresses.
+        if clinvar and clinvar.get("error") is not None:
             lines.append(
                 f"_Failed: {clinvar['error']} -- not evidence ClinVar has no record, see the AI Model Status/Stage Warnings above._"
             )
@@ -1016,7 +1540,14 @@ class ReportGenerator:
         if not rna_result:
             return []
         lines = ["### RNA-FM Analysis", ""]
-        if rna_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): `if
+        # rna_result.get("error"):` missed an empty-but-present error,
+        # falling through to a "skipped" reading -- a confirmed
+        # negative. Safe today because _run_rna_stage's producer was
+        # already fixed in Batch 2 to never emit an empty string; fixed
+        # here anyway so the class cannot reopen if that producer
+        # regresses.
+        if rna_result.get("error") is not None:
             # A genuine crash, not a normal "not transcript-relevant"
             # skip -- distinguished via the `error` key
             # `pipeline/orchestrator.py::_run_rna_stage` now sets only
@@ -1039,7 +1570,11 @@ class ReportGenerator:
         if not protein_result:
             return []
         lines = ["### Protein / ESM-2 Analysis", ""]
-        if protein_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): same
+        # defect and same fix as `_render_rna` above -- safe today
+        # because _run_protein_stage's producer was already fixed in
+        # Batch 2, fixed here anyway for the same reason.
+        if protein_result.get("error") is not None:
             # Same distinction as `_render_rna` -- see that method's comment.
             lines.append(
                 f"_Failed: {protein_result['error']} -- not evidence ESM-2 was inapplicable, see the AI Model Status table above._"
@@ -1067,7 +1602,11 @@ class ReportGenerator:
         if not am_result:
             return []
         lines = ["### AlphaMissense", ""]
-        if am_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): same
+        # defect and same fix as `_render_rna` above -- safe today
+        # because _run_alphamissense_stage's producer was already fixed
+        # in Batch 2, fixed here anyway for the same reason.
+        if am_result.get("error") is not None:
             # Same distinction as `_render_rna` -- see that method's comment.
             lines.append(
                 f"_Failed: {am_result['error']} -- not evidence this variant lacks a catalogue entry, see the AI Model Status table above._"
@@ -1094,6 +1633,17 @@ class ReportGenerator:
         lines.append(f"- **UniProt ID:** {am_result.get('uniprot_id', 'n/a')}")
         lines.append(f"- **Genome build:** {am_result.get('genome', 'n/a')}")
         lines.append("")
+        # Same caveat wording `acmg_rules.py::_pp3_bp4` established, as a
+        # trailing italic note rather than a bullet -- this block renders
+        # the raw stage result directly (not an ACMG evidence sentence),
+        # so there is no existing sentence to fold the caveat into; a
+        # standalone note matches this method's own convention for
+        # meta-commentary (see the Failed/Skipped/No-entry branches above).
+        lines.append(
+            "_AlphaMissense is not clinically validated and not approved for clinical use. This is a raw "
+            "model score, not a validated clinical pathogenicity measure._"
+        )
+        lines.append("")
         return lines
 
     @staticmethod
@@ -1101,7 +1651,15 @@ class ReportGenerator:
         if not mmsplice_result:
             return []
         lines = ["### MMSplice (Splice Effect Prediction)", ""]
-        if mmsplice_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): this
+        # is the site that closes Phase 1's "MMSplice untraced" open
+        # item -- `if mmsplice_result.get("error"):` missed an empty-
+        # but-present error, falling through to MMSplice's "not scored"
+        # text, a confirmed negative same class as BLAST's own already-
+        # fixed defect. Safe today because _run_mmsplice_stage's
+        # producer was already fixed in Batch 2, fixed here anyway so
+        # the class cannot reopen if that producer regresses.
+        if mmsplice_result.get("error") is not None:
             # Same distinction as `_render_rna` -- see that method's
             # comment. Checked first: MMSplice's own "not scored"/
             # "skipped" branches below both key off `supported`/
@@ -1177,22 +1735,40 @@ class ReportGenerator:
         labeled summary lines. `ensemble_result` is always the clean,
         already-sanitized dict `pipeline.models.ensemble.
         EnsembleManager.evaluate` returns (see that module) -- never a
-        raw exception or traceback, so nothing here needs its own
-        try/except: there is no technical error text this function
-        could accidentally leak into a clinical report.
+        raw exception or traceback reaching this function directly.
 
         The section is hidden entirely (returns an empty list, adding
-        no heading at all) whenever no ensemble evidence exists for
-        this variant -- either because `ensemble_result` itself is
-        empty/missing, or because it exists but no model actually ran
-        (`models_used` is empty, e.g. both Enformer and Borzoi were
-        disabled/unavailable). This mirrors exactly what
-        `report/json_builder.py::build_variant_result` does: the
+        no heading at all) only when no ensemble evidence exists AND no
+        model genuinely crashed -- `ensemble_result` itself empty/
+        missing, or `models_used` empty because both Enformer and
+        Borzoi were cleanly disabled/unavailable. This mirrors exactly
+        what `report/json_builder.py::build_variant_result` does: the
         `ai_splicing_ensemble` key is only present in the JSON output
         under that same condition, so JSON and Markdown agree on when
         this evidence "exists."
+
+        WHEN `models_used` IS EMPTY BECAUSE A MODEL GENUINELY CRASHED
+        (2026-09-11 fix, sweep finding 3): `ensemble_result["error"]` is
+        set by `EnsembleManager.evaluate()` in that case specifically
+        (never set for a clean disable), and this function renders a
+        "_Failed: ..._" line instead of silently disappearing -- before
+        this fix, a genuine double crash produced a report with NO
+        SECTION AT ALL, not even a "Failed" line, which is a stronger
+        fabricated absence than a wrong statement would have been: a
+        reader has nothing here to be suspicious of. Matches the exact
+        wording `_render_mmsplice`/`_render_rna`/`_render_protein`/
+        `_render_alphamissense` already use for the identical situation
+        (a model that ran and crashed, not one that never ran).
         """
         if not ensemble_result or not ensemble_result.get("models_used"):
+            if ensemble_result and ensemble_result.get("error") is not None:
+                return [
+                    "### AI Splicing Analysis (Enformer + Borzoi Ensemble)",
+                    "",
+                    f"_Failed: {ensemble_result['error']} -- not evidence Enformer/Borzoi found no "
+                    "splicing effect, see the AI Model Status table above._",
+                    "",
+                ]
             return []
 
         lines = ["### AI Splicing Analysis (Enformer + Borzoi Ensemble)", ""]
@@ -1256,7 +1832,7 @@ class ReportGenerator:
         lines.append(f"- **Source:** {gnomad_result.get('source', 'n/a')}")
         lines.append(f"- **Genome build:** {gnomad_result.get('build', 'n/a')}")
 
-        if gnomad_result.get("error"):
+        if gnomad_result.get("error") is not None:
             lines.append(f"- **Status:** query failed ({gnomad_result['error']})")
             lines.append("")
             return lines
@@ -1318,7 +1894,12 @@ class ReportGenerator:
         lines.append(f"- **Gene:** {gene_symbol or 'n/a'}")
         lines.append(f"- **Source:** {clingen_result.get('source', 'n/a')}")
 
-        if clingen_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): one
+        # of Phase 1's original four confirmed-negative sites. Safe
+        # today because clingen/provider.py's producer was already
+        # fixed in Batch 1, fixed here anyway so the class cannot
+        # reopen if that producer regresses.
+        if clingen_result.get("error") is not None:
             lines.append(f"- **Status:** query failed ({clingen_result['error']})")
             lines.append("")
             return lines
@@ -1378,7 +1959,12 @@ class ReportGenerator:
         lines.append(f"- **Gene:** {gene_symbol or 'n/a'}")
         lines.append(f"- **Source:** {uniprot_result.get('source', 'n/a')}")
 
-        if uniprot_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): one
+        # of Phase 1's original four confirmed-negative sites. Safe
+        # today because uniprot/provider.py's producer was already
+        # fixed in Batch 1, fixed here anyway so the class cannot
+        # reopen if that producer regresses.
+        if uniprot_result.get("error") is not None:
             lines.append(f"- **Status:** query failed ({uniprot_result['error']})")
             lines.append("")
             return lines
@@ -1431,7 +2017,12 @@ class ReportGenerator:
         lines.append(f"- **UniProt accession:** {interpro_result.get('accession', 'n/a')}")
         lines.append(f"- **Source:** {interpro_result.get('source', 'n/a')}")
 
-        if interpro_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): one
+        # of Phase 1's original four confirmed-negative sites. Safe
+        # today because interpro/provider.py's producer was already
+        # fixed in Batch 1, fixed here anyway so the class cannot
+        # reopen if that producer regresses.
+        if interpro_result.get("error") is not None:
             lines.append(f"- **Status:** query failed ({interpro_result['error']})")
             lines.append("")
             return lines
@@ -1489,7 +2080,7 @@ class ReportGenerator:
         lines.append(f"- **UniProt accession:** {alphafold_result.get('accession', 'n/a')}")
         lines.append(f"- **Source:** {alphafold_result.get('source', 'n/a')}")
 
-        if alphafold_result.get("error"):
+        if alphafold_result.get("error") is not None:
             lines.append(f"- **Status:** query failed ({alphafold_result['error']})")
             lines.append("")
             return lines
@@ -1520,10 +2111,15 @@ class ReportGenerator:
                 f"(_{alphafold_result.get('protein_position_basis', 'n/a')}_)"
             )
         elif alphafold_result.get("mean_plddt") is not None:
-            lines.append(
-                "- **pLDDT at variant residue:** not checked -- this variant's residue position could not "
-                "be determined from the transcript structure."
+            # The old hardcoded text here claimed the residue position
+            # couldn't be determined from the transcript -- true only for
+            # one of mapping_gate.py's six failure reasons, and actively
+            # false for the other five (e.g. a known position that's
+            # simply outside the AlphaFold entry's span, or not modelled).
+            reason = alphafold_result.get("mapping_unavailable_reason") or (
+                "this variant's residue position could not be determined from the transcript structure"
             )
+            lines.append(f"- **pLDDT at variant residue:** not checked -- {reason}.")
         lines.append("")
 
         return lines
@@ -1533,7 +2129,15 @@ class ReportGenerator:
         if not blast_result:
             return []
         lines = ["### BLAST Results", ""]
-        if blast_result.get("error"):
+        # POSITIVE-POLARITY TRUTHINESS (2026-08-31, sweep Batch 4): one
+        # of Phase 1's original four confirmed-negative sites -- the
+        # sharpest instance found this sweep, since the comment just
+        # below already names the exact defect this truthiness bug
+        # reopened for any empty-message crash. Safe today because
+        # orchestrator.py's BLAST stage producer was already fixed in
+        # Batch 1, fixed here anyway so the class cannot reopen if that
+        # producer regresses.
+        if blast_result.get("error") is not None:
             # A genuine crash, not "genuinely no hits" -- see
             # `pipeline/orchestrator.py::_run_blast_stage`'s comment.
             # Previously this branch didn't exist at all: an empty

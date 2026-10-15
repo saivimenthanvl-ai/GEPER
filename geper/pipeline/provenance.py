@@ -110,13 +110,16 @@ import enum
 import hashlib
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 from config import CONFIG
+from pipeline.models.status import USED
+from utils.auto_install import installed_package_version
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -149,6 +152,14 @@ class VersionStatus(str, enum.Enum):
     HASH_ONLY = "hash_only"  # no release version, but a content hash of the actual bytes used is known
     VERSION_KNOWN = "version_known"  # a real, source-published version/release/build identifier is known
 
+    def __bool__(self) -> NoReturn:
+        raise TypeError(
+            "VersionStatus has no truth value -- every member of a `str` enum is truthy, "
+            "so `if x:`/`if not x:` silently collapses NOT_CONSULTED (never queried) and UNKNOWN (queried, nothing obtainable) "
+            "into one answer, which is exactly the distinction this type exists to "
+            "keep. Compare explicitly, e.g. `x is VersionStatus.VERSION_KNOWN`."
+        )
+
 
 _STATUS_PRIORITY = {
     VersionStatus.NOT_CONSULTED: 0,
@@ -156,6 +167,433 @@ _STATUS_PRIORITY = {
     VersionStatus.TIMESTAMP_ONLY: 2,
     VersionStatus.HASH_ONLY: 3,
     VersionStatus.VERSION_KNOWN: 4,
+}
+
+
+class HashVerification(str, enum.Enum):
+    """
+    WHETHER THE BYTES WERE ACTUALLY READ -- a SEPARATE AXIS from
+    `VersionStatus`, in the same way `RetrievalMode` below is, and for the
+    same reason: collapsing it into the version axis would let a claim be
+    read as a measurement.
+
+    A HuggingFace blob is named by the sha256 of its content, so a content
+    hash is available for free by reading the filename. *** THAT IS THE
+    CACHE'S OWN ASSERTION ABOUT ITS CONTENT, NOT AN OBSERVATION OF IT. ***
+    It was computed at download time, on another machine, and nothing
+    rechecks it afterwards. A corrupted, truncated or substituted blob KEEPS
+    ITS FILENAME -- the label is the one thing that cannot change. So a
+    declared hash is strictly better evidence than a config pin, and is still
+    a claim: a cache is proven by a load, never by a listing, and reading a
+    filename is a listing.
+
+    THIS IS ALSO WHY A DECLARED HASH IS NOT `VersionStatus.HASH_ONLY`. That
+    member's own definition is "a content hash of the ACTUAL BYTES USED is
+    known". Awarding it to a filename would re-introduce, on the hash axis,
+    exactly the intention-vs-observation conflation this whole record exists
+    to remove. HASH_ONLY is reached only via `VERIFIED`.
+    """
+
+    UNVERIFIABLE = "unverifiable"  # no declared hash exists to compare bytes against
+    NOT_VERIFIED = "not_verified"  # a hash is DECLARED by the cache; the bytes were not read this run
+    VERIFIED = "verified"  # the bytes were streamed and matched the declared hash
+    MISMATCH = "mismatch"  # the bytes were streamed and DID NOT match -- corrupt or substituted cache
+
+    def __bool__(self) -> NoReturn:
+        raise TypeError(
+            "HashVerification has no truth value -- every member of a `str` enum is truthy, "
+            "so `if x:` would silently treat MISMATCH (a corrupted or substituted model cache, "
+            "the most informative event this subsystem can produce) as success. "
+            "Compare explicitly, e.g. `x is HashVerification.VERIFIED`."
+        )
+
+
+# A HuggingFace cache blob whose name is 64 hex characters is content-addressed:
+# the name IS the sha256 of the bytes. The small config/tokenizer blobs are named
+# with a 40-hex git blob SHA-1 instead, which is NOT a hash of the file's content
+# and must never be recorded as one. Measured on this project's own ESM-2 cache
+# (2026-09-10): of five entries, exactly one -- model.safetensors, the only
+# LFS-tracked file -- is 64 hex; the other four are 40 hex.
+_CONTENT_ADDRESSED_BLOB_NAME = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _derive_cache_identity(requested_path: str, resolved_path: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    `(served_revision, cache_declared_sha256)` from a HuggingFace cache layout.
+
+    TWO PATHS, BECAUSE THEY CARRY DIFFERENT FACTS. The path the loader asked
+    for names the snapshot -- `.../snapshots/<revision>/<file>` -- which is the
+    revision the cache ACTUALLY SERVED, not the one config requested. The path
+    it resolves to names the blob -- `.../blobs/<sha256>` -- which is the
+    content the cache CLAIMS to hold.
+
+    Pure, and deliberately so: it takes two strings and touches no filesystem,
+    so it is testable without creating symlinks. This project's own development
+    host cannot create them without elevation (WinError 1314), and a test that
+    skipped there would read as coverage while proving nothing.
+    """
+    served_revision: Optional[str] = None
+    declared_sha256: Optional[str] = None
+
+    requested_parts = requested_path.replace("\\", "/").split("/")
+    if "snapshots" in requested_parts:
+        index = requested_parts.index("snapshots")
+        if index + 1 < len(requested_parts):
+            served_revision = requested_parts[index + 1]
+
+    resolved_parts = resolved_path.replace("\\", "/").split("/")
+    if "blobs" in resolved_parts:
+        index = resolved_parts.index("blobs")
+        if index + 1 < len(resolved_parts):
+            candidate = resolved_parts[index + 1]
+            # Only a 64-hex name is a content hash. A 40-hex git blob SHA-1
+            # is dropped rather than recorded, because recording it would put
+            # a non-content hash in a field readers will treat as one.
+            if _CONTENT_ADDRESSED_BLOB_NAME.match(candidate):
+                declared_sha256 = candidate
+
+    return served_revision, declared_sha256
+
+
+class ResolvedModelArtifact(BaseModel):
+    """
+    What a run actually opened for one model, recorded ALONGSIDE the config
+    pin rather than replacing it -- so that a DISAGREEMENT between what was
+    intended and what was served stays visible instead of being reconciled
+    away. A disagreement here is the most informative event this subsystem
+    can produce and must never be defaulted, normalised, or logged at debug.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    requested_path: str
+    resolved_path: Optional[str] = None
+    served_revision: Optional[str] = None
+    # NAMED FOR ITS PROVENANCE, NOT ITS FORMAT. It is deliberately NOT called
+    # `observed_sha256`: a reader seeing "observed" would believe the bytes
+    # were read, and until `hash_verification is VERIFIED` they were not.
+    cache_declared_sha256: Optional[str] = None
+    # The bytes-on-disk hash `verify_model_artifact` actually computed,
+    # populated only when bytes were streamed (VERIFIED or MISMATCH) --
+    # `None` for UNVERIFIABLE/NOT_VERIFIED, where no read happened to
+    # produce one. Previously computed and logged at error level by
+    # `WeightCache.verify_checksum` and then discarded; this is that same
+    # value, kept.
+    observed_sha256: Optional[str] = None
+    hash_verification: HashVerification = HashVerification.UNVERIFIABLE
+    version_status: VersionStatus = VersionStatus.UNKNOWN
+    note: str = ""
+
+
+def resolve_model_artifact(requested_path: str) -> ResolvedModelArtifact:
+    """
+    Record what the cache SERVED and what it CLAIMS to hold. Free: no bytes
+    are read. Never raises -- provenance capture must not be the thing that
+    stops a run -- and a path it cannot interpret produces an explicit
+    `UNVERIFIABLE` state, never a silent absence.
+    """
+    try:
+        resolved_path = os.path.realpath(requested_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Could not resolve '{requested_path}': {exc}")
+        return ResolvedModelArtifact(
+            requested_path=requested_path,
+            note=f"path could not be resolved: {exc}",
+        )
+
+    served_revision, declared_sha256 = _derive_cache_identity(requested_path, resolved_path)
+
+    if declared_sha256 is None:
+        verification = HashVerification.UNVERIFIABLE
+        note = "no content-addressed blob name; nothing to verify the bytes against"
+    else:
+        verification = HashVerification.NOT_VERIFIED
+        note = "sha256 declared by the cache filename; the bytes have NOT been read"
+
+    return ResolvedModelArtifact(
+        requested_path=requested_path,
+        resolved_path=resolved_path,
+        served_revision=served_revision,
+        cache_declared_sha256=declared_sha256,
+        hash_verification=verification,
+        # NOT HASH_ONLY: no bytes have been read. A served revision is a real
+        # identifier the cache resolved, so it earns VERSION_KNOWN; without one
+        # this run knows nothing beyond a filename it has not checked.
+        version_status=(VersionStatus.VERSION_KNOWN if served_revision else VersionStatus.UNKNOWN),
+        note=note,
+    )
+
+
+def verify_model_artifact(artifact: ResolvedModelArtifact) -> ResolvedModelArtifact:
+    """
+    ON DEMAND, NOT PER RUN: stream the blob and compare it against the hash the
+    cache declared. Measured on this project's own ESM-2 weights (2026-09-10):
+    2,609,506,392 bytes in ~3.9s at ~650 MiB/s, per model per run -- a real tax,
+    which is why the free declared hash is what every run records and this is
+    reachable rather than automatic.
+
+    THIS IS ALSO THE FIRST PRODUCTION CALLER OF `WeightCache.verify_checksum`
+    (via `verify_checksum_detailed`, its bool-plus-actual-hash sibling),
+    which had none: it existed, carried five test assertions, and was invoked
+    by nothing -- and returns True when `expected_sha256` is None, so it would
+    have passed by default even once wired. Routing through it here gives it
+    both a caller and a non-None expected hash. `verify_checksum_detailed`
+    additionally returns the bytes-on-disk hash it computed to reach that
+    verdict, threaded below into `observed_sha256` -- the one this record
+    previously discarded after only logging it.
+    """
+    if artifact.cache_declared_sha256 is None or artifact.resolved_path is None:
+        return artifact.model_copy(
+            update={
+                "hash_verification": HashVerification.UNVERIFIABLE,
+                "note": "no declared hash to verify the bytes against",
+            }
+        )
+
+    from pathlib import Path
+
+    from pipeline.models.cache import WeightCache
+
+    checksum_result = WeightCache().verify_checksum_detailed(
+        Path(artifact.resolved_path), artifact.cache_declared_sha256
+    )
+    matches = checksum_result.matches
+
+    if matches:
+        return artifact.model_copy(
+            update={
+                "observed_sha256": checksum_result.actual_sha256,
+                "hash_verification": HashVerification.VERIFIED,
+                # Only now is this HASH_ONLY's own definition -- "a content hash
+                # of the actual bytes used is known" -- actually satisfied.
+                "version_status": VersionStatus.HASH_ONLY,
+                "note": "bytes streamed and matched the hash declared by the cache",
+            }
+        )
+
+    # NOT A WARNING. The bytes on disk are not the bytes the cache says it
+    # holds, which means a corrupted or substituted model cache produced this
+    # run's results. `WeightCache.verify_checksum` has already logged the two
+    # hashes at error level; this makes it unmissable in the record itself.
+    logger.error(
+        f"MODEL CACHE INTEGRITY FAILURE for '{artifact.resolved_path}': the bytes do not match the "
+        f"sha256 the cache filename declares ({artifact.cache_declared_sha256}). Any result produced "
+        f"from this artifact was produced by unknown weights."
+    )
+    return artifact.model_copy(
+        update={
+            "observed_sha256": checksum_result.actual_sha256,
+            "hash_verification": HashVerification.MISMATCH,
+            # Deliberately NOT HASH_ONLY. A mismatched artifact has no known
+            # content hash -- it has a REFUTED one, which is a different thing.
+            "version_status": VersionStatus.UNKNOWN,
+            "note": (
+                "MISMATCH: bytes do not match the cache's declared sha256 -- corrupted or substituted model cache"
+            ),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-run observation registry: written where weights are OPENED, read where
+# the provenance record is ASSEMBLED.
+# ---------------------------------------------------------------------------
+
+# What each model actually loaded THIS RUN, keyed by the same checkpoint name
+# `get_model_checkpoint_identifiers()` uses so the two can be joined without a
+# second naming scheme.
+#
+# WHY A MODULE-LEVEL REGISTRY AND NOT A CONSTRUCTOR ARGUMENT. The observation
+# has to be made at the only moment it is true -- inside the loader, with the
+# cache in the state that served the load -- and consumed after the last
+# variant, in `finalize_model_checkpoint_provenance`. The loaders
+# (`models/esm2.py`, the Enformer/Borzoi plugins) hold no reference to the
+# pipeline and are constructed by a registry that predates this record, so
+# threading a collector through every one of them would be a far larger change
+# to code this task was told not to disturb. The cost is process-global state,
+# and it is paid for by `reset_loaded_model_artifacts()` being called at run
+# start -- see `RunProvenanceCollector.__init__`, which draws exactly the same
+# line for `reset_stale_fallbacks()` and for the same reason.
+_LOADED_MODEL_ARTIFACTS: Dict[str, ResolvedModelArtifact] = {}
+
+# The weight filenames transformers/huggingface_hub resolve, in the order they
+# are preferred. Consulted only AFTER a load has already succeeded, to identify
+# WHICH cache entry served it.
+_HF_WEIGHT_FILENAMES = ("model.safetensors", "pytorch_model.bin")
+
+
+def reset_loaded_model_artifacts() -> None:
+    """
+    Clear the previous run's observations. Without this, a second run in the
+    same process inherits the first run's artifacts -- a carried-forward claim
+    about bytes this run never opened, which is the resumed-run defect
+    (`report/json_builder.py`'s carry-forward note) one field over.
+    """
+    _LOADED_MODEL_ARTIFACTS.clear()
+
+
+def get_loaded_model_artifacts() -> Dict[str, ResolvedModelArtifact]:
+    """A copy, so a caller cannot mutate the run's record by holding it."""
+    return dict(_LOADED_MODEL_ARTIFACTS)
+
+
+def record_loaded_model_artifact(checkpoint_name: str, requested_path: str) -> ResolvedModelArtifact:
+    """
+    Record what `checkpoint_name` actually opened. Free (no bytes are read) and
+    never raises: provenance capture must not be the thing that stops a run.
+
+    A path this module cannot interpret still produces a record -- an explicit
+    UNVERIFIABLE -- rather than nothing, because an absent entry is
+    indistinguishable from a model that never loaded.
+    """
+    artifact = resolve_model_artifact(requested_path)
+    _LOADED_MODEL_ARTIFACTS[checkpoint_name] = artifact
+    return artifact
+
+
+def capture_hf_cache_artifact(
+    checkpoint_name: str, repo_id: str, revision: str, cache_dir: str
+) -> Optional[ResolvedModelArtifact]:
+    """
+    Identify the cache entry that served an ALREADY-SUCCESSFUL
+    `from_pretrained(repo_id, revision=..., cache_dir=...)` and record it.
+
+    *** WHAT THIS IS AND IS NOT, STATED RATHER THAN IMPLIED. *** It is the
+    HuggingFace cache's own resolution for the same (repo, revision, cache_dir)
+    the load just used, queried in the same process immediately afterwards. It
+    is STRICTLY STRONGER than the config pin -- it names the revision the cache
+    served and the blob it holds, either of which can disagree with the pin --
+    and STRICTLY WEAKER than intercepting the file handle transformers opened,
+    which is not reachable through its public API. It is therefore recorded as
+    an observation OF THE CACHE, not as proof of the read: `hash_verification`
+    stays NOT_VERIFIED until bytes are actually streamed.
+
+    Returns None (recording nothing) when the cache cannot resolve the load at
+    all, so a caller can tell "no observation" from "an observation of nothing".
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        for filename in _HF_WEIGHT_FILENAMES:
+            hit = try_to_load_from_cache(repo_id, filename, cache_dir=cache_dir, revision=revision)
+            if isinstance(hit, str) and os.path.exists(hit):
+                return record_loaded_model_artifact(checkpoint_name, hit)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Could not identify the cache entry serving '{repo_id}@{revision}': {exc}")
+        return None
+
+    logger.debug(f"No cached weight file found for '{repo_id}@{revision}' under '{cache_dir}'.")
+    return None
+
+
+def verify_loaded_model_artifacts() -> Dict[str, ResolvedModelArtifact]:
+    """
+    Stream every recorded artifact's bytes and check them against the hash the
+    cache declares, replacing each record with its verified/mismatched form.
+
+    OPT-IN, NOT AUTOMATIC, AND THE REASON IS MEASURED: ~3.9s per 2.6GB model
+    (see `verify_model_artifact`). Every run records the free declared hash;
+    only a run that asks pays for reading the bytes. The switch is
+    `CONFIG.VERIFY_MODEL_ARTIFACT_HASHES` (`GEPER_VERIFY_MODEL_HASHES`), read by
+    `pipeline/orchestrator.py`.
+    """
+    for name, artifact in list(_LOADED_MODEL_ARTIFACTS.items()):
+        _LOADED_MODEL_ARTIFACTS[name] = verify_model_artifact(artifact)
+    return get_loaded_model_artifacts()
+
+
+class RetrievalMode(str, enum.Enum):
+    """
+    WHERE this run's answer from a source actually came from -- a
+    SEPARATE AXIS from `VersionStatus`, which is only ever about
+    version identifiability.
+
+    Deliberately NOT a sixth `VersionStatus` member, for two reasons:
+
+      1. The two facts are independent. A BLAST result replayed from
+         the on-disk cache in local mode still has a real, known
+         blast+ tool version; a live remote query has none. Every
+         combination of (version identifiability x retrieval mode) is
+         reachable, so folding one into the other would force
+         recording either fact to destroy the other -- the same
+         collapse `VersionStatus`'s own docstring exists to prevent.
+      2. `VersionStatus` is TOTALLY ORDERED, and that ordering is
+         load-bearing: `RunProvenanceCollector.record` uses it to stop
+         a later degraded query downgrading an already-captured real
+         version. "Replayed from cache" is not more or less
+         informative than "version known" -- there is no honest place
+         to put it in that ordering. Retrieval mode therefore MERGES
+         (see `RunProvenanceCollector.note_retrieval`) rather than
+         ranking.
+
+    Why it matters clinically: a cache replay returns bytes a previous
+    run obtained, and this run cannot verify they are still current.
+    ClinVar reclassifies weekly; NCBI's `nt` changes continuously. A
+    report that cannot distinguish "we asked the source and it said
+    this" from "we reused what it said some unrecorded time ago" is
+    making a stronger claim than it can support.
+    """
+
+    NOT_RETRIEVED = "not_retrieved"  # tracked this run, but no answer was obtained from this source at all
+    LIVE = "live"  # every answer used this run came from contacting the source this run
+    CACHE_REPLAY = "cache_replay"  # every answer used this run was replayed from a local cache written by an EARLIER run; the source itself was not contacted, and this run cannot verify the answer is still current
+    MIXED = "mixed"  # both happened this run -- some answers live, some replayed (see note_retrieval: recording either alone would be a false claim about the other)
+
+    def __bool__(self) -> NoReturn:
+        raise TypeError(
+            "RetrievalMode has no truth value -- same reason as VersionStatus: every member of a "
+            "`str` enum is truthy, so `if x:` would silently collapse NOT_RETRIEVED (tried nothing) "
+            "and CACHE_REPLAY (answered without contacting the source) into one answer. Compare "
+            "explicitly, e.g. `x is RetrievalMode.CACHE_REPLAY`."
+        )
+
+    @classmethod
+    def from_counts(cls, live: int, cache_replay: int) -> "RetrievalMode":
+        """
+        Maps "how many answers came from where" onto the honest single
+        label for a run.
+
+        Lives here, next to the vocabulary it produces, rather than in
+        the orchestrator that happens to call it: it IS the meaning of
+        these members, and putting it beside them is what lets the
+        rule be tested without constructing a pipeline. Any future
+        source that grows the same live/cached split gets one call, not
+        a second copy of this reasoning.
+
+        Note `live and cache_replay -> MIXED` comes FIRST. Checking
+        either count alone first would silently describe a mostly-cached
+        run as live (or the reverse), which is the whole failure being
+        fixed.
+        """
+        if live and cache_replay:
+            return cls.MIXED
+        if live:
+            return cls.LIVE
+        if cache_replay:
+            return cls.CACHE_REPLAY
+        # Nothing was retrieved at all. Recorded explicitly rather than
+        # left unset, so "this source returned nothing this run" stays
+        # distinguishable from "nobody tracked this source".
+        return cls.NOT_RETRIEVED
+
+
+# Human-readable labels for `RetrievalMode`, defined HERE rather than in
+# each renderer. `report/summary.py::_PROVENANCE_STATUS_LABELS` and
+# `report/report_generator.py::_render_provenance`'s `status_labels`
+# are two hand-maintained copies of the same map that only a comment
+# keeps in step; this axis is not going to repeat that. Both renderers
+# import this one.
+RETRIEVAL_MODE_LABELS: Dict[str, str] = {
+    RetrievalMode.NOT_RETRIEVED.value: "no data retrieved from this source this run",
+    RetrievalMode.LIVE.value: "retrieved live from the source this run",
+    RetrievalMode.CACHE_REPLAY.value: (
+        "REPLAYED FROM LOCAL CACHE -- the source itself was not contacted this run, "
+        "so this report cannot confirm the data is still current"
+    ),
+    RetrievalMode.MIXED.value: (
+        "MIXED -- some data retrieved live this run, some replayed from local cache; "
+        "the cached portion cannot be confirmed current"
+    ),
 }
 
 
@@ -171,6 +609,16 @@ class DataSourceProvenance(BaseModel):
 
     source: str
     status: VersionStatus
+    # `None` means "retrieval mode was not tracked for this source",
+    # which is NOT the same claim as RetrievalMode.NOT_RETRIEVED
+    # ("tracked, and nothing was retrieved") -- and neither is a claim
+    # that the data came live off the wire. Only BLAST is wired to
+    # report retrieval mode today, so every other source stays None and
+    # the renderers print nothing for it, rather than every unwired
+    # source silently acquiring a "retrieved live" claim nobody
+    # verified. Unlike `status` this therefore CAN default: the default
+    # asserts nothing.
+    retrieval: Optional[RetrievalMode] = None
     version: Optional[str] = None  # e.g. "gnomad_r4", "InterPro 109.0", "dbSNP build 157", "UniProt 2026_02"
     release_date: Optional[str] = (
         None  # ISO date/string if the source publishes one (Orphanet's `date`, ClinGen's filename date, UniProt's release date, ...)
@@ -184,6 +632,63 @@ class DataSourceProvenance(BaseModel):
     notes: Optional[str] = (
         None  # required explanation whenever status is UNKNOWN/TIMESTAMP_ONLY -- see `RunProvenanceCollector.record`
     )
+
+
+# ---------------------------------------------------------------------------
+# Stale-cache-fallback registry -- Packaging Part 3 mechanism.
+#
+# Every auto-fetch bootstrap module (`clingen/`, `hpo/bootstrap.py`,
+# `hpo/ontology.py`, `mane/`, `orphanet/`, `uniprot/`, `ensembl/`) falls
+# back to an existing on-disk cache file when a refresh fails, and used
+# to only `logger.warning` about it -- a warning nobody reads is not a
+# warning (the floor's standing rule). Each of those seven call sites
+# now ALSO calls `record_stale_fallback` here, on the exact branch that
+# decides to serve the stale copy, so the fact reaches
+# `report/json_builder.py`'s document and, from there,
+# `report/report_generator.py`'s rendered text -- not just the log.
+#
+# Module-level, not per-`RunProvenanceCollector`-instance: the bootstrap
+# functions are free functions with no collector to write into (they
+# run lazily, on first use, deep inside per-source modules that predate
+# this mechanism and are not being refactored to thread one through --
+# out of scope per the dispatch, "this is the mechanism, not a
+# bootstrap-module rewrite"). Matches this codebase's existing pattern
+# of module-level mutable state for cache bookkeeping (each bootstrap
+# module's own `_fetch_lock`), so a fresh pipeline run should clear it
+# -- `RunProvenanceCollector.__init__` does that, see below.
+# ---------------------------------------------------------------------------
+
+_STALE_FALLBACKS: List[Dict[str, str]] = []
+
+
+def record_stale_fallback(*, source: str, path: str, reason: str) -> None:
+    """Records that `source` fell back to an existing, possibly-stale
+    on-disk cache file at `path` after a failed refresh, `reason`-ed.
+    Never raises -- provenance bookkeeping must never break a bootstrap
+    fallback that is itself already the resilient path."""
+    _STALE_FALLBACKS.append(
+        {
+            "source": source,
+            "path": path,
+            "reason": reason,
+            "recorded_at": _utc_now_iso(),
+        }
+    )
+
+
+def get_stale_fallbacks() -> List[Dict[str, str]]:
+    """A copy of every stale-cache fallback recorded so far this
+    process -- consumed by `report/json_builder.py` so the fact reaches
+    the report, not just the log."""
+    return list(_STALE_FALLBACKS)
+
+
+def reset_stale_fallbacks() -> None:
+    """Clears the registry -- called at the start of a `RunProvenanceCollector`
+    (i.e. a new pipeline run) and by tests, so one run's stale-cache
+    fallbacks never leak into the next run's report in a long-lived
+    process."""
+    _STALE_FALLBACKS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -382,38 +887,219 @@ def get_geper_code_version() -> str:
         return f"unknown (git invocation failed: {exc})"
 
 
+def get_runtime_environment_provenance() -> Dict[str, Any]:
+    """
+    OS, hardware, and thread-count facts for this run.
+
+    [[provenance-captures-no-os-hardware-or-thread-count]]: `get_geper_code_version`
+    (above) and `RunProvenanceCollector` capture the CODE and DATA halves of
+    reproducibility, but nothing previously captured the HARDWARE half. Two
+    runs with identical code_version and identical data-source versions can
+    still have executed on different machines with different core/thread
+    counts -- both legitimate sources of numerical non-determinism in CPU
+    model inference (see REPRODUCIBILITY_PROTOCOL.md S2a) -- and without this,
+    the provenance record could not distinguish "reproduced on the same
+    machine" from "reproduced on a different one".
+
+    Every field is captured honestly, matching this module's own convention
+    elsewhere (`get_geper_code_version`): stdlib-only and best-effort, never
+    raises, and a field this process cannot determine is reported as `None`
+    with the reason, not silently omitted or guessed.
+    """
+    import platform
+
+    result: Dict[str, Any] = {
+        "os": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor() or None,
+        "logical_cpu_count": os.cpu_count(),
+        "python_version": platform.python_version(),
+        "torch_thread_count": None,
+        "torch_thread_count_unavailable_reason": None,
+    }
+
+    # Best-effort: torch's own default CPU thread count is itself a source
+    # of the reduction-order non-determinism this record exists to let a
+    # later reproducibility comparison attribute correctly. Only meaningful
+    # if torch is actually importable in this process -- absence is
+    # reported honestly, not treated as an error.
+    try:
+        import torch
+
+        result["torch_thread_count"] = torch.get_num_threads()
+    except Exception as exc:  # noqa: BLE001 -- best-effort provenance capture, never fatal.
+        result["torch_thread_count_unavailable_reason"] = str(exc)
+
+    return result
+
+
+def _with_pin(base: str, pin: Optional[str], label: str) -> str:
+    """
+    `"<base> (<label> <pin>)"`, or `base` unchanged when no pin is
+    available. Never invents a placeholder: a model whose pin could not
+    be read records exactly what it recorded before, which is a
+    visible gap rather than a fabricated identifier.
+    """
+    return f"{base} ({label} {pin})" if pin else base
+
+
+def _checkpoint_pins() -> Dict[str, Optional[str]]:
+    """
+    The pinned upstream identifiers each model's own loader already
+    holds, read from the modules that own them.
+
+    Imported inside the function rather than at module scope so that
+    importing `pipeline/provenance.py` on its own (an audit script, a
+    test) does not drag in torch/transformers. In any process that has
+    a `PipelineOrchestrator` -- the only caller -- all four modules are
+    already imported by the time this runs, measured 2026-09-02, so
+    this costs nothing there and `get_model_checkpoint_identifiers`
+    keeps the "safe to call unconditionally at pipeline startup"
+    property its docstring promises: reading a module constant loads no
+    model and touches no network.
+
+    Any failure degrades to `None` for that one pin. Provenance capture
+    must never be the thing that stops a run, and a missing pin is a
+    gap the caller renders honestly.
+    """
+    pins: Dict[str, Optional[str]] = dict.fromkeys(
+        (
+            "esm2_revision",
+            "hyenadna_revision",
+            "splicebert_record",
+            "splicebert_checkpoint",
+            "spliceformer_ref",
+            "spliceformer_checkpoint",
+            "enformer_repo",
+            "enformer_revision",
+            "borzoi_repo",
+            "borzoi_revision",
+        )
+    )
+
+    try:
+        from models.esm2 import _ESM2_REVISION
+
+        pins["esm2_revision"] = _ESM2_REVISION
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Could not read the ESM-2 revision pin: {exc}")
+
+    try:
+        from models.hyenadna import _HYENADNA_CHECKPOINT_REVISIONS
+
+        # Keyed by model name because each checkpoint repo has its own
+        # revision -- see that dict's own comment. A configured model
+        # with no pinned revision is a real gap, not an error.
+        pins["hyenadna_revision"] = _HYENADNA_CHECKPOINT_REVISIONS.get(CONFIG.models.HYENADNA_MODEL_NAME)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Could not read the HyenaDNA revision pin: {exc}")
+
+    try:
+        from pipeline.models.splicebert.loader import DEFAULT_CHECKPOINT, DEFAULT_ZENODO_RECORD
+
+        pins["splicebert_record"] = DEFAULT_ZENODO_RECORD
+        pins["splicebert_checkpoint"] = DEFAULT_CHECKPOINT
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Could not read the SpliceBERT pins: {exc}")
+
+    try:
+        from pipeline.models.spliceformer.loader import DEFAULT_CHECKPOINT, DEFAULT_SOURCE_REF
+
+        # The release tag alone is NOT sufficient here: ten replicate
+        # checkpoints ship under it and GEPER runs one, so which
+        # replicate ran is part of the identity of the result.
+        pins["spliceformer_ref"] = DEFAULT_SOURCE_REF
+        pins["spliceformer_checkpoint"] = DEFAULT_CHECKPOINT
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Could not read the SpliceFormer pins: {exc}")
+
+    try:
+        from pipeline.models.borzoi_plugin import _BORZOI_REVISION
+        from pipeline.models.enformer_plugin import _ENFORMER_REVISION
+
+        pins["enformer_repo"] = CONFIG.splicing.ENFORMER_HF_REPO
+        pins["enformer_revision"] = _ENFORMER_REVISION
+        pins["borzoi_repo"] = CONFIG.splicing.BORZOI_HF_REPO
+        pins["borzoi_revision"] = _BORZOI_REVISION
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Could not read the Enformer/Borzoi revision pins: {exc}")
+
+    return pins
+
+
+# Distributions whose INSTALLED version is a meaningful answer to
+# "which version produced this result" and is not already pinned in
+# GEPER's own source. Only `mmsplice` qualifies today: every other
+# model either pins an immutable upstream identifier (handled by
+# `_checkpoint_pins` above) or is loaded through a package whose own
+# version says nothing about the weights that were used.
+_RESOLVABLE_DISTRIBUTIONS: Dict[str, str] = {"mmsplice": "mmsplice"}
+
+
 def get_model_checkpoint_identifiers() -> Dict[str, str]:
     """
     The AI model checkpoint identifiers GEPER's own config already
     tracks (`config.py::ModelConfig` plus the splicing-plugin config
     flags) -- purely reads existing config, invokes no model loading or
     network I/O, safe to call unconditionally at pipeline startup.
-    Only lists a model when it's actually configured/enabled, so this
-    doubles as a record of which models this run's provenance covers.
+
+    Lists every model GEPER knows about, config-disabled ones included
+    (Finding 1, 2026-08-29): a model this deployment's config turned
+    off was still *considered* -- the config made a deliberate choice
+    to disable it, and a reviewer reading the report needs to see that
+    choice, not a silent gap indistinguishable from "this model doesn't
+    exist here". `finalize_model_checkpoint_provenance` (below) already
+    resolves each of these to the correct USED/DISABLED/SKIPPED/FAILED
+    status once the run has processed at least one variant -- omitting
+    the identifier here pre-empted that machinery from ever running for
+    a config-disabled model, dropping it from `model_checkpoints`
+    entirely rather than reporting it as disabled.
     """
     mc = CONFIG.models
-    identifiers: Dict[str, str] = {
+    pins = _checkpoint_pins()
+    return {
         "hyenadna_checkpoint_dir": mc.HYENADNA_CHECKPOINT_DIR,
-        "hyenadna_model_name": mc.HYENADNA_MODEL_NAME,
+        "hyenadna_model_name": _with_pin(mc.HYENADNA_MODEL_NAME, pins["hyenadna_revision"], "revision"),
         "rna_fm": mc.RNA_FM,
-        "esm2": mc.ESM2,
+        "esm2": _with_pin(mc.ESM2, pins["esm2_revision"], "revision"),
         "evo2_variant": mc.EVO2_VARIANT,
-    }
-    if CONFIG.mmsplice.ENABLED:
-        identifiers["mmsplice"] = "mmsplice==2.4.0 (pinned, see requirements.txt)"
-    if CONFIG.alphamissense.ENABLED:
-        identifiers["alphamissense_catalogue_source"] = (
+        # NOT a version claim, deliberately. The only code path that
+        # installs this package shells out to a BARE `pip install
+        # --no-deps mmsplice` (see `pipeline/models/mmsplice/loader.py::
+        # _ensure_mmsplice_package_files_available`), so no version is
+        # pinned anywhere and none can be known at startup -- the
+        # install happens lazily on first use, which may be after this
+        # runs or not at all. What the run actually loaded is resolved
+        # later by `finalize_model_checkpoint_provenance`, which is the
+        # only point at which it is knowable.
+        #
+        # The string this replaced read "mmsplice==2.4.0 (pinned, see
+        # requirements.txt)". Both halves were false: nothing enforced
+        # 2.4.0, and requirements.txt carries no mmsplice requirement
+        # line and explicitly instructs the reader not to add one. A
+        # citation is a claim like any other -- naming a file that
+        # appears to corroborate a version it does not contain is worse
+        # than recording no version at all, because a reader who
+        # follows it finds prose about mmsplice and stops looking.
+        "mmsplice": "mmsplice (unpinned: auto-installed with --no-deps at first use; see resolved_version)",
+        "alphamissense_catalogue_source": (
             "see 'AlphaMissense catalogue' in the data-source provenance list, not a model checkpoint"
-        )
-    if getattr(CONFIG.splicing, "ENABLE_SPLICEFORMER", False):
-        identifiers["spliceformer"] = "spliceformer (see pipeline/models/spliceformer_plugin.py for checkpoint URL)"
-    if getattr(CONFIG.splicing, "ENABLE_SPLICEBERT", False):
-        identifiers["splicebert"] = "splicebert (HuggingFace BertForMaskedLM, see pipeline/models/splicebert_plugin.py)"
-    if getattr(CONFIG.splicing, "ENABLE_ENFORMER", False):
-        identifiers["enformer"] = "enformer-pytorch (see pipeline/models/ensemble.py)"
-    if getattr(CONFIG.splicing, "ENABLE_BORZOI", False):
-        identifiers["borzoi"] = "borzoi-pytorch (see pipeline/models/ensemble.py)"
-    return identifiers
+        ),
+        # The three below all had a real, immutable upstream identifier
+        # sitting in the loader that uses it, and recorded a pointer to
+        # the source file instead. Carried, not newly obtained: each
+        # value is still owned by the module that loads with it, and is
+        # read from that module rather than restated here, so a pin
+        # change cannot leave the provenance record behind.
+        "spliceformer": _with_pin(
+            f"spliceformer {pins['spliceformer_checkpoint']}", pins["spliceformer_ref"], "release"
+        ),
+        "splicebert": _with_pin(
+            f"splicebert {pins['splicebert_checkpoint']}", pins["splicebert_record"], "zenodo record"
+        ),
+        "enformer": _with_pin(f"enformer-pytorch {pins['enformer_repo']}", pins["enformer_revision"], "revision"),
+        "borzoi": _with_pin(f"borzoi-pytorch {pins['borzoi_repo']}", pins["borzoi_revision"], "revision"),
+    }
 
 
 # Maps each key `get_model_checkpoint_identifiers()` uses onto the
@@ -462,19 +1148,91 @@ def finalize_model_checkpoint_provenance(
     mention that model key -- e.g. a run with zero variants) keeps its
     plain identifier string unchanged rather than fabricating a status.
     """
+    observed = get_loaded_model_artifacts()
     enriched: Dict[str, Any] = {}
     for name, identifier in identifiers.items():
         model_key = _CHECKPOINT_NAME_TO_MODEL_KEY.get(name)
         status_entry = run_status.get(model_key) if model_key else None
+        artifact = observed.get(name)
         if status_entry is None:
-            enriched[name] = identifier
+            if artifact is None:
+                enriched[name] = identifier
+            else:
+                # A real observation outranks the shape of the entry. This run
+                # tracked no per-model status (a run with zero variants, say),
+                # so there is no status to report -- but it did open a file,
+                # and dropping that to keep a bare string would be the
+                # silent-drop defect this whole record exists to remove.
+                enriched[name] = {
+                    "identifier": identifier,
+                    "loaded_artifact": artifact.model_dump(mode="json"),
+                }
         else:
-            enriched[name] = {
+            status = status_entry.get("status", "unknown")
+            entry: Dict[str, Any] = {
                 "identifier": identifier,
-                "status": status_entry.get("status", "unknown"),
+                "status": status,
                 "reason": status_entry.get("reason", ""),
+                # What actually loaded, as opposed to what was
+                # configured. `None` wherever that cannot be known, and
+                # `None` is a real answer here rather than a missing
+                # one -- see this function's own note below on why a
+                # model that did not run reports no version.
+                "resolved_version": _resolved_version(name, status),
+                # WHAT THIS RUN ACTUALLY OPENED, alongside the pin above and
+                # never instead of it -- a disagreement between the two is the
+                # most informative event this subsystem can produce, and it is
+                # only visible while both are present.
+                #
+                # `None` IS A REAL ANSWER AND IT IS DELIBERATELY NOT ABSENCE:
+                # "this run recorded no observation for this model". A missing
+                # key would read as "nothing worth saying", which is the same
+                # false silence `review/signoff.py::list_pending` was fixed for
+                # one level up. Today it is None for every model whose loader
+                # is not instrumented -- see `capture_hf_cache_artifact`'s
+                # callers -- and that gap is meant to be legible here.
+                "loaded_artifact": artifact.model_dump(mode="json") if artifact else None,
             }
+            # Only present for the five models `pipeline/models/
+            # status.py::_CALIBRATION_MODEL_KEYS` tracks it for
+            # (Enformer, Borzoi, SpliceFormer, SpliceBERT, MMSplice) --
+            # `status_entry` simply has no "calibration_status" key for
+            # any other model, so this stays absent for those rather
+            # than fabricating a value.
+            calibration_status = status_entry.get("calibration_status")
+            if calibration_status is not None:
+                entry["calibration_status"] = calibration_status
+            enriched[name] = entry
     return enriched
+
+
+def _resolved_version(name: str, status: str) -> Optional[str]:
+    """
+    The installed version of the distribution behind checkpoint `name`,
+    for models that actually ran.
+
+    Two deliberate `None`s, and they mean different things to a reader
+    who also has `status` in front of them:
+
+    * The model did not run this run (DISABLED/SKIPPED/FAILED). The
+      record's question is "which version produced this result", and a
+      model that produced no result has no version to report. Filling
+      this in from the environment would assert a load that never
+      happened -- the same defect, one field over, as a resumed run
+      stamping carried-forward variants with this run's checkpoints.
+    * The model ran but its distribution has no readable metadata.
+      Genuinely unknown, and recorded as unknown.
+
+    Only distributions in `_RESOLVABLE_DISTRIBUTIONS` are consulted; a
+    model whose identity is already pinned in GEPER's own source
+    carries that pin in `identifier` and has nothing to resolve.
+    """
+    if status != USED:
+        return None
+    distribution = _RESOLVABLE_DISTRIBUTIONS.get(name)
+    if distribution is None:
+        return None
+    return installed_package_version(distribution)
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +1245,7 @@ def finalize_model_checkpoint_provenance(
 # disabled/never queried this run still appears in the provenance
 # output as NOT_CONSULTED, rather than being silently absent -- the
 # structural distinction point 6 of this module's task required.
-KNOWN_SOURCES = (
+KNOWN_SOURCES: tuple[str, ...] = (
     "ClinVar",
     "dbSNP",
     "gnomAD",
@@ -518,6 +1276,106 @@ KNOWN_SOURCES = (
     "Functional evidence (MaveDB)",
     "MANE Select (NCBI)",
 )
+
+# ---------------------------------------------------------------------------
+# Tool versions (2026-09-11, the human's ruling: "Reports not recording which
+# htslib version produced them is the same gap as the model-hash -- the thing
+# that determines the output isn't captured alongside the output.")
+#
+# Each is MEASURED where the tool actually ran, never copied from the image's
+# package pin:
+#   - tabix/htslib is the one of these this pipeline RUNS (AlphaMissense and
+#     local-gnomAD lookups): its own `--version`, read at run time.
+#   - the software that created the VCF (Kim: freeBayes), bcftools and the
+#     htslib bcftools used ran UPSTREAM,
+#     in whatever produced the input VCF. Those tools write their own version
+#     into the VCF header as they produce it (`##source=freeBayes v1.3.10`,
+#     `##bcftools_viewVersion=1.16+htslib-1.16`), so the header is read.
+#     Probing a local `bcftools --version` instead would record a binary that
+#     did not produce this report -- and would be wrong for a supplied VCF.
+#   - samtools runs on the alignment, which this pipeline never receives, and
+#     writes nothing into a VCF. Recorded as not recorded, with the reason.
+# See `pipeline/orchestrator.py::GeperPipeline._capture_tool_provenance`.
+# ---------------------------------------------------------------------------
+TOOL_SOURCE_TABIX = "tabix / htslib (run by this pipeline)"
+# `##source` names the software that CREATED the file (VCF spec) -- a variant
+# caller for Kim's output (freeBayes), but a curation label for a hand-made
+# VCF (a fixture here says "GEPER_manual_curation_v1"). So not "variant caller".
+TOOL_SOURCE_CALLER = "Software that created the input VCF (its ##source)"
+TOOL_SOURCE_BCFTOOLS = "bcftools (declared in the input VCF)"
+TOOL_SOURCE_HTSLIB = "htslib used by bcftools (declared in the input VCF)"
+TOOL_SOURCE_SAMTOOLS = "samtools"
+# Kim reads this from the BAM's own @PG header (the aligner writes it as it
+# runs), so it names whichever aligner actually produced the alignment.
+TOOL_SOURCE_ALIGNER = "Aligner (declared in the input VCF)"
+KNOWN_SOURCES = KNOWN_SOURCES + (
+    TOOL_SOURCE_TABIX,
+    TOOL_SOURCE_CALLER,
+    TOOL_SOURCE_BCFTOOLS,
+    TOOL_SOURCE_HTSLIB,
+    TOOL_SOURCE_SAMTOOLS,
+    TOOL_SOURCE_ALIGNER,
+)
+
+_BCFTOOLS_STAMP = re.compile(r"^##bcftools_\w+Version=([^+\s]+)(?:\+htslib-(\S+))?")
+# Written by kim_pipeline/pipeline/variant_calling/tool_versions.py. A value
+# beginning "NOT READ" is that pipeline's honest marker, not a version.
+_KIM_STAMPS = {"##samtoolsVersion=": "samtools", "##alignerVersion=": "aligner"}
+NOT_READ_MARKER = "NOT READ"
+
+
+def parse_vcf_tool_stamps(header_lines: List[str]) -> Dict[str, List[str]]:
+    """
+    The tool versions an input VCF declares about itself, in order of first
+    appearance, duplicates removed -- EVERY distinct value, never one chosen
+    among several: a VCF touched by two bcftools versions says so. An empty
+    list means the header declares nothing, which callers must render as
+    such rather than fill in.
+    """
+    found: Dict[str, List[str]] = {"caller": [], "bcftools": [], "htslib": [], "samtools": [], "aligner": []}
+
+    def _add(key: str, value: Optional[str]) -> None:
+        if value and value not in found[key]:
+            found[key].append(value)
+
+    for line in header_lines:
+        if line.startswith("##source="):
+            _add("caller", line[len("##source=") :].strip())
+            continue
+        m = _BCFTOOLS_STAMP.match(line)
+        if m:
+            _add("bcftools", m.group(1))
+            _add("htslib", m.group(2))
+            continue
+        for prefix, key in _KIM_STAMPS.items():
+            if line.startswith(prefix):
+                _add(key, line[len(prefix) :].strip())
+    return found
+
+
+def capture_tool_version(binary: str, timeout_secs: float = 10.0) -> Dict[str, Optional[str]]:
+    """
+    `binary --version`'s first non-empty output line, read from the binary
+    itself. `{"version": None, "error": ...}` when it cannot be run or says
+    nothing -- never a guessed or pinned value. Never raises: a provenance
+    capture must not break a run.
+    """
+    try:
+        proc = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=timeout_secs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"version": None, "error": str(exc) or type(exc).__name__}
+    first = next(
+        (ln.strip() for stream in (proc.stdout, proc.stderr) for ln in (stream or "").splitlines() if ln.strip()),
+        None,
+    )
+    # Exit status first: a binary that rejects `--version` prints its USAGE
+    # and exits non-zero, and that text must not be recorded as a version.
+    if proc.returncode != 0:
+        return {"version": None, "error": f"`{binary} --version` exited {proc.returncode}: {first or 'no output'}"}
+    if first is None:
+        return {"version": None, "error": f"`{binary} --version` printed nothing"}
+    return {"version": first, "error": None}
+
 
 # Evidence-source short names, exactly as recorded in a variant's
 # `clinical_report["evidence_sources"]` (see
@@ -561,6 +1419,11 @@ class RunProvenanceCollector:
         self._records: Dict[str, DataSourceProvenance] = {
             name: DataSourceProvenance(source=name, status=VersionStatus.NOT_CONSULTED) for name in KNOWN_SOURCES
         }
+        # A new pipeline run's stale-cache fallbacks must not include a
+        # PRIOR run's (see `reset_stale_fallbacks`'s own docstring) --
+        # one collector per run (this class's own docstring), so this
+        # is the right place to draw that line.
+        reset_stale_fallbacks()
 
     def record(
         self,
@@ -597,6 +1460,17 @@ class RunProvenanceCollector:
         self._records[source] = DataSourceProvenance(
             source=source,
             status=status,
+            # Carried forward, never reset: `record` is about the
+            # VERSION axis and has no business clearing the RETRIEVAL
+            # axis. The two capture paths run at different points in a
+            # run (status at startup, retrieval after the variant
+            # loop), and the orchestrator's post-loop
+            # `_capture_bootstrapped_datasets_provenance` re-sweep can
+            # re-`record` a source after its retrieval mode is already
+            # known -- so a rebuild that dropped this field would erase
+            # the cache-replay finding in the ordinary case, not an
+            # exotic one.
+            retrieval=existing.retrieval,
             version=version,
             release_date=release_date,
             content_hash=content_hash,
@@ -605,6 +1479,42 @@ class RunProvenanceCollector:
             endpoint=endpoint,
             notes=notes,
         )
+
+    def note_retrieval(self, source: str, mode: RetrievalMode) -> None:
+        """
+        Records that `source` answered this run via `mode`, MERGING with
+        whatever is already recorded rather than ranking (see
+        `RetrievalMode`: there is no honest ordering between "live" and
+        "replayed from cache", so `record`'s priority-overwrite rule
+        would be the wrong instrument here).
+
+        The merge rule that matters: LIVE and CACHE_REPLAY together
+        become MIXED. A run that made nine cache replays and one live
+        query is not honestly describable as either -- calling it LIVE
+        implies nine unverifiable answers were fresh, calling it
+        CACHE_REPLAY implies a live query never happened. MIXED is the
+        only claim supported by what actually occurred.
+
+        NOT_RETRIEVED is the identity element: it never overwrites a
+        real retrieval, and any real retrieval overwrites it.
+        """
+        if source not in KNOWN_SOURCES:
+            logger.warning(
+                f"RunProvenanceCollector.note_retrieval: unrecognized source '{source}' -- "
+                "not in KNOWN_SOURCES, ignoring."
+            )
+            return
+        existing = self._records[source].retrieval
+        if existing is None or existing is RetrievalMode.NOT_RETRIEVED:
+            merged = mode
+        elif mode is RetrievalMode.NOT_RETRIEVED or mode is existing:
+            merged = existing
+        else:
+            # existing and mode are two different real retrieval modes
+            # (LIVE vs CACHE_REPLAY, or either against an already-MIXED
+            # record) -- the only honest answer is MIXED.
+            merged = RetrievalMode.MIXED
+        self._records[source] = self._records[source].model_copy(update={"retrieval": merged})
 
     def get(self, source: str) -> Optional[DataSourceProvenance]:
         return self._records.get(source)
@@ -656,7 +1566,14 @@ def capture_ensembl_release(endpoint: str = "https://rest.ensembl.org", timeout_
         version = f"Ensembl release {releases[0]}" if releases else None
         return {"version": version, "releases": releases, "endpoint": endpoint, "error": None}
     except Exception as exc:  # noqa: BLE001 -- a provenance capture must never break pipeline startup
-        return {"version": None, "releases": [], "endpoint": endpoint, "error": str(exc)}
+        # `str(exc)` is "" for any exception raised without a message
+        # (see d1128ee / FIX #10) -- and this value is interpolated
+        # directly into the reader-facing provenance notes line
+        # (`orchestrator.py::_capture_startup_provenance`), so an empty
+        # string renders as a garbled, unfinished sentence rather than
+        # simply being absent.
+        detail = str(exc) or type(exc).__name__
+        return {"version": None, "releases": [], "endpoint": endpoint, "error": detail}
 
 
 def capture_blast_local_tool_versions() -> Dict[str, Any]:
@@ -681,4 +1598,10 @@ def capture_blast_local_tool_versions() -> Dict[str, Any]:
         version = "; ".join(f"{tool} {v}" for tool, v in sorted(found.items()))
         return {"version": version, "tools": versions, "error": None}
     except Exception as exc:  # noqa: BLE001 -- a provenance capture must never break pipeline startup
-        return {"version": None, "tools": {}, "error": str(exc)}
+        # See `capture_ensembl_release`'s matching comment / d1128ee.
+        # No current consumer reads this key (orchestrator.py's BLAST
+        # notes text is a fixed string), but this matches the class
+        # rather than leaving the return shape's most-likely-empty
+        # field inconsistent with its sibling.
+        detail = str(exc) or type(exc).__name__
+        return {"version": None, "tools": {}, "error": detail}

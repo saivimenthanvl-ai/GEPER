@@ -13,13 +13,22 @@ from typing import Any, Dict, List, Optional
 
 from config import CONFIG
 from utils.logger import get_logger
+from utils.service_health import HEALTH
 from pipeline.acmg_rules import ACMGRuleEngine
 from pipeline.interpretation_result import build_interpretation_result
 from pipeline.confidence_engine import ConfidenceEngine
 from pipeline.prioritization_engine import PrioritizationEngine, floor_category_for_conflict_severity
 from pipeline.conflict_resolution_engine import ConflictResolutionEngine
 from pipeline.explainability_engine import ExplainabilityEngine
-from pipeline.pvs1.utils import protein_effect_flags, protein_effect_undetermined_reason, transcript_from_result
+from pipeline.pvs1.models import LOF_ESTABLISHED, LOF_ESTABLISHED_RECESSIVE, LOF_NOT_ESTABLISHED, LOF_REFUTED
+from pipeline.pvs1.utils import (
+    alphamissense_evidence_sentence,
+    dosage_sensitivity_verdict,
+    null_variant_term,
+    protein_effect_flags,
+    protein_effect_undetermined_reason,
+    transcript_from_result,
+)
 
 logger = get_logger(__name__)
 
@@ -31,11 +40,18 @@ _SIGNIFICANCE_WEIGHT = {
     "benign": -3,
 }
 
+# Registered on the health registry when the real-conflict pre-pass
+# raises, so the failure reaches the report bundle. Named as a component
+# rather than a data source because it is one, and the caveat renderer
+# says something different (and true) about each -- see
+# `ServiceHealthRegistry.note_component_failure`.
+_CONFLICT_DETECTION_COMPONENT = "Conflict detection (internal)"
+
 
 class InterpretationEngine:
     """Combines multi-stage evidence into one unified interpretation block."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._acmg_engine = ACMGRuleEngine()
         self._confidence_engine = ConfidenceEngine()
         self._prioritization_engine = PrioritizationEngine()
@@ -163,10 +179,11 @@ class InterpretationEngine:
         elif protein_flags.is_synonymous:
             evidence.append("Transcript-verified protein consequence: synonymous (no amino acid change).")
         elif protein_flags.is_lof:
-            if len(ref or "") != len(alt or ""):
-                evidence.append("Transcript-verified protein consequence: frameshift.")
-            else:
-                evidence.append("Transcript-verified protein consequence: premature stop codon (nonsense).")
+            # HIGH 3 / T3-F3 (2026-08-28, ruled): term sourced from the
+            # shared `null_variant_term` -- see its docstring for why
+            # both "frameshift"/"nonsense (stop-gained)" are kept.
+            is_frameshift = len(ref or "") != len(alt or "")
+            evidence.append(f"Transcript-verified protein consequence: {null_variant_term(is_frameshift)}.")
             significance_score += 2
             is_predicted_lof = True
         elif protein_flags.is_inframe_indel:
@@ -179,15 +196,22 @@ class InterpretationEngine:
         # protein-level missense evidence above -- deliberately small
         # relative to ClinVar's weights, since AlphaMissense is a
         # computational predictor, not a clinical classification.
-        if alphamissense_result and not alphamissense_result.get("skipped") and alphamissense_result.get("found"):
-            am_class = (alphamissense_result.get("am_class") or "").strip().lower()
-            am_score = alphamissense_result.get("am_pathogenicity")
-            am_score_str = f"{am_score:.3f}" if isinstance(am_score, (int, float)) else "n/a"
-            evidence.append(
-                f"AlphaMissense predicts '{am_class or 'unclassified'}' "
-                f"(am_pathogenicity={am_score_str}) for "
-                f"{alphamissense_result.get('protein_variant', 'this substitution')}."
-            )
+        # HIGH 3 / AM-07 (2026-08-28, ruled): text sourced from the
+        # shared `alphamissense_evidence_sentence` -- this legacy line
+        # and `acmg_rules.py::_pp3_bp4`'s own AlphaMissense line used to
+        # be two independently-worded sentences that could both land in
+        # the same variant's `supporting_evidence` (worded differently
+        # enough that exact-string dedup never merged them: a caveated
+        # and an uncaveated claim about the same tool, side by side, in
+        # every report format -- a visible contradiction, not merely a
+        # missing disclosure). Now byte-identical when both fire, so the
+        # existing exact-match `_dedupe` in interpretation_result.py
+        # collapses the duplicate on its own -- construction instead of
+        # a second, by-hand-synced copy.
+        am_sentence = alphamissense_evidence_sentence(alphamissense_result)
+        if am_sentence is not None:
+            evidence.append(am_sentence)
+            am_class = ((alphamissense_result or {}).get("am_class") or "").strip().lower()
             if am_class == "likely_pathogenic":
                 significance_score += 1
             elif am_class == "likely_benign":
@@ -222,18 +246,55 @@ class InterpretationEngine:
                 f"({mmsplice_result.get('skip_reason', 'unknown reason')})."
             )
 
-        # gnomAD: population-frequency evidence contributing ACMG/AMP
-        # BA1 (stand-alone benign), BS1 (strong benign), and PM2
-        # (moderate pathogenic -- absent/extremely rare) criteria,
-        # using configurable thresholds (CONFIG.gnomad.*). This block
-        # only ever appends new `evidence` entries and adds to
-        # `significance_score` -- it never rewrites or removes any
-        # evidence ClinVar/dbSNP/protein/AlphaMissense/MMSplice already
-        # contributed above (requirement #6: "Never overwrite existing
-        # evidence.").
+        # gnomAD: population-frequency evidence contributing to this
+        # engine's own `significance_score` (BA1/BS1/PM2-shaped
+        # weights, using configurable thresholds, CONFIG.gnomad.*).
+        #
+        # Q4-B/T3-F1 (HIGH 3, 2026-08-28): this block used to also
+        # `evidence.append(text)` -- deliberately removed. `_gnomad_
+        # acmg_evidence` only ever reads `global_af`/popmax; it has no
+        # population-priority-AF awareness at all (unlike `ACMGRuleEngine.
+        # _ba1_bs1`/`_pm2`, which do via `_population_priority_context`
+        # when `CONFIG.gnomad.POPULATION_PRIORITY` is configured), so
+        # under that supported config its sentence can be flatly wrong
+        # (e.g. "no BA1/BS1/PM2 threshold met" for a variant the real
+        # ACMG engine correctly flags as PM2-triggered from the priority
+        # population's own AF) while sitting right beside the real
+        # engine's own correct, disclosure-carrying sentence for the
+        # same variant in the same rendered `supporting_evidence` pool.
+        # The real engine already emits the correct frequency with its
+        # own disclosures, so this line was a redundant sentence that
+        # could be wrong under a supported config, not a needed one.
+        # Removing it is smaller than correcting it and eliminates the
+        # divergence rather than maintaining it (ruling: HIGH 3 Q4-B
+        # amendment). The `significance_score` contribution below is
+        # intentionally UNCHANGED, and the underlying global_af-only
+        # inconsistency is its own, separately carded,
+        # deliberately-not-dispatched issue.
+        #
+        # CORRECTION (2026-09-11): this comment used to say that score
+        # was "provably unread by every report renderer (verified by
+        # search, HIGH 3 Q4-B)". THAT IS FALSE, AND THE WAY IT WENT
+        # WRONG IS WORTH MORE THAN THE CORRECTION: A SEARCH FOR THE
+        # FIELD NAME WAS RUN, AND IT WAS RIGHT ABOUT THE FIELD AND
+        # WRONG ABOUT THE VALUE. `legacy_pre_acmg_significance_score`
+        # is indeed printed by no renderer -- but the number is not the
+        # score's only output. `_build_summary(..., significance_score,
+        # ...)` turns it into `summary` and `confidence`, and
+        # `report/report_generator.py::_render_interpretation` renders
+        # both, as "**Summary:**" and "**Confidence (legacy):**".
+        # THE NUMBER IS NOT RENDERED; WHAT IT DECIDES IS. Measured, not
+        # argued: moving BA1's weight from -3.0 to -2.0 moves a
+        # stand-alone-benign variant's rendered summary from "has
+        # uncertain clinical significance"/low to "shows some evidence
+        # suggestive of clinical relevance"/moderate.
+        # `tests/test_gnomad_weight_reaches_the_reader.py` now pins that
+        # end to end so this cannot be re-asserted from a search again.
+        # THE DELETION ITSELF IS UNCHANGED AND MAY WELL STILL BE RIGHT:
+        # what was false is one argument recorded for it, and those are
+        # different claims.
         gnomad_criteria = self._gnomad_acmg_evidence(gnomad_result)
-        for text, weight in gnomad_criteria:
-            evidence.append(text)
+        for _text, weight in gnomad_criteria:
             significance_score += weight
 
         # ClinGen: gene-level clinical evidence (gene-disease clinical
@@ -287,7 +348,15 @@ class InterpretationEngine:
         # result), so all three now agree on what "ran" rather than
         # "routed to" vs. "ran for" silently meaning different things.
         sequence_context_models = list(dna_models_used or [])
-        if rna_result and not rna_result.get("skipped") and not rna_result.get("error"):
+        # INERT (2026-08-31): truthiness on `error`, not `is not None`,
+        # but `_run_rna_stage` (orchestrator.py) keeps `skipped: True`
+        # on every failure path -- `not rna_result.get("skipped")`
+        # already excludes a failed run regardless of how `error` is
+        # read. Fixed to `is not None` for consistency only; same check
+        # duplicated (and fixed alongside this one) in
+        # confidence_engine.py, interpretation_result.py, and
+        # prioritization_engine.py.
+        if rna_result and not rna_result.get("skipped") and rna_result.get("error") is None:
             sequence_context_models.append("RNA-FM")
         if protein_result and protein_result.get("esm2"):
             sequence_context_models.append("ESM2")
@@ -337,7 +406,20 @@ class InterpretationEngine:
         legacy_result = {
             "summary": summary,
             "confidence": confidence,
-            "significance_score": significance_score,
+            # Renamed from "significance_score" (report review round 10):
+            # this is `InterpretationEngine`'s own pre-`ACMGRuleEngine`
+            # scoring system (ClinVar-concordance + gnomAD/ClinGen/
+            # MMSplice weights, `_SIGNIFICANCE_WEIGHT` above) -- not
+            # derived from the 28 Tavtigian ACMG/AMP criteria at all.
+            # The bare name "significance_score", serialized verbatim
+            # into geper_results.json right beside
+            # interpretation.acmg_evaluation.classification, reads as
+            # the ACMG score to a JSON consumer with no repo access --
+            # confirmed as a real, made-that-mistake-myself failure
+            # mode, not a hypothetical one. `acmg_evaluation.net_points`
+            # is the real Tavtigian number (see `ACMGRuleEngine.
+            # _combine`/`CombineResult` in pipeline/acmg_rules.py).
+            "legacy_pre_acmg_significance_score": significance_score,
             "supporting_evidence": evidence,
             "acmg_evaluation": acmg_evaluation,
         }
@@ -366,38 +448,124 @@ class InterpretationEngine:
                 rna_result=rna_result,
             )
 
-            # Phase 3: independent confidence scoring, applied on top of
-            # the InterpretationResult Phase 2 just built. Reuses its
-            # `conflicting_evidence` / `ai_consensus` (already derived,
-            # not recomputed) alongside the same raw provider dicts.
-            # Only these three fields are set here -- everything else on
-            # `result_obj` (acmg_classification, triggered_rules, etc.)
-            # is untouched.
-            confidence_result = None  # pre-initialized so Phase 6 below can safely check "did this run"
+            # HIGH-1: the conflicts Phases 3 and 4 score against,
+            # computed once here, ahead of both. This is the hoist
+            # `ConflictResolutionEngine.real_conflicts_for_scoring`
+            # documents -- I2's shape, not a second approach: a cheap
+            # side-effect-free re-run of the detectors rather than a
+            # reordering of the phases, which is impossible while Phase
+            # 6 renders Phases 3/4's penalties into its own text.
+            #
+            # THE COUPLING BELOW IS INTENTIONAL AND IS THE POINT. After
+            # this, three consumers read one definition of "a real
+            # conflict": Phase 6's Attention flag (via conflict_
+            # severity), Phase 3's confidence penalty and Phase 4's
+            # priority penalty. Phase 4 additionally has the J3 floor,
+            # which raises its category from that same severity -- so a
+            # single Clinical disagreement now both lowers Phase 4's
+            # score and can raise its category. That is deliberate:
+            # the penalty says "this finding's evidence is less
+            # coherent", the floor says "a human must look at it
+            # anyway", and they are answers to different questions.
+            # Before this change they could not collide only because
+            # they read different inputs, which is not a design.
             try:
-                confidence_result = self._confidence_engine.score(
+                real_conflicts = self._conflict_engine.real_conflicts_for_scoring(
+                    acmg_classification=result_obj.acmg_classification,
+                    acmg_conflicting_evidence=result_obj.conflicting_evidence,
+                    ai_consensus=result_obj.ai_consensus,
                     clinvar_result=clinvar_result,
                     clingen_result=clingen_result,
                     gnomad_result=gnomad_result,
-                    dbsnp_result=dbsnp_result,
                     alphamissense_result=alphamissense_result,
                     mmsplice_result=mmsplice_result,
-                    dna_models_used=dna_models_used,
-                    rna_result=rna_result,
-                    protein_result=protein_result,
                     uniprot_result=uniprot_result,
                     interpro_result=interpro_result,
                     alphafold_result=alphafold_result,
                     blast_result=blast_result,
-                    conflicting_evidence=result_obj.conflicting_evidence,
-                    ai_consensus=result_obj.ai_consensus,
                 )
-                result_obj.confidence_score = confidence_result.score
-                result_obj.confidence_label = confidence_result.label
-                result_obj.confidence_pending = False
-                result_obj.confidence_breakdown = confidence_result.to_dict()
             except Exception:
-                logger.exception("Confidence engine failed; confidence_pending remains True.")
+                # NOT `real_conflicts = []`. That was this block's first
+                # form and it was wrong in the one direction that
+                # matters: an empty list is indistinguishable from "no
+                # conflicts were detected", and it REMOVES a penalty --
+                # so a crashed detector would make a variant look MORE
+                # confident and higher-scoring than a working one. The
+                # absence-versus-failure confusion, inside the fix for a
+                # scoring defect, failing toward the flattering answer.
+                #
+                # `None` is the sentinel, and it is not a quieter zero:
+                # Phases 3 and 4 below skip scoring entirely when they
+                # see it, leaving `confidence_pending` /
+                # `priority_pending` True. The report then renders
+                # "Pending" for this finding instead of a number nobody
+                # can stand behind -- absence expressed as absence,
+                # which is what the four-status work established for
+                # models and what Finding 5 established for sources.
+                #
+                # `logger.exception` alone would not be enough: the log
+                # is not part of the output bundle, which is the whole
+                # point of Finding 5. So the failure is also recorded on
+                # the health registry, which carries it into
+                # `service_health` and out through every renderer.
+                logger.exception(
+                    "Real-conflict detection failed; withholding this variant's confidence and "
+                    "priority scores rather than scoring it as conflict-free."
+                )
+                HEALTH.note_component_failure(_CONFLICT_DETECTION_COMPONENT)
+                real_conflicts = None
+
+            # Phase 3: independent confidence scoring, applied on top of
+            # the InterpretationResult Phase 2 just built. Reuses its
+            # `real_conflicts` (hoisted just above) / `ai_consensus`
+            # (already derived, not recomputed) alongside the same raw
+            # provider dicts.
+            # Only these three fields are set here -- everything else on
+            # `result_obj` (acmg_classification, triggered_rules, etc.)
+            # is untouched.
+            confidence_result = None  # pre-initialized so Phase 6 below can safely check "did this run"
+            # Detection failed (see the sentinel's comment above).
+            # Scoring anyway would score the variant as conflict-free,
+            # which is the flattering direction. Guarded here rather
+            # than raised into the handler below, so the log says what
+            # actually happened instead of blaming the confidence
+            # engine for a failure that was not its own.
+            if real_conflicts is None:
+                logger.warning(
+                    "Confidence not scored for this variant: real-conflict detection was "
+                    "unavailable, and scoring without it would report the variant as "
+                    "conflict-free. confidence_pending remains True."
+                )
+            else:
+                try:
+                    confidence_result = self._confidence_engine.score(
+                        clinvar_result=clinvar_result,
+                        clingen_result=clingen_result,
+                        gnomad_result=gnomad_result,
+                        dbsnp_result=dbsnp_result,
+                        alphamissense_result=alphamissense_result,
+                        mmsplice_result=mmsplice_result,
+                        dna_models_used=dna_models_used,
+                        rna_result=rna_result,
+                        protein_result=protein_result,
+                        uniprot_result=uniprot_result,
+                        interpro_result=interpro_result,
+                        alphafold_result=alphafold_result,
+                        blast_result=blast_result,
+                        # HIGH-1 call site 1 of 2. The raw
+                        # `result_obj.conflicting_evidence` is per-criterion
+                        # caveats, which D4 already ruled are not conflicts;
+                        # scoring against them is what moved three of five
+                        # confidence bands on the nuclear_test run.
+                        real_conflicts=real_conflicts,
+                        ai_consensus=result_obj.ai_consensus,
+                    )
+                    result_obj.confidence_score = confidence_result.score
+                    result_obj.confidence_label = confidence_result.label
+                    result_obj.confidence_pending = False
+                    result_obj.confidence_breakdown = confidence_result.to_dict()
+                except Exception:
+                    logger.exception("Confidence engine failed; confidence_pending remains True.")
 
             # Phase 4: variant prioritization. Independent scoring logic
             # from Phase 1/3, but explicitly takes the ACMG
@@ -408,46 +576,61 @@ class InterpretationEngine:
             # -- see `prioritization_engine.rank_batch`, applied once by
             # the orchestrator after every variant in a run is scored.
             priority_result = None  # pre-initialized so Phase 6 below can safely check "did this run"
-            try:
-                triggered_codes = [c.get("code") for c in result_obj.triggered_rules]
-                # Report review round 4, I2: cheaply re-runs the same
-                # Critical-conflict check Phase 6 will do properly below
-                # (via `ConflictResolutionEngine.has_critical_conflict`,
-                # a thin wrapper around `_expert_panel_disagreement_
-                # conflict`) so Phase 4 can floor review priority at
-                # Critical when it fires -- Phase 6 itself can't run
-                # first here, since it needs Phase 4's own conflict-
-                # penalty output as one of its inputs.
-                critical_conflict = self._conflict_engine.has_critical_conflict(
-                    result_obj.acmg_classification, clinvar_result
+            # Same guard as Phase 3, and it matters more here: an
+            # unpenalised priority score is what sorts a finding to
+            # the top of a reviewer's worklist. A crashed detector
+            # must not promote a variant.
+            if real_conflicts is None:
+                logger.warning(
+                    "Review priority not scored for this variant: real-conflict detection was "
+                    "unavailable, and scoring without it would report the variant as "
+                    "conflict-free. priority_pending remains True."
                 )
-                priority_result = self._prioritization_engine.score(
-                    acmg_classification=result_obj.acmg_classification,
-                    confidence_score=result_obj.confidence_score,
-                    triggered_rule_codes=triggered_codes,
-                    clinvar_result=clinvar_result,
-                    clingen_result=clingen_result,
-                    gnomad_result=gnomad_result,
-                    dbsnp_result=dbsnp_result,
-                    alphamissense_result=alphamissense_result,
-                    mmsplice_result=mmsplice_result,
-                    dna_models_used=dna_models_used,
-                    rna_result=rna_result,
-                    protein_result=protein_result,
-                    interpro_result=interpro_result,
-                    alphafold_result=alphafold_result,
-                    blast_result=blast_result,
-                    ai_consensus=result_obj.ai_consensus,
-                    conflicting_evidence=result_obj.conflicting_evidence,
-                    critical_conflict=critical_conflict,
-                )
-                result_obj.priority_score = priority_result.score
-                result_obj.priority_category = priority_result.category
-                result_obj.priority_pending = False
-                result_obj.priority_explanation = priority_result.explanation
-                result_obj.priority_breakdown = priority_result.to_dict()
-            except Exception:
-                logger.exception("Prioritization engine failed; priority_pending remains True.")
+            else:
+                try:
+                    triggered_codes = [c.get("code") for c in result_obj.triggered_rules]
+                    # Report review round 4, I2: cheaply re-runs the same
+                    # Critical-conflict check Phase 6 will do properly below
+                    # (via `ConflictResolutionEngine.has_critical_conflict`,
+                    # a thin wrapper around `_expert_panel_disagreement_
+                    # conflict`) so Phase 4 can floor review priority at
+                    # Critical when it fires -- Phase 6 itself can't run
+                    # first here, since it needs Phase 4's own conflict-
+                    # penalty output as one of its inputs.
+                    critical_conflict = self._conflict_engine.has_critical_conflict(
+                        result_obj.acmg_classification, clinvar_result
+                    )
+                    priority_result = self._prioritization_engine.score(
+                        acmg_classification=result_obj.acmg_classification,
+                        confidence_score=result_obj.confidence_score,
+                        triggered_rule_codes=triggered_codes,
+                        clinvar_result=clinvar_result,
+                        clingen_result=clingen_result,
+                        gnomad_result=gnomad_result,
+                        dbsnp_result=dbsnp_result,
+                        alphamissense_result=alphamissense_result,
+                        mmsplice_result=mmsplice_result,
+                        dna_models_used=dna_models_used,
+                        rna_result=rna_result,
+                        protein_result=protein_result,
+                        interpro_result=interpro_result,
+                        alphafold_result=alphafold_result,
+                        blast_result=blast_result,
+                        ai_consensus=result_obj.ai_consensus,
+                        # HIGH-1 call site 2 of 2, and not a formality: this
+                        # is the one that demoted TP53 R248W from High
+                        # review priority to Moderate. Fixing only the
+                        # confidence engine leaves that in place.
+                        real_conflicts=real_conflicts,
+                        critical_conflict=critical_conflict,
+                    )
+                    result_obj.priority_score = priority_result.score
+                    result_obj.priority_category = priority_result.category
+                    result_obj.priority_pending = False
+                    result_obj.priority_explanation = priority_result.explanation
+                    result_obj.priority_breakdown = priority_result.to_dict()
+                except Exception:
+                    logger.exception("Prioritization engine failed; priority_pending remains True.")
 
             # Phase 6: conflict resolution. Purely additive and purely
             # documentary -- never touches acmg_classification or the
@@ -575,7 +758,10 @@ class InterpretationEngine:
         testable without constructing a full InterpretationEngine call
         (see tests/test_gnomad_acmg.py).
         """
-        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error"):
+        # `error` by presence -- see `acmg_rules.py::_pm2`: a failed
+        # lookup must contribute no evidence and no score weight, and
+        # an empty error message is still a failure.
+        if not gnomad_result or gnomad_result.get("skipped") or gnomad_result.get("error") is not None:
             return []
 
         cfg = CONFIG.gnomad
@@ -620,6 +806,46 @@ class InterpretationEngine:
                     -2.0,
                 )
             )
+        # FIX #15 (ruling, 2026-08-31): this PM2 branch reads `global_af`
+        # bare while `ba1_bs1_af` two lines up is popmax-aware -- NOT a
+        # bug to make symmetric. `ACMGRuleEngine._pm2` (acmg_rules.py)
+        # is the real, live-reaching PM2 evaluator, and it is
+        # deliberately asymmetric with `_ba1_bs1` for the same reason:
+        # BA1/BS1 and PM2 ask different questions. BA1/BS1 ask "is this
+        # variant common enough to be benign IN ANY population" --
+        # popmax (the highest population AF found anywhere) is the
+        # correct answer to that question. PM2 asks "is this variant
+        # rare in controls" for THIS patient -- popmax would suppress
+        # PM2 credit for a variant that is genuinely rare in the
+        # patient's own relevant population but happens to be common in
+        # some unrelated population gnomAD also samples, which is
+        # backwards. `ACMGRuleEngine._pm2` gets this right by using
+        # `CONFIG.gnomad.POPULATION_PRIORITY` (a configurable,
+        # deployment-target population's own AF) instead of popmax, via
+        # `_population_priority_context`, falling back to global AF only
+        # when the priority population has no data, with an explicit
+        # disclosure rather than a silent substitution.
+        #
+        # This branch is not a faithful mirror of that logic, though --
+        # it is an older, simpler implementation that happens not to
+        # have made the popmax mistake, but it also lacks the
+        # priority-population awareness the real evaluator has.
+        #
+        # ITS TEXT does not reach any report renderer: `evidence` text
+        # from this function is discarded by its only caller
+        # (`interpret()` reads `for _text, weight in ...`).
+        # ITS WEIGHT DOES REACH ONE, and this comment used to deny it --
+        # it said the weight "only feeds the legacy, unread
+        # `significance_score` / `legacy_pre_acmg_significance_score`
+        # path". CORRECTED 2026-09-11: the raw number is printed
+        # nowhere, but `_build_summary` turns the accumulated score into
+        # `summary`/`confidence`, which `report_generator.py::
+        # _render_interpretation` renders. So every weight below is
+        # reader-visible through what it decides, even though none of
+        # them is reader-visible as a number, and
+        # `tests/test_gnomad_weight_reaches_the_reader.py` pins that.
+        # Left as `global_af` rather than made popmax-aware -- that is
+        # the separately carded issue, not this one.
         elif global_af is not None and global_af <= cfg.PM2_AF_THRESHOLD:
             results.append(
                 (
@@ -648,18 +874,26 @@ class InterpretationEngine:
 
           - PVS1 support: when the translation predicts a
             loss-of-function change (`is_predicted_lof`) *and* the
-            gene has ClinGen-curated "sufficient evidence" for
-            haploinsufficiency, that combination is exactly what
-            ACMG/AMP's PVS1 rule requires as its gene-level
-            prerequisite (a LOF variant in a gene where LOF is an
-            established disease mechanism) -- so it's surfaced as
-            supporting evidence with a positive weight. Conversely, a
-            predicted LOF variant in a gene ClinGen has curated as
-            "dosage sensitivity unlikely" is a caution against a naive
-            PVS1 application, surfaced with a small negative weight
-            (never below what the protein-truncating evidence already
-            added -- this only tempers it, never reverses it to
-            benign on its own).
+            gene's haploinsufficiency score is one of
+            `DOSAGE_SUFFICIENT_EVIDENCE_SCORES`, that combination is
+            exactly what ACMG/AMP's PVS1 rule requires as its
+            gene-level prerequisite (a LOF variant in a gene where
+            losing one allele is established as sufficient to cause
+            disease) -- so it's surfaced as supporting evidence with a
+            positive weight. Membership, not a threshold: ClinGen's
+            score scale is not ordinal above 3 (see that constant).
+            Conversely, a predicted LOF variant in a gene ClinGen has
+            curated as "dosage sensitivity unlikely" is a caution
+            against a naive PVS1 application, surfaced with a small
+            negative weight (never below what the protein-truncating
+            evidence already added -- this only tempers it, never
+            reverses it to benign on its own). A gene curated as
+            "associated with autosomal recessive phenotype" gets a
+            third, explicitly neutral (0.0) disclosure: it is not
+            haploinsufficiency support, but it is also not the same
+            state as "no curation exists", and collapsing those two
+            into one silence is what let the previous defect here go
+            unnoticed.
           - Gene-disease clinical validity: the strongest curated
             classification for this gene contributes a modest,
             PP5/BP6-style gene-level signal (Definitive/Strong lean
@@ -672,7 +906,7 @@ class InterpretationEngine:
         independently unit-testable without constructing a full
         `InterpretationEngine` call (see tests/test_clingen_acmg.py).
         """
-        if not clingen_result or clingen_result.get("skipped") or clingen_result.get("error"):
+        if not clingen_result or clingen_result.get("skipped") or clingen_result.get("error") is not None:
             return []
         if not clingen_result.get("found"):
             return []
@@ -683,26 +917,82 @@ class InterpretationEngine:
 
         dosage = clingen_result.get("dosage_sensitivity")
         if is_predicted_lof and dosage:
-            hi_score = dosage.get("haploinsufficiency_score")
-            if (
-                hi_score is not None
-                and hi_score >= cfg.DOSAGE_SUFFICIENT_EVIDENCE_SCORE
-                and hi_score != cfg.DOSAGE_UNLIKELY_SCORE
-            ):
+            # HIGH 3 / T3-F2a (2026-08-28, ruled): verdict sourced from
+            # the shared `dosage_sensitivity_verdict` (pvs1/utils.py),
+            # passing this engine's own CONFIG.clingen thresholds through
+            # so its existing "all thresholds/configuration must remain
+            # configurable" guarantee is unaffected -- membership, not
+            # `>=`, is still what the shared function checks (ClinGen's
+            # Score column is not one ordinal range; 30 and 40 both argue
+            # AGAINST haploinsufficiency).
+            #
+            # PVS1's unconditional behaviour wins on WHICH SCORES produce
+            # evidence: this engine used to silently emit NOTHING for
+            # scores 0/1/2 ("curated, but not established"), collapsing
+            # that state into "no curation exists" -- a reviewer seeing
+            # nothing couldn't tell which. The LOF_NOT_ESTABLISHED branch
+            # below is new; every other branch's wording/weight is
+            # unchanged, since this engine's own scoring is not the
+            # shared function's decision to make.
+            mechanism, hi_score, hi_label = dosage_sensitivity_verdict(
+                clingen_result,
+                sufficient_scores=cfg.DOSAGE_SUFFICIENT_EVIDENCE_SCORES,
+                autosomal_recessive_score=cfg.DOSAGE_AUTOSOMAL_RECESSIVE_SCORE,
+                unlikely_score=cfg.DOSAGE_UNLIKELY_SCORE,
+            )
+            if mechanism == LOF_ESTABLISHED:
                 results.append(
                     (
                         f"ClinGen: {gene_symbol} has sufficient curated evidence for haploinsufficiency "
-                        f"({dosage.get('haploinsufficiency_label', 'n/a')}), supporting a PVS1-style "
+                        f"({hi_label}), supporting a PVS1-style "
                         f"interpretation of this predicted loss-of-function variant.",
                         1.5,
                     )
                 )
-            elif hi_score == cfg.DOSAGE_UNLIKELY_SCORE:
+            elif mechanism == LOF_REFUTED:
                 results.append(
                     (
-                        f"ClinGen: {gene_symbol} is curated as '{dosage.get('haploinsufficiency_label', 'dosage sensitivity unlikely')}' "
+                        f"ClinGen: {gene_symbol} is curated as '{hi_label}' "
                         f"-- a naive PVS1 application to this predicted loss-of-function variant should be applied with caution.",
                         -0.5,
+                    )
+                )
+            elif mechanism == LOF_ESTABLISHED_RECESSIVE:
+                # Deliberately weight 0.0, and deliberately not silent.
+                # ClinGen curating a gene as autosomal-recessive says
+                # one damaged allele is NOT sufficient, so this is not
+                # PVS1 gene-level support -- but it is a real curated
+                # finding, and dropping it on the floor would make it
+                # indistinguishable from "ClinGen has no dosage
+                # curation for this gene". What the correct non-zero
+                # weight would be is a clinical judgement, not an
+                # engineering one; 0.0 surfaces the finding for a
+                # reviewer without asserting a direction this module
+                # cannot justify (the convention
+                # `_biological_context_evidence` already uses).
+                results.append(
+                    (
+                        f"ClinGen: {gene_symbol} is curated as '{hi_label}' "
+                        f"(haploinsufficiency score {hi_score}), so ClinGen's dosage curation does not establish that a "
+                        f"single loss-of-function allele is sufficient to cause disease -- this predicted "
+                        f"loss-of-function variant gets no PVS1 gene-level support from dosage sensitivity. Loss of "
+                        f"function may still be this gene's disease mechanism when both alleles are affected.",
+                        0.0,
+                    )
+                )
+            elif mechanism == LOF_NOT_ESTABLISHED:
+                # New branch (HIGH 3 / T3-F2a): scores 0/1/2. Weight 0.0
+                # for the same reason as the autosomal-recessive branch
+                # above -- a real curated finding, not a directional
+                # claim this module can justify inventing.
+                results.append(
+                    (
+                        f"ClinGen: {gene_symbol} is curated for haploinsufficiency as '{hi_label}' "
+                        f"(score {hi_score}) -- curated evidence exists, but does not establish that a single "
+                        f"loss-of-function allele is sufficient to cause disease. This predicted loss-of-function "
+                        f"variant gets no PVS1 gene-level support from dosage sensitivity yet, but this is a "
+                        f"different state from 'ClinGen has no dosage curation for this gene at all'.",
+                        0.0,
                     )
                 )
 
@@ -757,7 +1047,14 @@ class InterpretationEngine:
         if (
             uniprot_result
             and not uniprot_result.get("skipped")
-            and not uniprot_result.get("error")
+            # INERT (2026-08-31): truthiness here, not `is not None`, but
+            # `found` two lines below already gates this branch, and a
+            # failure has no fallback text produced here at all (this
+            # function just appends nothing) -- so a genuine failure
+            # with error="" already produces the same silent-omission
+            # outcome, truthiness or not. Fixed to `is not None` for
+            # consistency only.
+            and uniprot_result.get("error") is None
             and uniprot_result.get("found")
         ):
             protein_name = uniprot_result.get("protein_name")
@@ -775,7 +1072,11 @@ class InterpretationEngine:
         if (
             interpro_result
             and not interpro_result.get("skipped")
-            and not interpro_result.get("error")
+            # INERT (2026-08-31): same reasoning as UniProt above --
+            # `found` two lines below already gates this branch, and a
+            # failure produces no fallback text here either way. Fixed
+            # to `is not None` for consistency only.
+            and interpro_result.get("error") is None
             and interpro_result.get("found")
         ):
             affected = interpro_result.get("affected_domains")
@@ -803,7 +1104,7 @@ class InterpretationEngine:
         if (
             alphafold_result
             and not alphafold_result.get("skipped")
-            and not alphafold_result.get("error")
+            and alphafold_result.get("error") is None
             and alphafold_result.get("found")
         ):
             band = alphafold_result.get("affected_residue_band")
@@ -814,15 +1115,24 @@ class InterpretationEngine:
                     f"(transcript-verified) is '{band}'."
                 )
             elif alphafold_result.get("mean_plddt_band"):
+                # `mapping_unavailable_reason` (models.py) is the mapping
+                # gate's own specific verdict for why residue-specific
+                # confidence isn't available -- state it when present
+                # rather than leaving the fallback unexplained.
+                reason = alphafold_result.get("mapping_unavailable_reason")
+                reason_clause = f" ({reason})" if reason else ""
                 lines.append(
                     f"AlphaFold DB: overall predicted structure confidence for this protein is "
-                    f"'{alphafold_result['mean_plddt_band']}' (mean pLDDT)."
+                    f"'{alphafold_result['mean_plddt_band']}' (mean pLDDT); residue-specific "
+                    f"confidence unavailable{reason_clause}."
                 )
 
         return lines
 
     @staticmethod
-    def _build_summary(chrom, pos, ref, alt, score: float, has_clinvar: bool) -> "tuple[str, str]":
+    def _build_summary(
+        chrom: object, pos: object, ref: object, alt: object, score: float, has_clinvar: bool
+    ) -> "tuple[str, str]":
         variant_label = f"{chrom}:{pos} {ref}>{alt}"
 
         if not has_clinvar:

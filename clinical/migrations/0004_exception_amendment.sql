@@ -1,0 +1,179 @@
+-- clinical/migrations/0004_exception_amendment.sql
+-- ────────────────────────────────────────────────
+-- THE EXCEPTION-AMENDMENT RELATIONSHIP, TENANT-BOUND AT THE DATABASE. Three
+-- objects and nothing else: a composite UNIQUE key on `exception_events`, the
+-- nullable column that carries the reference, and the COMPOSITE self-foreign
+-- key that makes a cross-organisation amendment INEXPRESSIBLE rather than
+-- merely unwritten. No vocabulary change, no verb, no route, no application
+-- code: this migration lands a RELATIONSHIP.
+--
+-- THE APPROVED DECISION, in the human's words: "The amendment relationship
+-- must be tenant/org-bound at the database level. Add the required composite
+-- uniqueness and make the self-reference composite so an amendment cannot
+-- reference an exception event belonging to another org. Do NOT use the held
+-- branch's unsafe single-column self-reference. Do NOT invent a different
+-- tenant model."
+--
+-- WHY THE UNIQUE KEY IS NEEDED AT ALL, AND WHY IT IS NOT REDUNDANT WITH THE
+-- PRIMARY KEY. PostgreSQL requires a foreign key's referenced column list to
+-- be covered by a unique constraint or unique index ON EXACTLY THOSE COLUMNS.
+-- `exception_events` carries `id UUID PRIMARY KEY` and, before this file,
+-- nothing over `(org_id, id)` -- so `REFERENCES exception_events (id, org_id)`
+-- cannot be created and Postgres answers SQLSTATE 42830. The key is what makes
+-- the composite reference EXPRESSIBLE; the composite reference is what makes
+-- the cross-tenant row inexpressible. Neither half works alone, which is why
+-- wrong-version B below fails to create at all.
+--
+-- WHERE THESE BYTES CAME FROM. They were DERIVED, and the derivation FAILED
+-- CLOSED at every stage; the script and its controls are in this wave's
+-- report. Three stages:
+--
+--   1. The 0003 test applied to this wave's held branch. `clinical/schema.sql`
+--      was read as bytes at 9bc3abd and at 95a33be (w126-reresolve-amendment)
+--      and line-diffed with difflib.SequenceMatcher. The result is a REFUSAL:
+--      5 opcodes, 18 inserted lines, and ONE `replace` -- the held branch
+--      rewrites `action TEXT NOT NULL CHECK (action IN ('open', 'resolve',
+--      'reopen'))` to add 'amend_resolution', and rewrites `action_note TEXT`
+--      to take a comma. A byte-wise lift in the 0003 style is therefore
+--      IMPOSSIBLE for this branch, and that refusal is not an obstacle to
+--      work around -- it is the MEASUREMENT that the action vocabulary is a
+--      DESTRUCTIVE change (an existing CHECK constraint must be dropped and
+--      recreated to widen it) and so is not in an additive migration. The
+--      refusal path was proved live on a control pair with a line deleted.
+--
+--   2. What may be taken from the held branch at all: the column's NAME and
+--      TYPE. The script requires the forbidden line
+--      `    amends_event_id UUID REFERENCES exception_events (id),` to be
+--      present VERBATIM -- it refuses to "derive" from a branch that does not
+--      say what we believe it says -- removes exactly the clause
+--      ` REFERENCES exception_events (id)`, and requires the residue to
+--      reconstruct the held line byte for byte when the clause is put back.
+--      The residue is `    amends_event_id UUID,`, which is what appears
+--      below. The refusal path was proved live against a held branch doctored
+--      to be already safe.
+--
+--   3. The two tenant objects are NOT from the held branch. They are derived
+--      by template substitution from the precedent ALREADY IN FORCE in
+--      `clinical/schema.sql` at 4d16b8f -- `exceptions_org_exception_unique
+--      UNIQUE (org_id, id)` and `exception_events_org_exception_fk FOREIGN KEY
+--      (exception_id, org_id) REFERENCES exceptions (id, org_id)` -- with the
+--      substitution refusing if either precedent string is absent, if the line
+--      count changes, or if any SQL KEYWORD differs from its template. This is
+--      not a new tenant model. It is the one this schema already applies to
+--      twenty of its twenty-nine org-scoped tables, measured by catalogue
+--      query rather than by grep (see the census note below).
+--
+-- WHAT THIS MIGRATION DELIBERATELY DOES NOT DO, AND WHY EACH IS A SEPARATE
+-- AUTHORISATION RATHER THAN AN OVERSIGHT:
+--
+--   * `'amend_resolution'` is NOT added to the `action` CHECK. Widening an
+--      inline CHECK means DROP CONSTRAINT then ADD CONSTRAINT, which is a
+--      destructive statement in a migration whose whole property is that it
+--      drops and renames nothing. Stage 1 above MEASURED that this is where
+--      the held branch stops being additive.
+--   * `exception_events_amendment_names_its_target CHECK ((action =
+--      'amend_resolution') = (amends_event_id IS NOT NULL))` is NOT here,
+--      because it cannot be: it names a value the vocabulary does not contain,
+--      and Postgres would accept the constraint while it could never be
+--      satisfied by an amendment. It belongs with the vocabulary.
+--   * No INSERT site changes. At 4d16b8f the three `INSERT INTO
+--      exception_events` statements in `clinical/data_access.py` already name
+--      `org_id` explicitly and none of them writes an amendment. The "four
+--      sites" figure in the dossier is the HELD branch's file (95a33be lines
+--      4060, 4090, 4145, 4179), none of which names `org_id`; that file is not
+--      being imported.
+--
+-- THE CONSEQUENCE, SAID PLAINLY: after this migration, an amendment row is
+-- STRUCTURALLY POSSIBLE and TENANT-BOUND, and NOTHING IN THIS REPOSITORY
+-- WRITES ONE. `amends_event_id` appears in no INSERT outside this wave's
+-- tests. The relationship is landed and proved; the verb that uses it is the
+-- next authorisation's.
+--
+-- THE CENSUS, RE-MEASURED, BECAUSE THE PREVIOUS ONE WAS WRONG. An earlier
+-- summary said `exception_events` was "the only" org-scoped table lacking the
+-- composite key. It is not. Measured by building a database from
+-- `clinical/schema.sql` at 4d16b8f and querying `pg_catalog` (a text search
+-- cannot see a named CONSTRAINT, a separate CREATE UNIQUE INDEX, or a primary
+-- key not called `id`): 31 tables in `public`, 29 carrying `org_id`, 20 with a
+-- UNIQUE key over (org_id, <single-column primary key>), EIGHT without --
+-- audit_log, exception_events, external_identifiers, patient_sessions,
+-- role_assignments, sessions, tests, totp_backup_codes -- and one not
+-- applicable (`organisations`, whose primary key IS org_id). THE OTHER SEVEN
+-- ARE NOT TOUCHED. The human's boundary is explicit: "Do NOT alter unrelated
+-- org-scoped tables merely because they lack composite keys."
+--
+-- MATCH SIMPLE IS CORRECT HERE AND IS A REAL DIFFERENCE FROM THE PRECEDENT.
+-- `exception_events_org_exception_fk` references two NOT NULL columns, so its
+-- match semantics never mattered. `amends_event_id` is NULLABLE -- an `open`,
+-- `resolve` or `reopen` row amends nothing -- and under the default MATCH
+-- SIMPLE a row whose `amends_event_id` is NULL skips the check entirely, which
+-- is exactly the intent. When `amends_event_id` IS set, `org_id` is NOT NULL,
+-- so both referencing columns are non-null and the check runs in full. There
+-- is no hole: MATCH SIMPLE can only be evaded by nulling a referencing column,
+-- and nulling `amends_event_id` is nulling the amendment itself.
+--
+-- ORDERING WITHIN THIS FILE IS NOT A STYLE CHOICE. The UNIQUE key must exist
+-- before the FOREIGN KEY that requires it; run the third statement first and
+-- Postgres answers 42830. The three statements are one transaction, as every
+-- migration here is, so a half-applied amendment relationship is not a state
+-- this database can be in.
+--
+-- ORDERING RELATIVE TO 0002 AND 0003. This file depends on `exception_events`
+-- carrying `org_id`, which is a BASELINE-generation fact (w129b tenant
+-- isolation). Against a pre-security database the `ALTER TABLE ... ADD
+-- CONSTRAINT ... UNIQUE (org_id, id)` RAISES 42703 (`column "org_id" does not
+-- exist`) rather than refusing politely -- the DDL is the thing that fails, so
+-- the refusal is Postgres's. The runner's own refusal is EARLIER, at adoption,
+-- and is what a wrong-generation database actually meets first. Both are
+-- asserted in `clinical/tests/test_w149_migration_0004_amendment.py`. It does
+-- NOT depend on 0003: the retraction tables and the amendment relationship
+-- share nothing, and this file would apply to a 0002-only database if the set
+-- allowed it -- which the runner does not, because versions apply in order.
+--
+-- THE POST-CONDITIONS BELOW ARE THE WEAK HALF AND SAY SO. A `MIGRATION-ASSERT`
+-- line is a bare `to_regclass` probe. It can see the INDEX Postgres builds for
+-- the UNIQUE constraint, because an index is a relation; it CANNOT see the
+-- column or the foreign key, which are the facts that separate this generation
+-- from the one before it. Those are the GENERATION INVARIANTS and they live in
+-- `clinical/migrate.py` under `(4, "exception_amendment")`, for the reason
+-- stated at length there: this file's checksum is stamped by
+-- `clinical/schema.sql`, so its bytes are frozen the moment it ships. Both
+-- sets are evaluated by the same `_failed_assertions` loop on every
+-- `inspect_state`, so `/readyz` sees both.
+--
+-- MIGRATION-ASSERT: to_regclass('exception_events') IS NOT NULL
+-- MIGRATION-ASSERT: to_regclass('exception_events_org_event_unique') IS NOT NULL
+
+
+-- ─── w149: the composite target ─────────────────────────────────────────────
+--
+-- Derived from `exceptions_org_exception_unique UNIQUE (org_id, id)`, the key
+-- that `exception_events_org_exception_fk` already binds to. See
+-- `users_org_user_unique`'s comment in clinical/schema.sql for why a unique
+-- key over (tenant, primary key) is not redundant with the primary key: it is
+-- not there to enforce uniqueness, which the primary key already does. It is
+-- there to be a FOREIGN KEY TARGET that carries the tenant.
+ALTER TABLE exception_events
+    ADD CONSTRAINT exception_events_org_event_unique UNIQUE (org_id, id);
+
+
+-- ─── w149: the column that carries the reference ────────────────────────────
+--
+-- NULLABLE, and its being NULL on every non-amendment row is what makes it
+-- mean something when set. Added with no DEFAULT, so PostgreSQL rewrites no
+-- heap and the statement is a catalogue update.
+ALTER TABLE exception_events
+    ADD COLUMN amends_event_id UUID;
+
+
+-- ─── w149: the self-reference, COMPOSITE ────────────────────────────────────
+--
+-- The whole point of the wave, in one clause. The schema's own comment on this
+-- table states the defect the single-column form has: "a foreign key that does
+-- not carry the tenant asks 'does this id exist?' when the question is 'does
+-- this id exist HERE?'." An amendment naming another organisation's event is
+-- not refused at runtime by code someone has to remember to write -- the row
+-- cannot be written at all.
+ALTER TABLE exception_events
+    ADD CONSTRAINT exception_events_amends_event_fk
+        FOREIGN KEY (amends_event_id, org_id) REFERENCES exception_events (id, org_id);

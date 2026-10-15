@@ -184,9 +184,7 @@ class TestModelRegistry(unittest.TestCase):
         registry.register("available_a", _AlwaysAvailableFakePlugin)
         registry.register("available_b", _SecondAvailableFakePlugin)
         registry.register("unavailable", _UnavailableFakePlugin)
-        self.assertEqual(
-            registry.available_keys(), ["available_a", "available_b"]
-        )
+        self.assertEqual(registry.available_keys(), ["available_a", "available_b"])
 
     def test_all_metadata_returns_every_registered_key(self):
         registry = ModelRegistry()
@@ -228,6 +226,58 @@ class TestWeightCache(unittest.TestCase):
             cache = WeightCache(cache_dir=d)
             missing = Path(d) / "nope.bin"
             self.assertFalse(cache.verify_checksum(missing, "0" * 64))
+
+    def test_verify_checksum_detailed_none_expected_no_actual_computed(self):
+        # No bytes are read when there is nothing to check against -- the
+        # actual hash must be None, not a value nobody asked for.
+        with tempfile.TemporaryDirectory() as d:
+            cache = WeightCache(cache_dir=d)
+            path = Path(d) / "f.bin"
+            path.write_bytes(b"data")
+            result = cache.verify_checksum_detailed(path, expected_sha256=None)
+            self.assertTrue(result.matches)
+            self.assertIsNone(result.actual_sha256)
+
+    def test_verify_checksum_detailed_match_returns_actual_hash(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = WeightCache(cache_dir=d)
+            path = Path(d) / "f.bin"
+            path.write_bytes(b"hello world")
+            correct = cache.sha256_of(path)
+            result = cache.verify_checksum_detailed(path, correct)
+            self.assertTrue(result.matches)
+            self.assertEqual(result.actual_sha256, correct)
+
+    def test_verify_checksum_detailed_mismatch_still_returns_actual_hash(self):
+        # THE CARD: a mismatch must not discard the hash it computed to
+        # reach that verdict -- this is the value a refusal needs to name.
+        with tempfile.TemporaryDirectory() as d:
+            cache = WeightCache(cache_dir=d)
+            path = Path(d) / "f.bin"
+            path.write_bytes(b"hello world")
+            correct = cache.sha256_of(path)
+            result = cache.verify_checksum_detailed(path, "0" * 64)
+            self.assertFalse(result.matches)
+            self.assertEqual(result.actual_sha256, correct)
+
+    def test_verify_checksum_detailed_missing_file_no_actual_computed(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = WeightCache(cache_dir=d)
+            missing = Path(d) / "nope.bin"
+            result = cache.verify_checksum_detailed(missing, "0" * 64)
+            self.assertFalse(result.matches)
+            self.assertIsNone(result.actual_sha256)
+
+    def test_verify_checksum_still_bool_and_unchanged(self):
+        # `verify_checksum` itself must keep its exact pre-change contract --
+        # a thin wrapper, bool only, for its existing callers.
+        with tempfile.TemporaryDirectory() as d:
+            cache = WeightCache(cache_dir=d)
+            path = Path(d) / "f.bin"
+            path.write_bytes(b"hello world")
+            correct = cache.sha256_of(path)
+            self.assertIs(cache.verify_checksum(path, correct), True)
+            self.assertIs(cache.verify_checksum(path, "0" * 64), False)
 
     def test_clear_removes_plugin_directory(self):
         with tempfile.TemporaryDirectory() as d:
@@ -330,7 +380,6 @@ class TestModelManager(unittest.TestCase):
         )
         self.assertNotIn("unavailable", self.manager.registry.available_keys())
 
-
         with self.assertRaises(PluginUnavailableError) as ctx:
             self.manager.get("unavailable")
         self.assertIn("license unverified (test)", str(ctx.exception))
@@ -348,9 +397,7 @@ class TestModelManager(unittest.TestCase):
             self.manager.get("broken_load")
         # Second attempt must return the *same* remembered failure
         # without invoking the plugin class's _load_impl again.
-        with mock.patch.object(
-            _FailsToLoadFakePlugin, "_load_impl", side_effect=AssertionError("must not retry")
-        ):
+        with mock.patch.object(_FailsToLoadFakePlugin, "_load_impl", side_effect=AssertionError("must not retry")):
             with self.assertRaises(PluginUnavailableError):
                 self.manager.get("broken_load")
 
@@ -402,7 +449,6 @@ class TestModelManager(unittest.TestCase):
         self.assertIsInstance(manager.weight_cache, WeightCache)
 
 
-
 class TestPendingPluginsRegisterAsUnavailable(unittest.TestCase):
     """Confirms Enformer/Borzoi/SpliceFormer participate in the exact
     same framework the mocked tests above exercise. All three are
@@ -443,11 +489,41 @@ class TestPendingPluginsRegisterAsUnavailable(unittest.TestCase):
         self.assertEqual("spliceformer" in available, SpliceFormerPlugin.is_available())
 
     def test_manager_predict_never_crashes_for_any_pending_plugin(self):
+        # Round 21: this used to assert `predict()` returns None for
+        # each key, which was really asserting "none of these optional
+        # packages happen to be pip-installed in whatever environment
+        # runs this test" -- true by accident, not by design (this
+        # class's own docstring says the opposite: these plugins
+        # "become available automatically whenever their optional pip
+        # package/dependency is installed"). It broke the moment
+        # enformer-pytorch was actually installed and Enformer loaded
+        # for real -- ~400s of genuine weight loading + inference on an
+        # 8GB machine, exactly what this module's own docstring says
+        # every test here must stay independent of.
+        #
+        # What the test's own name actually promises -- predict() never
+        # *crashes*, for any pending plugin, regardless of what's
+        # installed -- doesn't need real installs either way: `.get()`
+        # short-circuits to `PluginUnavailableError` (which `.predict()`
+        # catches and turns into a plain `None`, per its own docstring)
+        # the moment `model_cls.is_available()` says no, before any
+        # package import or weight load is attempted. Forcing that
+        # False deterministically tests the actual contract -- "never
+        # crashes when unavailable" -- without depending on, or being
+        # broken by, this environment's own installed packages.
+        from pipeline.models.borzoi_plugin import BorzoiPlugin
+        from pipeline.models.enformer_plugin import EnformerPlugin
         from pipeline.models.pending_plugins import build_default_registry
+        from pipeline.models.spliceformer_plugin import SpliceFormerPlugin
 
         manager = ModelManager(registry=build_default_registry())
-        for key in ("enformer", "borzoi", "spliceformer"):
-            self.assertIsNone(manager.predict(key, "ACGT...ref", "ACGT...alt"))
+        with (
+            mock.patch.object(EnformerPlugin, "is_available", return_value=False),
+            mock.patch.object(BorzoiPlugin, "is_available", return_value=False),
+            mock.patch.object(SpliceFormerPlugin, "is_available", return_value=False),
+        ):
+            for key in ("enformer", "borzoi", "spliceformer"):
+                self.assertIsNone(manager.predict(key, "ACGT...ref", "ACGT...alt"))
 
     def test_metadata_never_asserts_unverified_license_as_true(self):
         # Updated for the completed license audit: Enformer and Borzoi

@@ -32,6 +32,7 @@ from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils.profiling import StageProfiler
+from component_identity import SHORT_NAME
 
 from config import CONFIG
 from database.blast_client import BLASTClient
@@ -39,7 +40,15 @@ from database.clinvar_client import ClinVarClient
 from database.dbsnp_client import DbSNPClient
 from models import MODEL_REGISTRY as _BASE_MODEL_REGISTRY
 from models.alphamissense import catalogue_cache_path as alphamissense_catalogue_cache_path
-from pipeline.assembly_validator import validate_assembly
+from pipeline.assembly_validator import mito_only_exemption_reason, validate_assembly
+from pipeline.acmg_rules import (
+    mtdna_alphamissense_skip_result,
+    mtdna_ensemble_skip_result,
+    mtdna_gnomad_skip_result,
+    mtdna_mmsplice_skip_result,
+    mtdna_splice_plugin_skip_result,
+    non_protein_coding_gene_reason,
+)
 from pipeline.alphafold.lookup import AlphaFoldLookup
 import pipeline.clingen.bootstrap as clingen_bootstrap
 from pipeline.clingen.lookup import ClinGenLookup
@@ -69,15 +78,27 @@ from pipeline.models.status import build_ai_model_status, rollup_run_status
 from pipeline.prioritization_engine import rank_batch
 from pipeline.protein_translator import ProteinTranslator
 from pipeline.provenance import (
+    NOT_READ_MARKER,
+    TOOL_SOURCE_ALIGNER,
+    TOOL_SOURCE_BCFTOOLS,
+    TOOL_SOURCE_CALLER,
+    TOOL_SOURCE_HTSLIB,
+    TOOL_SOURCE_SAMTOOLS,
+    TOOL_SOURCE_TABIX,
+    RetrievalMode,
     RunProvenanceCollector,
     VersionStatus,
     capture_blast_local_tool_versions,
     capture_ensembl_release,
+    capture_tool_version,
+    parse_vcf_tool_stamps,
     finalize_model_checkpoint_provenance,
     get_geper_code_version,
     get_model_checkpoint_identifiers,
     local_file_provenance,
     read_dataset_provenance_sidecar,
+    reset_loaded_model_artifacts,
+    verify_loaded_model_artifacts,
 )
 from pipeline.ps1_pm5.lookup import ClinVarCodonLookup
 from pipeline.pvs1.lookup import TranscriptLookup
@@ -90,9 +111,10 @@ from pipeline.sequence_context import SequenceContextGenerator
 from pipeline.uniprot.lookup import UniProtLookup
 from pipeline.vcf_parser import Variant, VCFParser
 from report.json_builder import JSONResultBuilder, build_variant_result
-from report.summary import _parse_patient_meta, generate_pdf
+from report.summary import _parse_patient_meta, _parse_qc_metrics, generate_pdf
 from report.summary_short import generate_short_pdf
 from report.report_generator import ReportGenerator
+from utils.service_health import HEALTH
 from utils.exceptions import (
     AssemblyMismatchError,
     ExternalAPIError,
@@ -105,6 +127,7 @@ from utils.exceptions import (
 from utils.device_utils import log_environment_versions
 from utils.logger import get_logger
 from utils.model_cache import ModelCache
+from utils.output_paths import ensure_writable_output_dir
 
 logger = get_logger(__name__)
 
@@ -169,32 +192,24 @@ _MODEL_DISPLAY_NAMES = {
     "splicebert": "SpliceBERT",
 }
 
-# Report review round 8: a chrM variant used to reach the full ACMG
-# engine and pick up PM2 (gnomAD queried its nuclear-only callset,
-# found nothing, and that "not found" was read as a rarity signal
-# rather than "queried the wrong resource") and BP4 (MMSplice/Enformer/
-# Borzoi -- nuclear-trained sequence models, out of distribution on
-# mitochondrial DNA, which has no spliceosome at all) -- both firing
-# specifically BECAUSE nothing else could (no transcript resolves for
-# chrM against GEPER's nuclear GTF/Ensembl data, so the 23 criteria
-# that correctly gate on transcript resolution stayed silent while the
-# two that don't gate on it fired on out-of-distribution inputs, on a
-# real MELAS-causing variant). Option (a) of two considered: reject at
-# this single compartment gate, entirely bypassing the 28-criterion
-# engine, rather than (b) a NOT_APPLICABLE status threaded through
-# every affected evidence source individually -- see ROUND_CANDIDATES.md
-# for why (b) is deferred, not abandoned, and for the audit of exactly
-# which call sites it would need to touch.
-_MITOCHONDRIAL_OUT_OF_SCOPE_REASON = (
-    "Mitochondrial variants are out of scope for this GEPER build. GEPER's evidence sources have "
-    "no validity on chrM: gnomAD's queryable callset here is the nuclear one, a separate resource "
-    "from gnomAD's mitochondrial callset (never queried by this pipeline); the nuclear-trained "
-    "sequence/splicing models (MMSplice, Enformer, Borzoi, SpliceFormer, SpliceBERT) are out of "
-    "distribution on mtDNA, which has no spliceosome; and transcript resolution depends on nuclear "
-    "GTF/Ensembl data that does not cover chrM. This variant was not evaluated against any ACMG/AMP "
-    "criterion -- it is reported here as an explicit out-of-scope entry, never as a Variant of "
-    "Uncertain Significance assembled from criteria that should not have been able to fire."
-)
+# Report review round 8 rejected every chrM variant here outright (see
+# git history for `_MITOCHONDRIAL_OUT_OF_SCOPE_REASON`/
+# `_mitochondrial_out_of_scope_result`, removed in round 14, B2): gnomAD's
+# nuclear-only callset and the nuclear-trained splice models (MMSplice/
+# Enformer/Borzoi/SpliceFormer/SpliceBERT) were firing on mtDNA they have
+# no validity for, specifically because nothing else could (no transcript
+# resolved for chrM at the time, so the criteria that correctly gate on
+# transcript resolution stayed silent while the two that didn't gate on it
+# fired on out-of-distribution inputs). Round 14 fixed transcript
+# resolution (B1) and replaced the whole-variant rejection with
+# per-criterion, per-evidence-source compartment gating instead -- see
+# `_process_variant`'s `is_mtdna_variant` gate and
+# `pipeline/acmg_rules.py::ACMGRuleEngine.evaluate`'s own compartment gate.
+# The generic `out_of_scope` result shape / `_classify_variant_result`
+# bucket / report-renderer branches below are NOT removed -- they were
+# never mtDNA-specific in the code, only in their one prior caller, and
+# remain legitimate infrastructure for a future genuinely-unassessable
+# variant class (e.g. an unsupported contig or structural-variant type).
 
 # Maps a `FunctionalEvidenceResult.consulted_sources` entry (see
 # `pipeline/functional_evidence/models.py`) onto the `KNOWN_SOURCES`
@@ -348,7 +363,17 @@ class GeperPipeline:
         self.profiler = StageProfiler()
 
         self.output_dir = output_dir or CONFIG.OUTPUT_DIR
-        os.makedirs(self.output_dir, exist_ok=True)
+        # Round 19: creates AND verifies --output-dir is genuinely
+        # writable (a bare `os.makedirs(exist_ok=True)` only ever
+        # confirms the path exists, never that it's currently
+        # writable) -- raises PipelineError immediately if not, before
+        # any model load or network call below. See
+        # `utils/output_paths.py::ensure_writable_output_dir`'s own
+        # docstring for the real run this is fixing: 51 minutes of
+        # processing, all 6 variants successfully completed, discarded
+        # at the very last line because the output path had become
+        # unwritable.
+        ensure_writable_output_dir(self.output_dir)
         # Optional path to a patient-metadata JSON file for the clinical
         # PDF report's header (report/summary.py::generate_pdf). None by
         # default -- the report then renders the safe "De-identified /
@@ -483,6 +508,10 @@ class GeperPipeline:
         """
         self.geper_code_version = get_geper_code_version()
         self.model_checkpoints = get_model_checkpoint_identifiers()
+        # A previous run in this process observed a different set of files.
+        # Clearing here, at the same point the collector clears its own stale
+        # fallbacks, is what keeps `loaded_artifact` a claim about THIS run.
+        reset_loaded_model_artifacts()
 
         try:
             ensembl = capture_ensembl_release()
@@ -514,6 +543,136 @@ class GeperPipeline:
             logger.warning(f"BLAST tool-version provenance capture failed: {exc}")
 
         self._capture_bootstrapped_datasets_provenance()
+
+    def _capture_tool_provenance(self, vcf_header_lines: List[str]) -> None:
+        """
+        Records the versions of the tools that produced this report (the
+        human's ruling, 2026-09-11), each MEASURED where it ran -- see
+        `pipeline/provenance.py`'s tool-version block for why tabix is read
+        from its binary while the VCF's creating software and bcftools are read from
+        the input VCF's own header, and why samtools cannot be recorded here.
+        Never a pinned or default value: anything unreadable is recorded as
+        UNKNOWN with the reason. Never raises.
+        """
+        try:
+            measured: Dict[str, Dict[str, Optional[str]]] = {}
+            uses = [
+                ("AlphaMissense lookups", CONFIG.alphamissense.TABIX_BINARY),
+                ("gnomAD local lookups", CONFIG.gnomad.TABIX_BINARY),
+            ]
+            for _, binary in uses:
+                if binary not in measured:
+                    measured[binary] = capture_tool_version(binary)
+            versions = {b: r["version"] for b, r in measured.items() if r["version"]}
+            if not versions:
+                self.provenance.record(
+                    TOOL_SOURCE_TABIX,
+                    VersionStatus.UNKNOWN,
+                    notes="tabix version could not be read at run time: "
+                    + "; ".join(f"`{b}`: {r['error']}" for b, r in measured.items()),
+                )
+            else:
+                if len(set(versions.values())) == 1 and len(versions) == len(measured):
+                    version = next(iter(versions.values()))
+                else:
+                    version = "; ".join(
+                        f"{use}: {measured[binary]['version'] or 'could not be read (' + str(measured[binary]['error']) + ')'}"
+                        for use, binary in uses
+                    )
+                self.provenance.record(
+                    TOOL_SOURCE_TABIX,
+                    VersionStatus.VERSION_KNOWN,
+                    version=version,
+                    notes="Read from `<binary> --version` at the start of this run, from the binary this run "
+                    "invokes -- not copied from the image's package pin.",
+                )
+        except Exception as exc:  # noqa: BLE001 -- provenance capture must never break a run
+            logger.warning(f"tabix tool-version provenance capture failed: {exc}")
+
+        try:
+            stamps = parse_vcf_tool_stamps(vcf_header_lines)
+            declared = (
+                (TOOL_SOURCE_CALLER, "caller", "creating software (no `##source=` line)"),
+                (TOOL_SOURCE_BCFTOOLS, "bcftools", "bcftools version (no `##bcftools_*Version=` line)"),
+                (TOOL_SOURCE_HTSLIB, "htslib", "htslib version (no `+htslib-` in a `##bcftools_*Version=` line)"),
+            )
+            for source, key, what in declared:
+                if stamps[key]:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.VERSION_KNOWN,
+                        version="; ".join(stamps[key]),
+                        notes="Read from the input VCF's own header, written by that tool when it produced "
+                        "the file. Not measured by this pipeline, which did not run it.",
+                    )
+                else:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.UNKNOWN,
+                        notes=f"The input VCF declares no {what}; what produced this file is not recorded in it.",
+                    )
+            # samtools and the aligner run upstream on the alignment, which
+            # this pipeline never receives; Kim stamps both into its VCF
+            # (`##samtoolsVersion=`, `##alignerVersion=`), or writes
+            # "NOT READ: <why>" when it could not measure one -- a marker
+            # carried through as a marker, never shown as a version.
+            upstream = (
+                (TOOL_SOURCE_SAMTOOLS, "samtools", "samtools version"),
+                (TOOL_SOURCE_ALIGNER, "aligner", "aligner version"),
+            )
+            for source, key, what in upstream:
+                read = [v for v in stamps[key] if not v.startswith(NOT_READ_MARKER)]
+                not_read = [v for v in stamps[key] if v.startswith(NOT_READ_MARKER)]
+                if read:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.VERSION_KNOWN,
+                        version="; ".join(read),
+                        notes="Read from the input VCF's own header, stamped at run time by the pipeline that "
+                        "ran it." + (f" Also declared: {'; '.join(not_read)}" if not_read else ""),
+                    )
+                elif not_read:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.UNKNOWN,
+                        notes=f"The pipeline that produced the input VCF could not read the {what}: "
+                        + "; ".join(not_read),
+                    )
+                else:
+                    self.provenance.record(
+                        source,
+                        VersionStatus.UNKNOWN,
+                        notes=f"Not recorded. It runs upstream on the alignment (BAM), which this pipeline "
+                        f"does not receive, and the input VCF declares no {what}.",
+                    )
+        except Exception as exc:  # noqa: BLE001 -- provenance capture must never break a run
+            logger.warning(f"VCF-declared tool-version provenance capture failed: {exc}")
+
+    def _capture_blast_retrieval_provenance(self) -> None:
+        """
+        Records WHERE this run's BLAST evidence came from -- the network,
+        or the on-disk cache a previous run wrote.
+
+        The two are otherwise indistinguishable downstream: a disk-cache
+        replay returns the same normalized hits, with the same real
+        accessions, in milliseconds (observed: real NCBI hits in 0.015s
+        with no NCBI contact). Nothing in the report could tell them
+        apart, because `VersionStatus` only ever describes version
+        identifiability -- see `pipeline/provenance.py::RetrievalMode`.
+
+        Uses `note_retrieval`, not `record`: this is the retrieval axis
+        and must not touch the BLAST tool version already captured at
+        startup.
+        """
+        try:
+            counts = self.blast_client.retrieval_counts()
+        except Exception as exc:  # noqa: BLE001 -- provenance capture must never break a run
+            logger.warning(f"BLAST retrieval-mode provenance capture failed: {exc}")
+            return
+
+        live, replayed = counts.get("live", 0), counts.get("cache_replay", 0)
+        self.provenance.note_retrieval("BLAST", RetrievalMode.from_counts(live, replayed))
+        logger.info(f"BLAST retrieval provenance: {live} live search(es), {replayed} replayed from disk cache.")
 
     def _capture_bootstrapped_datasets_provenance(self) -> None:
         """
@@ -664,7 +823,7 @@ class GeperPipeline:
                 present there are skipped and the run continues from
                 where it left off (issue #8 -- Colab-disconnect resume).
         """
-        logger.info(f"Starting GEPER pipeline run for '{vcf_path}'.")
+        logger.info(f"Starting {SHORT_NAME} pipeline run for '{vcf_path}'.")
         if self.enable_profiling:
             self.profiler.mark_run_start()
         if max_variants is not None and max_variants <= 0:
@@ -683,6 +842,9 @@ class GeperPipeline:
         except VCFParsingError as exc:
             raise PipelineError(f"Fatal error parsing input VCF: {exc}") from exc
 
+        # Tool versions that produced this report -- needs the parsed header.
+        self._capture_tool_provenance(parser.header_lines)
+
         if not variants:
             raise PipelineError(f"'{vcf_path}' contained no usable variant records.")
 
@@ -690,12 +852,23 @@ class GeperPipeline:
         # Runs before any variant is processed / any reference sequence
         # is fetched, using the header lines the parser already
         # collected while reading up to `variants`.
+        # The record chromosomes are passed for the all-mitochondrial exception
+        # (card #15): the header alone cannot prove a run is ALL mito.
+        record_chroms = [v.chrom for v in variants]
         try:
-            resolved_assembly = validate_assembly(parser.header_lines, self._cli_assembly)
+            resolved_assembly = validate_assembly(parser.header_lines, self._cli_assembly, record_chroms=record_chroms)
         except AssemblyMismatchError as exc:
             raise PipelineError(str(exc)) from exc
         if resolved_assembly and not self._cli_assembly:
             self.sequence_context_gen.assembly = resolved_assembly
+        # Set ONLY when the exception actually fired -- `validate_assembly`
+        # returns None on the no-build path for no other reason now -- so the
+        # report can say the build check was skipped, and why.
+        assembly_note = (
+            mito_only_exemption_reason(parser.header_lines, record_chroms)
+            if resolved_assembly is None and not self._cli_assembly
+            else None
+        )
 
         # --- Ensembl batch prefetch (Phase 2 performance pass) -------------
         # Best-effort: warms the sequence-context generator's region
@@ -774,11 +947,24 @@ class GeperPipeline:
         result_builder = JSONResultBuilder(
             input_vcf_path=vcf_path,
             assembly=self.sequence_context_gen.assembly,
+            assembly_note=assembly_note,
             vcf_samples=parser.samples,
             provenance_collector=self.provenance,
             code_version=self.geper_code_version,
             model_checkpoints=self.model_checkpoints,
             patient_consent=patient_consent,
+            # Live reference, snapshotted inside build() -- see
+            # JSONResultBuilder.service_health_registry. Without this the
+            # run document cannot say that a source failed and recovered,
+            # because a handled failure never reaches any variant's
+            # `errors` list.
+            service_health_registry=HEALTH,
+            # Parsed once here and stored on the document, so a later
+            # re-render (review/signoff.py's approve()/override()) sees
+            # the same QC this run observed instead of falling back to
+            # the "no upstream step was observed" branch -- see
+            # JSONResultBuilder.qc_metrics' own comment.
+            qc_metrics=_parse_qc_metrics(self.qc_metrics_path) if self.qc_metrics_path else None,
         )
         completed_keys = set()
         stats = {"processed": 0, "success": 0, "skipped": 0, "out_of_scope": 0, "failed": 0}
@@ -794,6 +980,7 @@ class GeperPipeline:
                     stats["processed"] += 1
                     stats[self._classify_variant_result(prior_result)] += 1
                 if completed_keys:
+                    self._carry_forward_prior_provenance(result_builder, prior_document, completed_keys)
                     logger.info(
                         f"Resuming previous run: {len(completed_keys)} variant(s) already completed in '{json_path}'."
                     )
@@ -805,11 +992,13 @@ class GeperPipeline:
                 result_builder = JSONResultBuilder(
                     input_vcf_path=vcf_path,
                     assembly=self.sequence_context_gen.assembly,
+                    assembly_note=assembly_note,
                     vcf_samples=parser.samples,
                     provenance_collector=self.provenance,
                     code_version=self.geper_code_version,
                     model_checkpoints=self.model_checkpoints,
                     patient_consent=patient_consent,
+                    service_health_registry=HEALTH,
                 )
                 completed_keys = set()
                 stats = {"processed": 0, "success": 0, "skipped": 0, "out_of_scope": 0, "failed": 0}
@@ -837,6 +1026,11 @@ class GeperPipeline:
         # source consulted via the cache path show up as consulted.
         self._capture_bootstrapped_datasets_provenance()
 
+        # Same timing reason: whether BLAST answered from the network or
+        # from its on-disk cache is only known once every variant has
+        # been searched.
+        self._capture_blast_retrieval_provenance()
+
         # Same timing fix, applied to the "AI model checkpoints"
         # provenance list (F1a, report review round 4): whether
         # SpliceBERT/Evo2/etc actually ran, failed to load, or were
@@ -848,7 +1042,23 @@ class GeperPipeline:
         # dict object `result_builder` was constructed with), so
         # `result_builder.build()` below picks up the enriched version.
         run_model_status = rollup_run_status([vr.get("ai_model_status") for vr in result_builder.variant_results])
+        # Opt-in and measured (~3.9s per 2.6GB model): every run records the
+        # hash the cache DECLARES for what it served; only a run that asks
+        # streams the bytes to find out whether that hash is true. Before the
+        # finalisation below, so a MISMATCH reaches the record rather than
+        # being discovered after it was written.
+        if CONFIG.VERIFY_MODEL_ARTIFACT_HASHES:
+            verify_loaded_model_artifacts()
         self.model_checkpoints.update(finalize_model_checkpoint_provenance(self.model_checkpoints, run_model_status))
+
+        # Round 17: only true here, after the enrichment immediately
+        # above -- every earlier `result_builder.write(json_path)` call
+        # (the periodic in-loop checkpoint a few lines up) left this
+        # `False`, its honest default, since `model_checkpoints` at that
+        # point was still bare config identifiers with no real run
+        # status attached. See `report/json_builder.py::
+        # JSONResultBuilder.__init__`'s `self.run_complete` comment.
+        result_builder.run_complete = True
 
         json_document = result_builder.build()
 
@@ -896,7 +1106,9 @@ class GeperPipeline:
         pdf_filename = "geper_report_full.pdf"
         pdf_path = os.path.join(self.output_dir, pdf_filename)
         try:
-            generate_pdf(json_document, pdf_path, patient_meta=self.patient_meta_path, qc_metrics=self.qc_metrics_path)
+            # No qc_metrics argument: this run already recorded its QC on
+            # `json_document` above, and generate_pdf reads it from there.
+            generate_pdf(json_document, pdf_path, patient_meta=self.patient_meta_path)
         except Exception as exc:  # noqa: BLE001 - additive output, must never fail an otherwise-successful run
             logger.error(f"Clinical PDF report generation failed ({exc}); JSON/Markdown outputs are unaffected.")
             pdf_path = None
@@ -921,7 +1133,7 @@ class GeperPipeline:
             short_pdf_path = None
 
         logger.info(
-            f"GEPER run complete. {len(json_document['variants'])} variant(s) "
+            f"{SHORT_NAME} run complete. {len(json_document['variants'])} variant(s) "
             f"total in output. JSON: '{json_path}', Report: '{report_path}'"
             + (f", PDF: '{pdf_path}'" if pdf_path else " (full PDF generation failed -- see error above)")
             + (
@@ -1156,7 +1368,7 @@ class GeperPipeline:
             return "".join(parts)
 
         header = _render_row({key: label for key, label, _floor in columns})
-        lines = ["", "===== GEPER Startup Model Validation =====", "", header, "-" * len(header)]
+        lines = ["", f"===== {SHORT_NAME} Startup Model Validation =====", "", header, "-" * len(header)]
         for row in rows:
             lines.append(_render_row(row))
         lines.append("=" * len(header))
@@ -1170,6 +1382,46 @@ class GeperPipeline:
         return (variant.chrom, variant.pos, variant.ref, variant.alt)
 
     @staticmethod
+    @staticmethod
+    def _carry_forward_prior_provenance(result_builder, prior_document, completed_keys) -> None:
+        """
+        Keep the prior run's provenance alongside the variants this run
+        is reusing from it.
+
+        Every run-level field on `result_builder` is THIS run's, so
+        without this the carried-forward variants are stamped with a
+        model set, code version, service-health snapshot and timestamp
+        under which they were never processed -- and the merged
+        document is indistinguishable from a clean run, which makes it
+        a false claim rather than a gap.
+
+        `prior_document` is already fully loaded by the resume path,
+        which reads only its `variants` key: this stops discarding what
+        that object already holds rather than collecting anything new.
+        The count is the number of DISTINCT variants carried, the same
+        value the resume log line reports, so the two cannot disagree.
+
+        DO NOT INLINE THIS BACK INTO `run()`. It is a one-line body and
+        it will look like pointless indirection to a future tidy-up
+        sweep -- that is exactly why this paragraph exists. It was
+        extracted so the resume WIRING is drivable by a test:
+        `tests/test_model_version_provenance.py::ResumeWiringTests`
+        calls it directly, because nothing in the suite constructs a
+        `GeperPipeline` (verified 2026-09-02: zero test files do) and
+        building the first orchestrator harness was out of scope for
+        the change this fix shipped in. Production behaviour is
+        IDENTICAL to the inline call it replaced -- the seam buys
+        testability and nothing else.
+
+        Inlining it would silently un-test the wiring on the precise
+        defect this method exists to fix, which is the failure mode
+        that reached the human as a false claim in the first place.
+
+        See `report/json_builder.py::note_carried_forward_provenance`
+        for the three states a resumed run actually has.
+        """
+        result_builder.note_carried_forward_provenance(prior_document, len(completed_keys))
+
     def _variant_key_from_dict(variant_dict: Dict[str, Any]) -> Tuple[str, int, str, str]:
         return (
             variant_dict.get("chrom"),
@@ -1253,10 +1505,12 @@ class GeperPipeline:
         """
         Buckets one variant's result into success/skipped/out_of_scope/
         failed for the run summary. A variant this run deliberately
-        never evaluated at all (`out_of_scope` -- currently only the
-        mitochondrial compartment gate, see
-        `_mitochondrial_out_of_scope_result`) is checked FIRST and
-        returned as its own bucket, distinct from "skipped": "skipped"
+        never evaluated at all (`out_of_scope` -- no current producer as
+        of round 14, B2, which replaced the mitochondrial compartment's
+        whole-variant rejection with per-criterion gating instead; this
+        bucket remains legitimate infrastructure for a future genuinely-
+        unassessable variant class) is checked FIRST and returned as its
+        own bucket, distinct from "skipped": "skipped"
         means GEPER tried to build sequence context and couldn't
         (a real gap), while "out_of_scope" means GEPER never attempted
         anything for this variant by design -- collapsing the two would
@@ -1280,7 +1534,7 @@ class GeperPipeline:
         if variant_result.get("out_of_scope"):
             return "out_of_scope"
         context = variant_result.get("sequence_context", {})
-        if context.get("error"):
+        if context.get("error") is not None:
             return "skipped"
         interpretation_result = variant_result.get("interpretation_result")
         if not isinstance(interpretation_result, dict) or "error" in interpretation_result:
@@ -1305,59 +1559,38 @@ class GeperPipeline:
         lines.append(f"Processed variants: {stats['processed']}")
         lines.append(f"Successful predictions: {stats['success']}")
         lines.append(f"Skipped: {stats['skipped']}")
-        lines.append(f"Out of scope (mitochondrial): {stats['out_of_scope']}")
+        # Round 14, B2: no code path currently produces an `out_of_scope`
+        # result (see `_classify_variant_result`'s docstring) -- printing
+        # this line unconditionally, forever, at 0 would be exactly the
+        # permanent-looks-like-a-real-metric line round 7's coverage-
+        # breadth finding already flagged as bad practice (a reader learns
+        # to skim past a line that never changes). Shown only when the
+        # bucket is actually non-empty; the label is generic, not
+        # "(mitochondrial)", since the bucket itself never was chrM-
+        # specific in code, only in its one prior caller.
+        if stats["out_of_scope"]:
+            lines.append(f"Out of scope: {stats['out_of_scope']}")
         lines.append(f"Failed: {stats['failed']}")
         lines.append("==============================")
         logger.info("\n".join(lines))
-
-    @staticmethod
-    def _mitochondrial_out_of_scope_result(variant: Variant) -> Dict[str, Any]:
-        """
-        The entire result for a chrM variant, deliberately minimal: no
-        sequence context, no evidence-source stage, no ACMG evaluation
-        was ever attempted, so none of `build_variant_result`'s ~25
-        stage-result kwargs apply here -- constructing a fake "everything
-        skipped" version of that full shape would run
-        `build_clinical_report`/`build_raw_evidence_bundle` against
-        entirely fabricated inputs, producing a misleading "checked,
-        nothing there" clinical_report instead of an honest "never
-        checked at all". `report/report_generator.py` (Markdown) and
-        `report/summary.py`/`summary_short.py` (PDF) each check for the
-        `out_of_scope` key explicitly, before touching `clinical_report`/
-        `interpretation_result`, and render a short, distinct notice
-        instead of the normal multi-section finding -- see each
-        renderer's own `out_of_scope` branch.
-        """
-        return {
-            "variant": variant.to_dict(),
-            "out_of_scope": {
-                "scope": "mitochondrial_genome",
-                "reason": _MITOCHONDRIAL_OUT_OF_SCOPE_REASON,
-            },
-            "errors": [],
-        }
 
     # ------------------------------------------------------------------
     # Per-variant pipeline
     # ------------------------------------------------------------------
     def _process_variant(self, variant: Variant) -> Dict[str, Any]:
-        # Compartment gate (report review round 8, option (a)): checked
-        # before anything else in this method -- before normalization,
-        # before sequence-context fetching, before any evidence-source
-        # stage -- so a chrM variant never reaches gnomAD's nuclear
-        # callset, the nuclear-trained splice-model ensemble, or the
-        # 28-criterion ACMG engine at all. See
-        # `_mitochondrial_out_of_scope_result`'s docstring and
-        # `_MITOCHONDRIAL_OUT_OF_SCOPE_REASON` above for why, and
-        # ROUND_CANDIDATES.md for the larger per-criterion compartment
-        # gate (option (b)) this single early exit defers.
-        if is_mitochondrial_chrom(variant.chrom):
-            logger.info(
-                f"Variant {variant.chrom}:{variant.pos} is mitochondrial -- out of scope for this "
-                "GEPER build, skipping ACMG evaluation entirely (see ROUND_CANDIDATES.md)."
-            )
-            return self._mitochondrial_out_of_scope_result(variant)
-
+        # Round 8 (option (a)) rejected every chrM variant here outright,
+        # before any evidence stage or the ACMG engine ever ran. Round 14
+        # (B2) replaces that whole-variant rejection with per-criterion,
+        # per-evidence-source compartment gating instead: a chrM variant
+        # now runs the real pipeline below, but the evidence sources with
+        # no mtDNA validity are never queried (see the `is_mtdna_variant`
+        # gate further down, where gnomAD/AlphaMissense/MMSplice/Enformer/
+        # Borzoi/SpliceFormer/SpliceBERT are skipped with an honest
+        # reason instead of called), and `pipeline/acmg_rules.py::
+        # ACMGRuleEngine.evaluate`'s own compartment gate pre-marks the 7
+        # criteria those sources fed (plus, for non-protein-coding
+        # mitochondrial genes, 6 more) `not_evaluated` with their own
+        # reason before their real logic would otherwise run.
         errors: List[str] = []
 
         # --- Variant normalization: early gate (see pipeline/variant_normalization.py) ---
@@ -1378,7 +1611,11 @@ class GeperPipeline:
             with self._timer("sequence_context"):
                 sequence_context = self.sequence_context_gen.build_context(variant, flank_size)
         except (SequenceGenerationError, ExternalAPIError) as exc:
-            errors.append(f"Sequence context generation failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"Sequence context generation failed: {detail}")
             logger.error(errors[-1])
 
         dna_model_results: Dict[str, Any] = {}
@@ -1387,7 +1624,8 @@ class GeperPipeline:
             try:
                 model_keys = self.router.route(variant, sequence_context)
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"Routing failed: {exc}")
+                detail = str(exc) or type(exc).__name__
+                errors.append(f"Routing failed: {detail}")
                 model_keys = []
 
             model_keys = self._filter_available_models(model_keys, variant, errors)
@@ -1398,9 +1636,24 @@ class GeperPipeline:
                     dna_model_results[model_key] = result
                     dna_models_used.append(model_key)
                 except (ModelLoadError, ModelInferenceError) as exc:
-                    errors.append(f"Model '{model_key}' failed: {exc}")
+                    # INVESTIGATED AND FOUND CURRENTLY UNREACHABLE (2026-08-31):
+                    # every `raise ModelLoadError(...)`/`raise
+                    # ModelInferenceError(...)` in this codebase (models/
+                    # hyenadna.py, models/evo2.py, models/base_model.py,
+                    # pipeline/models/base.py) passes an explicit,
+                    # non-empty message -- none is ever raised bare, so
+                    # `str(exc)` cannot actually be empty here today.
+                    # Fixed anyway for uniformity with the other eleven
+                    # str(exc) sites in this sweep and as future-proofing:
+                    # the immunity is a fact about today's call sites
+                    # across several independently-changeable files, not
+                    # a property the type system enforces -- a future
+                    # bare `raise ModelLoadError()` would otherwise
+                    # reopen this exact defect at this site silently.
+                    detail = str(exc) or type(exc).__name__
+                    errors.append(f"Model '{model_key}' failed: {detail}")
                     logger.error(errors[-1])
-                    self._model_stage_errors.setdefault(model_key, str(exc)[:120])
+                    self._model_stage_errors.setdefault(model_key, detail[:120])
 
         # ClinGen + transcript-structure resolution: moved ahead of the
         # protein/AlphaMissense stages below (they used to run first,
@@ -1420,20 +1673,46 @@ class GeperPipeline:
 
         rna_result = self._run_rna_stage(variant, sequence_context, errors)
         protein_result = self._run_protein_stage(variant, sequence_context, errors)
-        alphamissense_result = self._run_alphamissense_stage(variant, transcript_result, errors)
-        mmsplice_result = self._run_mmsplice_stage(variant, errors)
-        ensemble_result = self._run_ensemble_stage(variant, sequence_context, errors)
-        # Standalone splice-prediction plugins for BP7 (see
-        # pipeline/acmg_rules.py::ACMGRuleEngine._bp7) -- distinct from
-        # the Enformer/Borzoi ensemble above (see
-        # _run_standalone_splice_plugin_stage's own docstring for why).
-        spliceformer_result = self._run_standalone_splice_plugin_stage("spliceformer", sequence_context, errors)
-        splicebert_result = self._run_standalone_splice_plugin_stage("splicebert", sequence_context, errors)
+        # mtDNA compartment gate (round 14, B2): AlphaMissense (no
+        # mitochondrial catalogue rows), MMSplice/Enformer/Borzoi/
+        # SpliceFormer/SpliceBERT (all nuclear-trained splice/regulatory
+        # models, meaningless for a genome with no spliceosome), and
+        # gnomAD's nuclear-only dataset (see `_run_gnomad_stage` below)
+        # are never even QUERIED for a chrM variant -- not merely ignored
+        # by the ACMG engine (`pipeline/acmg_rules.py`'s own compartment
+        # gate) once results come back. This is what `test_mtdna_*`
+        # asserts at the provenance/call level, not just the output: no
+        # real cost is spent on a resource that is structurally wrong for
+        # this compartment, and every skip is honestly recorded, never
+        # silently absent. See `pipeline/acmg_rules.py`'s
+        # `_MTDNA_STRUCTURALLY_INAPPLICABLE_REASONS` for the full
+        # per-criterion rationale this mirrors.
+        is_mtdna_variant = is_mitochondrial_chrom(variant.chrom)
+        if is_mtdna_variant:
+            # `pipeline/acmg_rules.py`'s `mtdna_*_skip_result` functions
+            # are small and standalone specifically so they (and their
+            # exact reason text) can be unit-tested without importing
+            # this module -- see their own docstrings.
+            alphamissense_result = mtdna_alphamissense_skip_result()
+            mmsplice_result = mtdna_mmsplice_skip_result()
+            ensemble_result = mtdna_ensemble_skip_result()
+            spliceformer_result = mtdna_splice_plugin_skip_result()
+            splicebert_result = mtdna_splice_plugin_skip_result()
+        else:
+            alphamissense_result = self._run_alphamissense_stage(variant, transcript_result, errors)
+            mmsplice_result = self._run_mmsplice_stage(variant, errors)
+            ensemble_result = self._run_ensemble_stage(variant, sequence_context, errors)
+            # Standalone splice-prediction plugins for BP7 (see
+            # pipeline/acmg_rules.py::ACMGRuleEngine._bp7) -- distinct from
+            # the Enformer/Borzoi ensemble above (see
+            # _run_standalone_splice_plugin_stage's own docstring for why).
+            spliceformer_result = self._run_standalone_splice_plugin_stage("spliceformer", sequence_context, errors)
+            splicebert_result = self._run_standalone_splice_plugin_stage("splicebert", sequence_context, errors)
 
         blast_result = self._run_blast_stage(sequence_context, errors)
         dbsnp_result = self._run_dbsnp_stage(variant, errors)
         clinvar_result = self._run_clinvar_stage(variant, dbsnp_result, errors)
-        gnomad_result = self._run_gnomad_stage(variant, errors)
+        gnomad_result = mtdna_gnomad_skip_result() if is_mtdna_variant else self._run_gnomad_stage(variant, errors)
         indigenomes_result = self._indigenomes_retired_result()
         thousand_genomes_sas_result = self._run_thousand_genomes_sas_stage(variant, dbsnp_result, errors)
         conservation_result = self._run_conservation_stage(variant, errors)
@@ -1452,9 +1731,29 @@ class GeperPipeline:
         # for exactly what it guarantees and when it is honestly `None`
         # instead of a guess).
         protein_position = canonical_protein_position(transcript_result, variant.pos)
-        uniprot_result = self._run_uniprot_stage(variant, clingen_result, errors)
-        interpro_result = self._run_interpro_stage(uniprot_result, protein_position, errors)
-        alphafold_result = self._run_alphafold_stage(uniprot_result, protein_position, errors)
+        # Round 16: a gene whose Ensembl biotype confirms it has no
+        # protein-coding transcript at all (tRNA/rRNA/lncRNA/...) has no
+        # protein product, full stop -- there is no UniProt entry,
+        # InterPro/Pfam domain, or AlphaFold DB structure to ever find
+        # for it. Querying anyway and reporting the inevitable "not
+        # found" indistinguishably from a real failed lookup misreports
+        # gene biology as a data gap (this was previously masked for
+        # mitochondrial tRNA/rRNA genes specifically -- see
+        # `pipeline/acmg_rules.py::non_protein_coding_gene_reason`'s own
+        # docstring for why this is deliberately NOT mtDNA-specific: a
+        # nuclear ncRNA gene has the exact same property). Skipped
+        # honestly, the same shape as `mtdna_gnomad_skip_result` etc.
+        # above, rather than spending a real query on a resource that is
+        # structurally never going to have an answer.
+        skip_reason = non_protein_coding_gene_reason(transcript_result)
+        if skip_reason:
+            uniprot_result = {"found": False, "skipped": True, "reason": skip_reason}
+            interpro_result = {"found": False, "skipped": True, "reason": skip_reason}
+            alphafold_result = {"found": False, "skipped": True, "reason": skip_reason}
+        else:
+            uniprot_result = self._run_uniprot_stage(variant, clingen_result, errors)
+            interpro_result = self._run_interpro_stage(uniprot_result, protein_position, errors)
+            alphafold_result = self._run_alphafold_stage(uniprot_result, protein_position, errors)
 
         interpretation = self.interpretation_engine.interpret(
             variant_dict=variant.to_dict(),
@@ -1576,7 +1875,7 @@ class GeperPipeline:
         """
         try:
             if clinvar_result:
-                if clinvar_result.get("error"):
+                if clinvar_result.get("error") is not None:
                     self.provenance.record(
                         "ClinVar", VersionStatus.UNKNOWN, notes=f"Most recent query failed: {clinvar_result['error']}"
                     )
@@ -1594,7 +1893,7 @@ class GeperPipeline:
                 build = (dbsnp_result.get("detail") or {}).get("dbsnp_build")
                 if build:
                     self.provenance.record("dbSNP", VersionStatus.VERSION_KNOWN, version=f"dbSNP build {build}")
-                elif dbsnp_result.get("error"):
+                elif dbsnp_result.get("error") is not None:
                     self.provenance.record(
                         "dbSNP", VersionStatus.UNKNOWN, notes=f"Most recent query failed: {dbsnp_result['error']}"
                     )
@@ -1606,7 +1905,7 @@ class GeperPipeline:
                 dataset_id = gnomad_dataset_id_for_build(self.sequence_context_gen.assembly or "GRCh38")
                 if dataset_id:
                     self.provenance.record("gnomAD", VersionStatus.VERSION_KNOWN, version=dataset_id)
-                elif gnomad_result.get("error"):
+                elif gnomad_result.get("error") is not None:
                     self.provenance.record(
                         "gnomAD", VersionStatus.UNKNOWN, notes=f"Query failed: {gnomad_result['error']}"
                     )
@@ -1622,7 +1921,7 @@ class GeperPipeline:
                         version=f"UniProt {uniprot_result['release']}",
                         release_date=uniprot_result.get("release_date"),
                     )
-                elif uniprot_result.get("error"):
+                elif uniprot_result.get("error") is not None:
                     self.provenance.record(
                         "UniProt", VersionStatus.UNKNOWN, notes=f"Most recent query failed: {uniprot_result['error']}"
                     )
@@ -1641,7 +1940,7 @@ class GeperPipeline:
                     self.provenance.record(
                         "InterPro", VersionStatus.VERSION_KNOWN, version=f"InterPro {interpro_result['api_version']}"
                     )
-                elif interpro_result.get("error"):
+                elif interpro_result.get("error") is not None:
                     self.provenance.record(
                         "InterPro", VersionStatus.UNKNOWN, notes=f"Most recent query failed: {interpro_result['error']}"
                     )
@@ -1662,11 +1961,29 @@ class GeperPipeline:
                         VersionStatus.VERSION_KNOWN,
                         version=f"AlphaFold DB v{alphafold_result['model_version']}",
                     )
-                elif alphafold_result.get("error"):
+                elif alphafold_result.get("error") is not None:
                     self.provenance.record(
                         "AlphaFold DB",
                         VersionStatus.UNKNOWN,
                         notes=f"Most recent query failed: {alphafold_result['error']}",
+                    )
+                else:
+                    # The query SUCCEEDED but carried no version. Without
+                    # this branch nothing was recorded, and because the
+                    # collector pre-seeds every known source at
+                    # NOT_CONSULTED, the table did not merely omit
+                    # AlphaFold -- it asserted "never queried this run"
+                    # about a source that answered and contributed data.
+                    # UNKNOWN is defined for exactly this: queried, but
+                    # nothing beyond a timestamp obtainable.
+                    self.provenance.record(
+                        "AlphaFold DB",
+                        VersionStatus.UNKNOWN,
+                        notes=(
+                            "Queried successfully; the response carried no model version."
+                            if alphafold_result.get("found")
+                            else "Queried successfully; no predicted structure available for this accession."
+                        ),
                     )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"AlphaFold DB provenance capture failed: {exc}")
@@ -1692,7 +2009,7 @@ class GeperPipeline:
                             VersionStatus.TIMESTAMP_ONLY,
                             notes=_FUNCTIONAL_EVIDENCE_PROVENANCE_NOTE.get(consulted, ""),
                         )
-                if functional_evidence_result.get("error"):
+                if functional_evidence_result.get("error") is not None:
                     # The composite provider doesn't disclose which of
                     # ERepo/MaveDB the failure was in -- honestly
                     # recorded against both rather than guessing one.
@@ -1734,7 +2051,7 @@ class GeperPipeline:
                         "not a GERP/dbNSFP data release, so no version is recorded; only the query "
                         "timestamp is.",
                     )
-                if error and not conservation_result.get("found"):
+                if error is not None and not conservation_result.get("found"):
                     note = f"Most recent query failed: {error}"
                     self.provenance.record("Conservation (PhyloP/PhastCons, UCSC)", VersionStatus.UNKNOWN, notes=note)
                     self.provenance.record("Conservation (GERP++, MyVariant.info)", VersionStatus.UNKNOWN, notes=note)
@@ -1826,9 +2143,18 @@ class GeperPipeline:
             rna_fm_result["alt_rna_preview"] = rna_context.alt_rna[:60]
             return rna_fm_result
         except (SequenceGenerationError, ModelLoadError, ModelInferenceError) as exc:
-            errors.append(f"RNA-FM stage failed: {exc}")
+            # INVESTIGATED AND FOUND CURRENTLY UNREACHABLE (2026-08-31):
+            # every raise of these three types in this codebase passes an
+            # explicit, non-empty message -- none is ever raised bare, so
+            # `str(exc)` cannot actually be empty here today. Fixed
+            # anyway for uniformity with the other sites in this sweep
+            # and as future-proofing: the immunity is a fact about
+            # today's call sites across several independently-changeable
+            # files, not something the type system enforces.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"RNA-FM stage failed: {detail}")
             logger.error(errors[-1])
-            self._model_stage_errors.setdefault("rna_fm", str(exc)[:120])
+            self._model_stage_errors.setdefault("rna_fm", detail[:120])
             # `skipped: True` is kept (not flipped to False) so every
             # existing downstream reader that gates on it -- e.g.
             # `pipeline/interpretation_result.py`'s
@@ -1840,7 +2166,7 @@ class GeperPipeline:
             # resolve this to `ERROR` instead of `NOT_RUN` -- see that
             # module's docstring for why the two were indistinguishable
             # before this key existed.
-            return {"skipped": True, "reason": str(exc), "error": str(exc)}
+            return {"skipped": True, "reason": detail, "error": detail}
 
     def _run_protein_stage(self, variant: Variant, sequence_context, errors: List[str]) -> Dict[str, Any]:
         if sequence_context is None:
@@ -1876,9 +2202,18 @@ class GeperPipeline:
                 "esm2": esm2_result,
             }
         except (SequenceGenerationError, ModelLoadError, ModelInferenceError) as exc:
-            errors.append(f"Protein/ESM-2 stage failed: {exc}")
+            # INVESTIGATED AND FOUND CURRENTLY UNREACHABLE (2026-08-31):
+            # every raise of these three types in this codebase passes an
+            # explicit, non-empty message -- none is ever raised bare, so
+            # `str(exc)` cannot actually be empty here today. Fixed
+            # anyway for uniformity with the other sites in this sweep
+            # and as future-proofing: the immunity is a fact about
+            # today's call sites across several independently-changeable
+            # files, not something the type system enforces.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"Protein/ESM-2 stage failed: {detail}")
             logger.error(errors[-1])
-            self._model_stage_errors.setdefault("esm2", str(exc)[:120])
+            self._model_stage_errors.setdefault("esm2", detail[:120])
             # `skipped: True` stays True (see `_run_rna_stage`'s
             # matching comment for why -- ESM-2's own downstream
             # consumers still gate on this). Note `_run_alphamissense_stage`
@@ -1886,7 +2221,7 @@ class GeperPipeline:
             # is decided from `transcript_result`, not from whether
             # this ESM-2 translation succeeded (see that method's
             # docstring). `error` is new -- see `_run_rna_stage`'s comment.
-            return {"skipped": True, "reason": str(exc), "error": str(exc)}
+            return {"skipped": True, "reason": detail, "error": detail}
 
     def _run_alphamissense_stage(
         self, variant: Variant, transcript_result: Dict[str, Any], errors: List[str]
@@ -1939,9 +2274,18 @@ class GeperPipeline:
             result["skipped"] = False
             return result
         except (ModelLoadError, ModelInferenceError) as exc:
-            errors.append(f"AlphaMissense stage failed: {exc}")
+            # INVESTIGATED AND FOUND CURRENTLY UNREACHABLE (2026-08-31):
+            # every raise of these two types in this codebase passes an
+            # explicit, non-empty message -- none is ever raised bare, so
+            # `str(exc)` cannot actually be empty here today. Fixed
+            # anyway for uniformity with the other sites in this sweep
+            # and as future-proofing: the immunity is a fact about
+            # today's call sites across several independently-changeable
+            # files, not something the type system enforces.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"AlphaMissense stage failed: {detail}")
             logger.error(errors[-1])
-            self._model_stage_errors.setdefault("alphamissense", str(exc)[:120])
+            self._model_stage_errors.setdefault("alphamissense", detail[:120])
             # `skipped: True` stays True (see `_run_rna_stage`'s
             # matching comment); `error` is new -- and, unlike
             # RNA-FM/protein, this one also flows into
@@ -1949,7 +2293,7 @@ class GeperPipeline:
             # (`alphamissense` is one of its 11 required fields), so
             # this fix is what lets that boundary resolve a genuine
             # AlphaMissense crash to `ERROR` instead of `NOT_RUN`.
-            return {"skipped": True, "reason": str(exc), "error": str(exc)}
+            return {"skipped": True, "reason": detail, "error": detail}
 
     def _run_mmsplice_stage(self, variant: Variant, errors: List[str]) -> Dict[str, Any]:
         """
@@ -1991,9 +2335,14 @@ class GeperPipeline:
                 # result dict, no repeat Keras call.
                 return service.predict(variant)
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth; MMSpliceService.predict should already catch everything
-            errors.append(f"MMSplice stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds the log line, the
+            # stage-error truncation, and all three returned fields so
+            # none of them can diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"MMSplice stage failed: {detail}")
             logger.error(errors[-1])
-            self._model_stage_errors.setdefault("mmsplice", str(exc)[:120])
+            self._model_stage_errors.setdefault("mmsplice", detail[:120])
             # `supported`/`predicted` stay False (this stage has no
             # "skipped" key at all, so keeping both False is what
             # already-existing downstream readers of this shape
@@ -2007,9 +2356,9 @@ class GeperPipeline:
             return {
                 "supported": False,
                 "predicted": False,
-                "skip_reason": str(exc)[:300],
-                "interpretation": str(exc)[:300],
-                "error": str(exc)[:300],
+                "skip_reason": detail[:300],
+                "interpretation": detail[:300],
+                "error": detail[:300],
             }
 
     def _get_mmsplice_service(self) -> MMSpliceService:
@@ -2149,9 +2498,14 @@ class GeperPipeline:
             with self._timer("model:ai_splicing_ensemble"):
                 return self.ensemble_manager.evaluate(sequence_context.ref_sequence, sequence_context.alt_sequence)
         except Exception as exc:  # noqa: BLE001 - never let ensemble evaluation crash a variant
-            errors.append(f"AI splicing ensemble (Enformer/Borzoi) failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds the log line, the
+            # stage-error truncation, and the returned `reasoning` field
+            # so none of them can diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"AI splicing ensemble (Enformer/Borzoi) failed: {detail}")
             logger.error(errors[-1])
-            self._model_stage_errors.setdefault("ai_splicing_ensemble", str(exc)[:120])
+            self._model_stage_errors.setdefault("ai_splicing_ensemble", detail[:120])
             return {
                 "models_used": [],
                 "individual_scores": {},
@@ -2160,7 +2514,7 @@ class GeperPipeline:
                 "agreement_percentage": None,
                 "classification": None,
                 "basis": "error",
-                "reasoning": f"AI splicing ensemble raised an unexpected error: {exc}",
+                "reasoning": f"AI splicing ensemble raised an unexpected error: {detail}",
             }
 
     def _run_standalone_splice_plugin_stage(self, key: str, sequence_context, errors: List[str]) -> Dict[str, Any]:
@@ -2233,9 +2587,14 @@ class GeperPipeline:
                 }
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth; ModelManager.predict should already catch everything
-            errors.append(f"{_MODEL_DISPLAY_NAMES.get(key, key)} stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds the log line, the
+            # stage-error truncation, and both returned fields so none
+            # of them can diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"{_MODEL_DISPLAY_NAMES.get(key, key)} stage failed: {detail}")
             logger.error(errors[-1])
-            self._model_stage_errors.setdefault(key, str(exc)[:120])
+            self._model_stage_errors.setdefault(key, detail[:120])
             # `available: True` already distinguished "ran (but failed)"
             # from "never eligible to run" (the `available: False`
             # branches above) -- `error` is an additional, explicit
@@ -2246,7 +2605,7 @@ class GeperPipeline:
             # rendering path for these two plugins -- see BP7 in
             # `pipeline/acmg_rules.py`), added for the same schema-
             # correctness reason regardless.
-            return {"available": True, "classification": None, "skip_reason": str(exc)[:300], "error": str(exc)[:300]}
+            return {"available": True, "classification": None, "skip_reason": detail[:300], "error": detail[:300]}
 
     def _build_ai_model_status(
         self,
@@ -2294,7 +2653,11 @@ class GeperPipeline:
             with self._timer("blast"):
                 return self.blast_client.search(sequence_context.alt_sequence)
         except ExternalAPIError as exc:
-            errors.append(f"BLAST stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"BLAST stage failed: {detail}")
             logger.error(errors[-1])
             # `skipped: True` stays True (no downstream reader gates on
             # it, but this keeps the shape consistent with the
@@ -2308,7 +2671,7 @@ class GeperPipeline:
             # clinician "BLAST failed" apart from "BLAST found nothing"
             # before this fix; see report/clinical_report_builder.py
             # and report/report_generator.py for where this now surfaces.
-            return {"hits": [], "hit_count": 0, "skipped": True, "reason": str(exc), "error": str(exc)}
+            return {"hits": [], "hit_count": 0, "skipped": True, "reason": detail, "error": detail}
 
     def _run_dbsnp_stage(self, variant: Variant, errors: List[str]) -> Dict[str, Any]:
         # `sequence_context_gen.assembly` holds the build resolved by the
@@ -2324,9 +2687,14 @@ class GeperPipeline:
             with self._timer("dbsnp"):
                 return self.dbsnp_client.lookup_variant(variant, assembly=assembly)
         except ExternalAPIError as exc:
-            errors.append(f"dbSNP stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee, which fixed the identical mechanism for
+            # gnomAD) -- fall back to the exception's type name rather
+            # than reporting a failure with nothing said about it.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"dbSNP stage failed: {detail}")
             logger.error(errors[-1])
-            return {"rsid": None, "found": False, "error": str(exc)}
+            return {"rsid": None, "found": False, "error": detail}
 
     def _run_clinvar_stage(self, variant: Variant, dbsnp_result: Dict[str, Any], errors: List[str]) -> Dict[str, Any]:
         rsid = dbsnp_result.get("rsid") if dbsnp_result else None
@@ -2335,9 +2703,11 @@ class GeperPipeline:
             with self._timer("clinvar"):
                 return self.clinvar_client.query_variant(variant, rsid=rsid, assembly=assembly)
         except ExternalAPIError as exc:
-            errors.append(f"ClinVar stage failed: {exc}")
+            # See `_run_dbsnp_stage`'s matching comment / d1128ee.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"ClinVar stage failed: {detail}")
             logger.error(errors[-1])
-            return {"query": None, "found": False, "error": str(exc)}
+            return {"query": None, "found": False, "error": detail}
 
     def _run_gnomad_stage(self, variant: Variant, errors: List[str]) -> Dict[str, Any]:
         """
@@ -2354,13 +2724,19 @@ class GeperPipeline:
         try:
             with self._timer("gnomad"):
                 result = self.gnomad_client.query_variant(variant, assembly=assembly)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"gnomAD stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"gnomAD stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (RuntimeError(), MemoryError(), TimeoutError()). That empty
+            # string is printed verbatim into the report's Stage Warnings
+            # section, so fall back to the exception's type name rather
+            # than reporting a failure with nothing said about it.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"gnomAD stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     def _indigenomes_retired_result(self) -> Dict[str, Any]:
         """
@@ -2381,7 +2757,7 @@ class GeperPipeline:
         """
         return {
             "skipped": True,
-            "reason": "IndiGenomes retired from GEPER's active query path (commercial-use licensing "
+            "reason": "IndiGenomes retired from Bij AI's active query path (commercial-use licensing "
             "restriction) -- see DATA_SOURCE_LICENSE_AUDIT.md.",
             "found": False,
         }
@@ -2407,7 +2783,7 @@ class GeperPipeline:
         try:
             with self._timer("indigenomes"):
                 result = self.indigenomes_client.query_variant(variant, assembly=assembly)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"IndiGenomes stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
@@ -2439,13 +2815,17 @@ class GeperPipeline:
         try:
             with self._timer("thousand_genomes_sas"):
                 result = self.thousand_genomes_sas_client.query_variant(variant, assembly=assembly, rsid_hint=rsid_hint)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"1000 Genomes SAS stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"1000 Genomes SAS stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"1000 Genomes SAS stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     def _run_conservation_stage(self, variant: Variant, errors: List[str]) -> Dict[str, Any]:
         """
@@ -2462,13 +2842,17 @@ class GeperPipeline:
         try:
             with self._timer("conservation"):
                 result = self.conservation_client.query_variant(variant, assembly=assembly)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"Conservation stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"Conservation stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"Conservation stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     def _run_clingen_stage(self, variant: Variant, errors: List[str]) -> Dict[str, Any]:
         """
@@ -2484,13 +2868,17 @@ class GeperPipeline:
         try:
             with self._timer("clingen"):
                 result = self.clingen_client.query_variant(variant, assembly=assembly)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"ClinGen stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"ClinGen stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"ClinGen stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     def _run_hpo_stage(self, clingen_result: Dict[str, Any], errors: List[str]) -> Dict[str, Any]:
         """
@@ -2509,13 +2897,17 @@ class GeperPipeline:
         try:
             with self._timer("hpo"):
                 result = self.hpo_client.query_variant(gene_symbol)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"HPO stage: {result['error']}")
             return self._with_gene_resolution_context(result, clingen_result)
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"HPO stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"HPO stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     @staticmethod
     def _with_gene_resolution_context(result: Dict[str, Any], clingen_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -2588,9 +2980,13 @@ class GeperPipeline:
             )
             return {"skipped": False, "normalized": normalized.to_dict(), "hgvs_g": hgvs_g, "hgvs_c": None}
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"Variant normalization stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"Variant normalization stage failed: {detail}")
             logger.error(errors[-1])
-            return {"skipped": False, "normalized": None, "hgvs_g": None, "hgvs_c": None, "error": str(exc)}
+            return {"skipped": False, "normalized": None, "hgvs_g": None, "hgvs_c": None, "error": detail}
 
     def _attach_hgvs_c(self, normalization_result: Dict[str, Any], transcript_result: Dict[str, Any]) -> None:
         """
@@ -2633,13 +3029,17 @@ class GeperPipeline:
         try:
             with self._timer("orphanet"):
                 result = self.orphanet_client.query_variant(gene_symbol)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"Orphanet stage: {result['error']}")
             return self._with_gene_resolution_context(result, clingen_result)
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"Orphanet stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"Orphanet stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     def _run_transcript_stage(
         self, variant: Variant, clingen_result: Dict[str, Any], errors: List[str]
@@ -2664,13 +3064,17 @@ class GeperPipeline:
         try:
             with self._timer("transcript_structure"):
                 result = self.transcript_client.query_variant(variant, assembly=assembly, gene_symbol=gene_symbol)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"Transcript-structure stage: {result['error']}")
             return self._with_gene_resolution_context(result, clingen_result)
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"Transcript-structure stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"Transcript-structure stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc), "transcript": None}
+            return {"found": False, "skipped": False, "error": detail, "transcript": None}
 
     def _run_clinvar_codon_stage(
         self, variant: Variant, transcript_result: Dict[str, Any], errors: List[str]
@@ -2711,13 +3115,17 @@ class GeperPipeline:
         try:
             with self._timer("clinvar_codon"):
                 result = self.clinvar_codon_client.query_codon(transcript, codon_number, assembly=assembly)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"PS1/PM5 ClinVar codon stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"PS1/PM5 ClinVar codon stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"PS1/PM5 ClinVar codon stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc), "matches": []}
+            return {"found": False, "skipped": False, "error": detail, "matches": []}
 
     def _run_functional_evidence_stage(
         self,
@@ -2758,13 +3166,17 @@ class GeperPipeline:
                     hgvs_g=hgvs_g,
                     hgvs_c=hgvs_c,
                 )
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"Functional-evidence (PS3/BS3) stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"Functional-evidence (PS3/BS3) stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"Functional-evidence (PS3/BS3) stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc), "records": []}
+            return {"found": False, "skipped": False, "error": detail, "records": []}
 
     # ------------------------------------------------------------------
     # Biological evidence layer: UniProt -> InterPro/Pfam -> AlphaFold DB
@@ -2788,13 +3200,17 @@ class GeperPipeline:
         try:
             with self._timer("uniprot"):
                 result = self.uniprot_client.query_variant(variant, assembly=assembly, gene_symbol_hint=gene_hint)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"UniProt stage: {result['error']}")
             return self._with_gene_resolution_context(result, clingen_result)
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"UniProt stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"UniProt stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     def _run_interpro_stage(
         self, uniprot_result: Dict[str, Any], protein_position: Optional[int], errors: List[str]
@@ -2809,13 +3225,17 @@ class GeperPipeline:
         try:
             with self._timer("interpro"):
                 result = self.interpro_client.query_variant(uniprot_result, protein_position=protein_position)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"InterPro stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"InterPro stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"InterPro stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}
 
     def _run_alphafold_stage(
         self, uniprot_result: Dict[str, Any], protein_position: Optional[int], errors: List[str]
@@ -2831,10 +3251,14 @@ class GeperPipeline:
         try:
             with self._timer("alphafold"):
                 result = self.alphafold_client.query_variant(uniprot_result, protein_position=protein_position)
-            if result.get("error"):
+            if result.get("error") is not None:
                 errors.append(f"AlphaFold stage: {result['error']}")
             return result
         except Exception as exc:  # noqa: BLE001 - final defense-in-depth
-            errors.append(f"AlphaFold stage failed: {exc}")
+            # `str(exc)` is "" for any exception raised without a message
+            # (see d1128ee) -- one variable feeds both the log line and
+            # the returned field so they cannot diverge.
+            detail = str(exc) or type(exc).__name__
+            errors.append(f"AlphaFold stage failed: {detail}")
             logger.error(errors[-1])
-            return {"found": False, "skipped": False, "error": str(exc)}
+            return {"found": False, "skipped": False, "error": detail}

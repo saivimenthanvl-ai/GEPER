@@ -16,6 +16,10 @@ extend-exclude = [
     # license file) -- same reasoning as hyena-dna above.
     "geper/pipeline/models/spliceformer/vendor",
     "geper/pipeline/models/spip/vendor",
+    # DELIBERATELY BROKEN, and excluded so it breaks nothing else. It holds
+    # a type error on purpose; `geper/tests/test_mypy_canary.py` fails if
+    # mypy ever stops reporting it. See the file's own docstring.
+    "geper/pipeline/_mypy_canary.py",
 ]
 
 [lint]
@@ -26,3 +30,53 @@ extend-exclude = [
 # an unrelated style migration. Revisit/expand once the codebase has
 # had a chance to clear a first, narrow pass.
 select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# These are PRE-EXISTING patterns, present at HEAD before the commit that
+# first staged these files -- surfaced by the "each file normalizes the
+# first time it's next touched" behaviour described above, not introduced
+# by the change that exposed them.
+#
+# E402 (module import not at top of file): each of these modules MUST
+# import after executing setup code -- `sys.path.insert` to make a sibling
+# package importable, or `_fake_heavy_deps.install()` to register stub
+# modules before the real imports resolve against them. *** MOVING THESE
+# IMPORTS TO THE TOP OF THE FILE WOULD BREAK THE MODULE AT IMPORT TIME. ***
+# The ignore is the correct resolution here, not a deferral of one.
+#
+# *** ONLY geper/ PATHS BELONG IN THIS BLOCK. *** Ruff resolves the
+# NEAREST config to each file, so everything under kim_pipeline/ is
+# governed by kim_pipeline/pyproject.toml's own [tool.ruff.lint] block --
+# which says so itself -- and NOT by this file. kim_pipeline entries
+# listed here would be silently inert: they would read as coverage that
+# does not exist. Its E402 ignores live in that pyproject.toml, beside
+# the `select` list they have to stay in sync with.
+"geper/verify_report_fixes_e2e.py" = ["E402"]
+# Same property as above: `sys.path.insert` at :39 makes this script's own
+# directory importable, and the three imports at :41-43 depend on it.
+# Identical shape to the entry above, found missing from this list during
+# the 2026-09-10 per-file-ignore audit (see that audit's report for the
+# denominator/method) -- not a new property, an omission from this one.
+"geper/verify_ps3_bs3_integration.py" = ["E402"]
+# F841 (local assigned but never used): the assignment documents that
+# generate_pdf returns a value, in a test whose assertions are about the
+# file it writes rather than its return. Unlike the E402s above this one
+# is a genuine tidy candidate -- it is ignored to keep an unrelated commit
+# from making unreviewed edits to a reviewed file, not because it is right.
+"geper/tests/test_summary_pdf_logo.py" = ["F841"]
+# A DIFFERENT AND WEAKER JUSTIFICATION THAN EVERY E402 ENTRY ABOVE --
+# deliberately its own entry with its own comment, not folded into the
+# "moving would break the module" property above, because it isn't that
+# property. `bp7_kaggle_verification.py`'s own docstring says it is a
+# verbatim mirror of upstream Kaggle notebook cells; each import sits
+# where its source cell placed it, not where import-order correctness
+# requires. Moving these imports would not break the module at import
+# time -- it would silently diverge the mirror from the notebook it
+# reproduces, which is the thing this file exists to avoid (see
+# RESIDUAL-the-kaggle-bp7-mirror-CANNOT-be-edited-at-all-because-editing-
+# it-pulls-preexisting-E402-failures-into-ruffs-scope: this file could not
+# be edited AT ALL, for any reason, while these two pre-existing E402s sat
+# outside every ignore list -- any edit pulled the file into ruff's scope
+# and pre-commit rejected the commit). Two lines, :162 and :541 at the
+# 2026-09-10 audit.
+"geper/kaggle_bp7_verification/bp7_kaggle_verification.py" = ["E402"]

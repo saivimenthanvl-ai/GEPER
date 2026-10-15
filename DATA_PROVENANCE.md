@@ -261,3 +261,347 @@ plausible to be genuinely functional for a gene pair where exactly one
 candidate has a MANE Select transcript. Confirming which of (a)/(b)
 explains the specific observed cases needs a live run's logs, not
 another static-inspection pass.
+
+## `kim_pipeline` DNABERT-2 `trust_remote_code` revision pin (security fix)
+
+`kim_pipeline/pipeline/ai/engine.py::DnaBertEngine` loads
+`zhihan1996/DNABERT-2-117M` via `transformers.AutoTokenizer`/`AutoModel
+.from_pretrained(..., trust_remote_code=True)`. That flag is required
+because DNABERT-2's architecture (MosaicBERT with ALiBi/FlashAttention)
+ships as custom Python inside the HF repo, not inside the `transformers`
+library — but unpinned, it means the loader executes whatever code sits
+on the repo's default branch at load time, which the repo owner (or an
+attacker who compromises their account) could silently repoint to
+something malicious after this review.
+
+Reviewed 2026-08-20: fetched `https://huggingface.co/api/models/zhihan1996/DNABERT-2-117M`
+directly (not summarized) — current HEAD `sha` = `7bce263b15377fc15361f52cfab88f8b586abda0`.
+Read the full custom-code payload at that exact commit (`configuration_bert.py`,
+`bert_layers.py`, `bert_padding.py`, `flash_attn_triton.py` — the files
+named in the repo's `auto_map`): standard MosaicML BERT/FlashAttention
+implementation built on `torch`/`einops`/`triton`/`transformers` base
+classes. No `subprocess`, `eval`/`exec`, `socket`, HTTP calls
+(`requests`/`urllib`), `pickle.load`, dynamic imports, or file writes
+outside normal model init. **Verdict: reviewed, benign.**
+
+Fix: pinned `revision="7bce263b15377fc15361f52cfab88f8b586abda0"` on both
+`from_pretrained()` calls (this is the HF-documented mitigation — see
+["Custom models" / revision pinning](https://hf.co/docs/transformers/en/models#custom-models)),
+applied only when `model_name` is the default repo string (an
+operator-supplied `model_name` override is out of scope for this pin and
+is left unpinned so it isn't broken by a stale hash). `trust_remote_code=True`
+itself is still required and was not removed — the pin is what closes the
+moving-ref RCE surface, not the flag.
+
+Not independently re-verified in this pass: a full model-weight smoke
+load (`AutoModel.from_pretrained` pulling the ~1.87GB `pytorch_model.bin`)
+was not run in this environment — no `torch`/`transformers` stack was
+installed here beforehand, and installing the full ML stack plus a
+multi-GB download was out of scope for what should be a mechanical
+`revision=` kwarg change. What *was* verified live: the pinned commit
+hash resolves against the real HF API (see above), and the code change
+matches HF's own documented pattern exactly.
+`tests/test_dnabert2_revision_pin.py`-equivalent regression coverage is
+being added separately (asserts `from_pretrained` is called with this
+exact `revision` value).
+
+## BP7 disclosure: SpliceFormer/SpliceBERT evidence must be named in reports
+
+**Decision (2026-08-20), implemented in commit `fd75fe3`: every clinical
+report that shows BP7 evidence derived from SpliceFormer or SpliceBERT
+must name the model, state that it is uncalibrated, and state that it
+has not undergone clinical validation.** This is required, not
+optional formatting.
+
+**Why.** Kelly's git investigation (commit `cb79edc`, the project's
+initial commit, 2026-07-30) establishes that both splice models were
+*intentionally* enabled from project inception — not accidentally
+shipped. That is a claim about **enablement**, a deliberate
+engineering decision, and is a different claim entirely from
+**validation**: no clinical outcome study has evaluated either model,
+and both plugins already self-report
+`details.calibration_status == "uncalibrated -- ..."` in their own
+`predict()` output (see `pipeline/models/spliceformer_plugin.py` and
+`splicebert_plugin.py`) — the pipeline already knew this about itself
+before this fix, it just wasn't surfaced to the reader. "Uncalibrated"
+is the accurate word, not a hedge. A pathologist reviewing a report
+cannot weigh evidence whose origin and validation status are hidden
+from them — silently folding an uncalibrated model's score into BP7
+without saying so would let a production-grade-looking report imply a
+rigor the underlying evidence doesn't have.
+
+**What's disclosed, and where.** Implemented in
+`pipeline/acmg_rules.py::ACMGRuleEngine._bp7`: each evidence line reads
+the model's own `details.calibration_status` value from its `predict()`
+output, rather than restating a fixed phrase — applied to both the
+damaging-effect branch (feeds `conflicting_evidence`) and the
+no-disruption branch (feeds `supporting_evidence`, which is what
+actually lets BP7 trigger, and so carries at least as much clinical
+weight as the damaging branch). When a model does not report a
+calibration status, _bp7 supplies an honest absence statement rather
+than an invented default. The
+caveat renders directly alongside the BP7 evidence itself in both the
+Markdown and PDF report formats — not relegated to a general
+limitations section a reader might skip. This is the same
+missing-vs-empty honesty problem this project has fixed repeatedly
+elsewhere (e.g. `not_evaluated` vs. a silently omitted criterion):
+visibility over invisibility, every time evidence provenance and
+confidence could otherwise be assumed rather than stated.
+
+Tests: `pipeline/acmg_rules.py`'s BP7 disclosure logic has 3/3 passing
+regression tests as of this commit.
+
+## PDF Conflicting Evidence section: missing since project inception (data integrity issue)
+
+**The clinical PDF renderer (`report/summary.py`) omitted the
+Conflicting Evidence section entirely from project inception (initial
+commit `cb79edc`, 2026-07-30) through commit `01a2e2d` (2026-08-20),
+which fixes it.** `git log -S "conflicting_evidence" --
+geper/report/summary.py` returns exactly one commit — `01a2e2d` itself
+— confirming the string never appeared in this file before this fix.
+This was **not a BP7-specific gap**: it affected every ACMG criterion
+that can produce conflicting evidence, for the entire lifetime of the
+PDF renderer. The Markdown report (`report/report_generator.py`,
+"### 6. Conflicting Evidence") and the underlying ACMG classification
+logic both computed and carried this data correctly the whole time —
+only the PDF rendering path silently dropped it, the same "cited but
+not shown" asymmetry between PDF and Markdown already flagged
+elsewhere in this document for `decision_path` and the combining-rule
+trace. It was discovered as a side effect of the BP7 disclosure work
+above (that disclosure text is itself carried in
+`conflicting_evidence`, which is how the PDF-rendering gap surfaced),
+not by a dedicated audit of the PDF path.
+
+**Blast radius — stated plainly, not softened:**
+- **Every PDF report generated by this pipeline from 2026-07-30
+  through 2026-08-20 is incomplete.** Any variant with conflicting
+  evidence for any criterion had that evidence silently absent from
+  the PDF a reader received, with no indication anything was missing.
+- **Any clinical team, reviewer, or pathologist who reviewed a PDF
+  report in that window may have drawn a classification or
+  significance conclusion without seeing evidence that conflicted with
+  it.** The PDF gave no signal that this section existed and was
+  omitted — it simply wasn't there, which reads as "no conflicting
+  evidence" rather than "conflicting evidence not shown."
+- **Any prior internal verification, QA, or audit run that reviewed
+  PDF output as its evidence source may itself have reached an
+  incorrect conclusion about a variant's classification**, because it
+  was reviewing an incomplete rendering of the same underlying data
+  the Markdown report and JSON output represented correctly.
+- **This is a data integrity issue, not a cosmetic formatting gap, and
+  should be flagged as such in any governance or audit review of prior
+  report accuracy.** Markdown reports and the underlying
+  `geper_results.json` for the same runs were not affected — only the
+  PDF rendering path — but for any workflow where the PDF was the
+  reviewed artifact, this blast radius applies in full.
+
+Tests: 45/45 PDF report tests pass as of commit `01a2e2d`.
+
+## End-to-end verification venue, and `requirements.txt`'s build status (2026-08-20)
+
+Two distinct claims. They are easy to conflate and must not be:
+
+**1. Correction to an earlier, too-strong claim.** An earlier note on
+this project's working notes stated that `geper/` "has never run
+end-to-end" — that reads as if prior verification work was worthless,
+which is not accurate and not the intended claim. **The correct
+framing: this local box has always been a test/dev environment; every
+real end-to-end verification run in this project's history happened on
+Colab.** Prior verification wasn't invalid — it simply happened on a
+different, Colab-provisioned environment than this local machine.
+Nothing about the finding below should be read as casting doubt on
+those Colab-run results.
+
+**2. UPDATE (2026-08-20, later the same day): `requirements.txt` is now
+PROVEN TO BUILD a working `geper/` environment — minus `evo2`.** This
+supersedes the "declared-but-never-proven-to-build" status this entry
+originally recorded a few hours earlier; that gap has been closed by a
+real, from-scratch build, not merely re-argued. Andy built an isolated
+Python 3.12.10 venv (outside the git tree, shared `site-packages`
+untouched) and installed `requirements.txt`'s full declared set in the
+order the file's own comments specify: `torch==2.7.1` alone first
+(resolves to the CPU wheel from plain PyPI, no custom index-url
+needed), then the main batch (`transformers`, `accelerate`, `einops`,
+`torchvision==0.22.1`, `omegaconf`, `torchaudio==2.7.1`, `biopython`,
+and the rest), then `tensorflow` alone, then
+`mmsplice==2.4.0 --no-deps`, then `rna-fm`. All 82 packages resolved
+cleanly with **zero dependency conflicts** — `torch 2.7.1+cpu`,
+`transformers 5.15.1`, `torchvision`/`torchaudio` matching the torch
+pin exactly, `tensorflow 2.21.0`. `evo2` was deliberately not
+installed (GPU-only, requires a manual CUDA-toolkit-matched build that
+`requirements.txt`'s own comments already say not to attempt via a
+bare install pass — its absence here is by design, not a build
+failure). `from pipeline.orchestrator import GeperPipeline` **imported
+cleanly** in this venv. Full recipe and the ground-truth `pip freeze`
+are recorded in `geper/VENV_BUILD_RECIPE.md`, cross-referenced
+from `geper/README.md` Section 5 — this is the first working install
+recipe this project has ever had.
+
+**Be precise about what this does and does not prove.** Proven: the
+declared dependency set (minus `evo2`) installs cleanly with no
+conflicts, and the pipeline's own import chain works end-to-end at
+the Python-import level. **NOT proven: a full end-to-end variant-processing
+run.** No run has yet completed on this box — four attempts were
+externally killed before reaching `geper_results.json`/report
+generation (survival time shrank each attempt, 19min → 1min → 3-4min,
+consistent with an exhausted background-task/resource ceiling on this
+box, not a GEPER defect), and separately, `rest.ensembl.org` was
+independently returning `500` errors and 30-second timeouts during the
+same window — Ensembl reliability, not a GEPER defect, but also on the
+critical path for every variant, so it would slow or degrade any run
+attempted right now regardless of the killed-process issue. Neither
+failure mode says anything about `geper/`'s own correctness. **"Proven
+to build" must not be read as "proven to work end-to-end"** — those
+are different claims, and only the first one is closed as of this
+entry.
+
+**Earlier context (superseded by the full build above, kept for the
+reasoning it establishes): what was found on this local box before the
+clean venv existed** (Andy, 2026-08-20): a bare
+`pip install -r requirements.txt` starts from an environment
+where 7 of the 20 declared packages happen to be absent on this
+particular box (`rna-fm`, `evo2`, `torchvision`, `omegaconf`,
+`torchaudio`, `biopython`, `tensorflow`), plus a `torch 2.13.0+cpu`
+install against the file's `torch==2.7.1` pin. But walking every actual
+import site from `GeperPipeline`'s entry point found **exactly two
+hard blockers at module-load time: `transformers` (corrupted local
+install, unrelated to the pin) and `biopython`** — after resolving
+both, `from pipeline.orchestrator import GeperPipeline` imported
+cleanly, with no third blocker surfacing. **Packages needed but absent
+from `requirements.txt` itself: none.** Every package the import chain
+actually reaches is already correctly declared; the file's own
+comments proved accurate in every case checked. The failure on this
+box was declared-but-never-installed (plus one corrupted `transformers`
+install, a separate local artifact — see below), not a deficient
+`requirements.txt`. The startup-failure mechanism itself is unchanged:
+`ModuleNotFoundError: No module named 'Bio'`, because
+`pipeline/orchestrator.py:58` unconditionally imports
+`pipeline/uniprot/bootstrap.py`, which imports `Bio` (biopython) at
+line 64 regardless of which models a given run actually needs. See
+`geper/README.md` Section 5 ("Installation") for the setup-gotcha note
+this finding produced (torch/torchvision/torchaudio pinning, Evo 2's
+manual CUDA install, tensorflow-before-mmsplice ordering) — not
+duplicated here.
+
+Two narrower points worth keeping in view, not part of the headline
+gap but relevant to reading `requirements.txt` accurately: `torchaudio`
+is declared but never imported by GEPER's own code at all — it's a
+purely prophylactic pin against an ABI-mismatched transitive copy
+being pulled in by another dependency, not evidence of a real GEPER
+runtime need. `evo2` is installable but unusable without a
+CUDA-toolkit-matched build that `requirements.txt`'s own comments
+already say not to attempt via a bare `pip install -r requirements.txt`
+pass — its presence in the declared list was never meant to imply a
+one-command install path.
+
+**Explicitly out of scope for this finding**: the `transformers`
+corruption mentioned above was a local install-corruption artifact,
+repaired, and confirmed not to represent a fresh-install failure mode.
+It is a different story from the declared-but-never-proven-to-build
+gap and is not evidence against `requirements.txt`'s own correctness.
+
+**Status**: the build question is closed — `requirements.txt` builds a
+working `geper/` (minus `evo2`), demonstrated in a real, from-scratch
+venv, recipe recorded in `geper/VENV_BUILD_RECIPE.md`. **The
+end-to-end-run question remains open**: no full variant-processing run
+has completed on this box yet, for the external/environmental reasons
+described above, not for any reason connected to `requirements.txt` or
+`geper/`'s own code. Do not read this entry as claiming end-to-end
+verification has occurred on this box — it has not, as of this entry.
+
+## Borzoi/Enformer `post_init()` shim: commit `c1e0949` was accurate-but-stale, not wrong (2026-08-20)
+
+Kelly re-derived the exact upstream mechanism behind both shims (see
+the shim comments themselves, `pipeline/models/borzoi_plugin.py` and
+`pipeline/models/enformer_plugin.py`, for the full technical detail —
+not duplicated here). Worth recording as its own provenance point:
+`transformers>=5`'s `PreTrainedModel.post_init()` sets
+`all_tied_weights_keys` unconditionally, so the `AttributeError` both
+shims guard against is reachable only when a subclass never calls
+`post_init()` at all. Commit `c1e0949`'s message correctly described
+this for `borzoi-pytorch`'s installed version at the time — it is
+**stale, not wrong**, since `borzoi-pytorch` 0.5.0 (2026-06-10) added
+the missing call upstream, making that shim a no-op on any current
+install (kept only because GEPER's own installer never upgrades an
+already-present package, so a box that picked up `<=0.4.4` keeps it
+indefinitely). `enformer-pytorch` never added the equivalent call —
+upstream closed the report by pinning `transformers==4.56.2` instead —
+so the Enformer shim remains live and load-bearing. Both shims are
+behaviorally inert either way: `{}` is the same value `post_init()`
+would have produced, so neither changes architecture, weights, or
+output.
+
+## What a run records about the weights it loaded, and what `service_health` can never answer (2026-09-10)
+
+Two separate limits, written down here because both are the kind that read as
+answers when they are not.
+
+### 1. The pin is not the observation
+
+Until this change, `model_checkpoints` recorded only what each run's config
+*intended* to load: a repo id and a pinned revision. An impact query built on
+it -- "which reports used weights X" -- was in fact answering "which reports
+DECLARED revision X". Those are the same sentence only while the cache is
+honest. They diverge exactly when it matters: a substituted, corrupted, or
+re-resolved cache entry, which is the case such a query exists to find.
+
+Each finalised entry now carries a `loaded_artifact` alongside the pin, never
+instead of it, because a disagreement between the two is only visible while
+both are present. What it contains, precisely:
+
+* `served_revision` -- the revision the cache actually resolved for the load.
+* `cache_declared_sha256` -- **the hash the cache's own filename declares.**
+  Deliberately not named `observed_sha256`: nothing has read the bytes.
+* `hash_verification` -- `UNVERIFIABLE` / `NOT_VERIFIED` / `VERIFIED` /
+  `MISMATCH`, on its own axis rather than folded into `VersionStatus`.
+
+**What this is, stated so it cannot be over-read.** It is the HuggingFace
+cache's own resolution for the same (repo, revision, cache dir) that the load
+just used, queried in the same process immediately after a *successful* load.
+It is strictly stronger than the pin and strictly weaker than intercepting the
+file handle `transformers` opened, which its public API does not expose.
+
+**Three real gaps, none of them silent:**
+
+* Only the three HF-cache-backed loaders are instrumented (ESM-2, Enformer,
+  Borzoi) -- the models where a pin and a served revision can actually
+  disagree. Every other model reports `loaded_artifact: null`, which means
+  "this run recorded no observation", not "there was nothing to observe".
+  A missing key would have read as the latter.
+* `VERIFIED` requires reading the bytes, which is opt-in
+  (`GEPER_VERIFY_MODEL_HASHES`) because the cost is measured, not guessed:
+  ~3.9s per 2.6GB model per run. Default runs record the free declared hash
+  and say `NOT_VERIFIED`, which is true.
+* On a host without symlink privilege (Windows without developer mode) the
+  hub copies blobs into the snapshot directory instead of linking. There is
+  then no content-addressed filename to read, and the record says
+  `UNVERIFIABLE` rather than inventing one.
+
+A `MISMATCH` is logged at ERROR with both hashes and is **never** promoted to
+`VersionStatus.HASH_ONLY`. A refuted hash is not a known hash.
+
+### 2. `service_health` is answerable at RUN granularity only -- never at interval granularity
+
+`ServiceHealthRegistry.snapshot()` (`geper/utils/service_health.py`) writes ten
+fields into every run document: `service`, `status`, `is_local_component`,
+`degraded`, `startup_status`, `failure_count`, `success_count`,
+`skipped_count`, `latency_ms`. **Not one of them is a time.**
+
+`ServiceRecord.latched_at` does exist, but it is `time.monotonic()` -- a clock
+with no relation to wall time and no meaning across processes -- and it is not
+in the snapshot at all. The only wall-clock stamp in the neighbourhood is the
+document's `generated_at`, which records when the *report was written*, not
+when a service failed.
+
+The consequence, concretely. A document can say "Ensembl failed 3 times during
+this run". It cannot say when, and the failures cannot be placed inside the
+run's own duration. So:
+
+* **Answerable:** "which runs experienced degraded Ensembl?" -- one row per run.
+* **NOT answerable:** "which runs were affected by the 14:20-14:40 outage?"
+
+Asking the second question of this data returns a confident, wrong answer,
+because a run that started at 13:00 and finished at 15:00 is indistinguishable
+from one that overlapped the outage window and one that did not. Anyone
+building an impact query on `service_health` must restrict it to run
+granularity, or add a wall-clock stamp at the point of failure first.

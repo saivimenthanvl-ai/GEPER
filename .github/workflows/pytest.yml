@@ -1,0 +1,474 @@
+name: pytest
+
+# Interpreter: 3.12.
+#
+# geper/requirements.txt line 39 documents the hard constraint -- 3.11 or
+# 3.12 ONLY, forced by evo2's own PyPI metadata (requires-python:
+# >=3.11,<3.13). Both are equally permitted by it. 3.12 is chosen because
+# it is the project's validated interpreter of record: the mmsplice/cyvcf2
+# incompatibility documented in that same file was established by testing
+# against 3.12, and the clean-venv installs that identified geper's missing
+# test runner were done on 3.12.
+#
+# THE COST, stated here so it is not discovered later: a 3.12-only CI will
+# not catch a regression specific to 3.11, which requires-python still
+# permits. That cost is currently theoretical -- no 3.11 environment is
+# reachable from this project's development floor to reproduce such a
+# regression against (`py --list` -> 3.14.7 and 3.12.10 only). Revisit --
+# as a build matrix over both -- if a 3.11 environment becomes reachable.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # WHAT THIS JOB CLOSES, AND WHAT IT DOES NOT -- read both before trusting
+  # a green tick here.
+  #
+  # CLOSES (enforcement): until this job existed, mypy ran ONLY in a local
+  # pre-commit hook. Nothing checked types on a machine where nobody ran
+  # `pre-commit install`, or on a commit made with `--no-verify`. A fresh
+  # checkout on every push closes all of that, because it does not depend
+  # on anyone's machine being configured.
+  #
+  # DOES NOT CLOSE (disarming): this job runs mypy against whatever
+  # mypy.ini says at that commit. A mypy.ini that disables the checks --
+  # `ignore_errors` on the scoped modules, say -- makes mypy legitimately
+  # report zero errors, and THIS JOB GOES GREEN. Running is not detecting.
+  # A GREEN TICK HERE IS NOT EVIDENCE THAT THE CONFIGURATION IS INTACT.
+  # That is what the canary test (geper/tests/test_mypy_canary.py) is for,
+  # and it is a separate mechanism on purpose.
+  mypy:
+    name: mypy (ACMG interpretation path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pinned to the same version the pre-commit hook uses
+      # (.pre-commit-config.yaml, mirrors-mypy rev v2.3.0), so local and CI
+      # cannot disagree about what an error is. pydantic is here for the
+      # same reason it is in the hook's additional_dependencies: mypy.ini
+      # enables the pydantic plugin and cannot load it otherwise.
+      - name: Install mypy
+        run: pip install "mypy==2.3.0" "pydantic>=2.13,<3.0"
+
+      # No file arguments: mypy checks the `files =` scope from mypy.ini
+      # itself, exactly as the pre-commit hook does with
+      # `pass_filenames: false`.
+      - name: Run mypy over the configured scope
+        run: python -m mypy --config-file=mypy.ini
+
+  # ── THIS JOB AND kim_pipeline-tests RUN IN THE PRODUCT'S OWN BASE IMAGE, AND
+  #    THAT IS THE POINT OF THEM (2026-09-11, the human's ruling: "PIN, AND PIN
+  #    CI TO WHAT SHIPS. CI tests what ships; it does not get its own version.")
+  #
+  #    BEFORE THIS, both jobs ran on ubuntu-latest and installed samtools/
+  #    bcftools/tabix unpinned from Ubuntu noble: htslib 1.19. The shipped image
+  #    runs htslib 1.16 from Debian bookworm. THREE MINOR VERSIONS APART, AND
+  #    NOTHING SAID SO -- every green tick was evidence about a machine that
+  #    RESEMBLED the product. And the clinical question -- WHICH VERSION WERE
+  #    THE REPORTS VALIDATED AGAINST -- had no answer while both sides floated.
+  #
+  #    NOW: `container:` is the SAME tag as the Dockerfile's runtime `FROM`, and
+  #    the htslib stack is installed at the versions READ OUT OF THE DOCKERFILE'S
+  #    PINNED LINE, then checked with dpkg-query against that line. There is one
+  #    declaration of these versions, in the Dockerfile. CHANGE THEM THERE.
+  #
+  #    WHAT THIS COSTS, so a later reader does not rediscover it:
+  #    - actions/setup-python is gone from these two jobs: it installs its own
+  #      interpreter, which would be a second Python beside the product's. The
+  #      interpreter is now the base image's own 3.12.x -- the one that ships.
+  #      Its pip cache went with it (`cache: "pip"`).
+  #    - The base tag is not digest-pinned, in the Dockerfile or here. Both
+  #      float TOGETHER, which keeps CI equal to a build made the same day; it
+  #      does not make either reproducible.
+  #    - python:3.12-slim has NO C COMPILER. Measured 2026-09-11 in that image:
+  #      every requirement of geper/, kim_pipeline/ and clinical/ resolves to a
+  #      wheel except antlr4-python3-runtime 4.9.3, which is pure Python and
+  #      built there with no compiler present. A future sdist-only dependency
+  #      WITH C code will fail this job at install. That is correct: it would
+  #      fail the product image the same way.
+  #    - The htslib pins were RESOLVED by apt-get install -s, then by a real
+  #      build (2026-09-11, geper:vic-trim-htslib-d2fc3ee: dpkg-query inside
+  #      the image equals the pins). If this job fails at the pinned install,
+  #      read the Dockerfile's pin note before touching either file.
+  geper-tests:
+    name: geper/ pytest
+    runs-on: ubuntu-latest
+    container: python:3.12-slim-bookworm
+    # The clinical-link tests in api/tests (the worker writing a pipeline run
+    # into clinical records) need a real PostgreSQL. This job runs INSIDE a
+    # container, so the service is reached by its service name, `postgres`,
+    # not localhost -- a DSN naming localhost here would point at the job
+    # container itself, where nothing listens.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres_ci_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: geper
+    env:
+      GEPER_DEV_INSECURE: "1"
+      CLINICAL_TEST_DSN: postgresql://postgres:postgres_ci_password@postgres:5432/postgres
+      # Throwaway service, so disposable (clinical/tests/db_guard.py).
+      CLINICAL_TEST_DB_DISPOSABLE: "1"
+      # Fail, not skip, if the database is missing (api/tests/conftest.py).
+      CLINICAL_REQUIRE_DB: "1"
+    steps:
+      # git first, so actions/checkout makes a real clone rather than falling
+      # back to a tarball without .git. `/` because the job's working-directory
+      # (geper) does not exist until the checkout below.
+      - name: Install git
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends git
+
+      - uses: actions/checkout@v4
+
+      # IDENTICAL IN kim_pipeline-tests. One declaration of the versions (the
+      # Dockerfile); two copies of this step that read it.
+      - name: Install the SHIPPED htslib stack (versions read from the Dockerfile)
+        working-directory: .
+        run: |
+          PINS=$(tr -d '\r' < Dockerfile | grep -oE '(^| )(samtools|bcftools|tabix|libhts3)=[^ ]+' | tr -d ' ' | sort -u)
+          echo "Dockerfile pins:"; echo "$PINS"
+          N=$(printf '%s\n' "$PINS" | grep -c . || true)
+          NAMES=$(printf '%s\n' "$PINS" | cut -d= -f1 | sort -u | grep -c . || true)
+          if [ "$N" -ne 4 ] || [ "$NAMES" -ne 4 ]; then
+            echo "::error::Expected exactly ONE pinned version each for samtools, bcftools, tabix and libhts3 in the Dockerfile; found $N pin(s) over $NAMES name(s). CI installs what the Dockerfile pins, so it cannot proceed without that line."
+            exit 1
+          fi
+          apt-get update
+          apt-get install -y --no-install-recommends $PINS
+          # What apt ACTUALLY installed, not what was asked for.
+          for p in $PINS; do
+            name=${p%%=*}; want=${p#*=}
+            got=$(dpkg-query -W -f='${Version}' "$name")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name: installed $got, the Dockerfile pins $want"
+              exit 1
+            fi
+            echo "$name $got == Dockerfile pin"
+          done
+          samtools --version | head -2
+
+      - name: Install shared package (subprocess-reachable import resolution)
+        working-directory: .
+        run: pip install -e .
+
+      # DO NOT REVERT THIS AS A TIDY-UP. It is load-bearing.
+      #
+      # This is not only about removing weight the runner cannot use. It
+      # fixes an INTERMITTENT out-of-disk failure whose error message points
+      # at the wrong thing. MEASURED across the two runs either side of it:
+      # cp311 run 32597004559 downloaded 186 wheels totalling 3740.1 MB and
+      # DIED on disk; cp312 run 32599323393 downloaded 195 wheels totalling
+      # 3740.5 MB and PASSED. A delta of 0.4 MB -- 0.01% -- with the LARGER
+      # install succeeding. Both runs logged "pip cache is not found", so
+      # neither had a warm cache. Interpreter, cache and dependency set are
+      # all eliminated: the variable was which runner the job landed on.
+      #
+      # That is the worst diagnostic shape available. The job fails on
+      # IDENTICAL INPUTS, and the message says "No space left on device"
+      # while the actual variable is the machine. Anyone debugging it reads
+      # that message and goes looking at the dependency set -- at whichever
+      # change happened to be in flight -- which is where the cause is not.
+      # Reverting this restores that failure mode, and it will not reappear
+      # on the commit that reverted it.
+      #
+      # CPU-only torch. The runner has no GPU, so the ~2.2 GB of nvidia
+      # CUDA libraries that PyPI's default linux torch wheel drags in are
+      # unusable there by construction -- and their unpacked footprint
+      # exhausted the runner's disk outright (run 32597004559: "ERROR: Could
+      # not install packages due to an OSError: [Errno 28] No space left on
+      # device", raised during "Installing collected packages"; the wheels
+      # alone were torch 821.2 MB + cudnn 571.0 MB + cublas 393.1 MB + 39
+      # further nvidia components).
+      #
+      # WHAT THIS COSTS, so no future reader misreads a green tick: CI DOES
+      # NOT VALIDATE ANY GPU CODE PATH. It never did -- a GPU-less runner
+      # could not execute one -- so this loses no coverage that existed. But
+      # do not treat a passing run here as evidence that device placement,
+      # CUDA memory handling, or multi-GPU behaviour works. Nothing in this
+      # workflow tests those.
+      #
+      # Checked before adopting, not assumed: (1) no test requires a real
+      # GPU -- tests/test_evo2.py MOCKS torch.cuda.is_available in both
+      # directions, which works because CPU builds still expose torch.cuda
+      # and torch.cuda.get_device_name, and torch.device("cuda") constructs
+      # without a device; the 53 tests across test_evo2/test_model_manager/
+      # test_torchaudio_pin_regression all pass on torch 2.7.1+cpu with zero
+      # nvidia packages installed. (2) evo2 does not need the CUDA tree to
+      # install: evo2 0.6.0 requires only biopython, huggingface_hub, torch,
+      # vtx>=1.1.0, and vtx 1.1.0 requires only torch, numpy, einops,
+      # packaging, rich, tqdm, PyYAML -- no flash-attn, no nvidia-* pins.
+      #
+      # These three versions MUST match the torch/torchvision/torchaudio
+      # pins in requirements.txt. If they drift, pip resolves the conflict
+      # by reinstalling the CUDA build and the disk failure returns. The
+      # guard step below turns that coupling into something CI enforces
+      # rather than something a reader has to remember.
+      - name: Install CPU-only torch
+        run: >-
+          pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+          --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # THE ONE CLINICAL DEPENDENCY THIS JOB REACHES THAT requirements.txt
+      # DOES NOT DECLARE (w119).
+      #
+      # api/tests/test_signoff_clinical_link.py's end-to-end test drives
+      # review/signoff.py::_connect_clinical_data_access() -- the REAL connect
+      # path -- so nothing is injected and the DataAccess it builds carries
+      # clinical/data_access.py's DEFAULT password hasher, BcryptHasher. That
+      # class imports bcrypt LAZILY, inside hash()/verify(), so the gap does
+      # not show at import time: it shows at the first login. Every OTHER
+      # clinical-link test in this directory injects a stand-in hasher, which
+      # is why BcryptHasher had never been constructed in this job and its
+      # absence had never been visible here.
+      #
+      # This is the same direction this job already went, not a new one: it
+      # already runs a PostgreSQL service, already sets CLINICAL_TEST_DSN and
+      # CLINICAL_REQUIRE_DB=1, and the comment on `services:` above says the
+      # clinical-link tests are meant to run here. Installing the auth
+      # dependency that layer needs is what that decision costs.
+      #
+      # bcrypt ONLY, and that is MEASURED rather than assumed. With bcrypt
+      # made unimportable, api/tests is 138 passed + 1 error, the error being
+      # exactly this test (ModuleNotFoundError at data_access.py:289, which is
+      # what CI reported). With pyotp AND cryptography both made unimportable
+      # and bcrypt present, api/tests is 139 passed -- because DataAccess
+      # defaults totp_verifier and secret_cipher to None rather than to
+      # PyOtpVerifier, so neither is reached. psycopg[binary] is already a
+      # declared geper requirement. Installing clinical/requirements.txt
+      # wholesale here would pull the clinical SERVICE's dependencies into
+      # this job for paths that do not run in it.
+      #
+      # UNPINNED, matching clinical/requirements.txt's own bcrypt line.
+      # Nothing in this repository pins bcrypt; pinning it only here would
+      # create a second, diverging answer to a question that has one.
+      - name: Install bcrypt (the real clinical login path in api/tests)
+        run: pip install bcrypt
+
+      # Fails loudly if the CUDA stack came back -- the pins above drifting
+      # from requirements.txt is the expected way for that to happen, and it
+      # would otherwise show up as an intermittent out-of-disk error whose
+      # cause is nowhere near the change that caused it.
+      - name: Assert the CUDA stack was not pulled in
+        run: |
+          if pip list --format=freeze | grep -qiE '^(nvidia-|triton==)'; then
+            echo "::error::CUDA packages are installed. The CPU-index pins in this workflow have drifted from requirements.txt, or a new dependency pulled GPU torch."
+            pip list --format=freeze | grep -iE '^(nvidia-|triton==)'
+            exit 1
+          fi
+          python -c "import torch; print('torch', torch.__version__, '| cuda build:', torch.version.cuda)"
+
+      # The environment verdict GATES this job (human, 2026-09-12: "A check
+      # nothing runs is the same inert control as an exit code nobody reads").
+      # verify_environment.py exits 1 on FAIL and 0 on PASS or WARN-only, so
+      # DO NOT add `|| true` or continue-on-error: the only thing either can
+      # silence is a FAIL. Expected here: no FAIL; WARN for the absent GPU and
+      # BLAST+, possibly for disk (a LOCAL SIMULATION of this job, 2026-09-12,
+      # not yet an observed CI run -- the first run of this step is that).
+      # tests/test_verify_environment_is_run.py pins this step.
+      - name: Verify the environment (a FAIL verdict fails the job)
+        run: python verify_environment.py
+
+      # WHAT CI DOES NOT COVER:
+      #
+      # 1. Optional integration tests (opt-in markers):
+      #    - real_pip: tests that shell out to real `pip install/uninstall`.
+      #      Excluded by addopts in pytest.ini because running against a
+      #      shared interpreter risks collision/removal. ~20 tests deselected.
+      #    - live_network: tests that make real HTTP calls to third-party APIs
+      #      (Ensembl REST, etc.). Excluded because infrastructure outages are
+      #      indistinguishable from regressions. ~9 tests deselected.
+      #    Both require explicit `-m real_pip` / `-m live_network` to run.
+      #
+      # 2. Heavy optional model packages (unittest.skipUnless-gated):
+      #    - enformer-pytorch: ~12 tests. Enformer inference, load, and
+      #      device-placement tests are skipped when not installed.
+      #    - borzoi-pytorch: involved in ~3 integration tests (both enformer
+      #      and borzoi must be present for these to run).
+      #    - spliceformer: ~1 integration test (requires enformer/borzoi).
+      #    - evo2: inference and configuration tests skip if not installed
+      #      (used in variant effect prediction pipelines).
+      #    Total: approximately 22 tests skip due to absent model packages.
+      #
+      # 3. SpliceBERT checkpoint cache:
+      #    This workflow never sets GEPER_CACHE_DIR (or
+      #    GEPER_PLUGIN_CACHE_DIR), so CONFIG.splicing.PLUGIN_CACHE_DIR
+      #    falls back to "./plugin_model_cache" (config.py), which is always
+      #    empty on a fresh checkout. tests/test_splicebert_loader_live.py's
+      #    real-checkpoint regression test (TestSpliceBertLoaderDoesNotHang) is
+      #    unittest.skipUnless-gated on config.json + pytorch_model.bin
+      #    existing under that path, so it SKIPS on every CI run -- pytest
+      #    reports it green, not absent. Whether to set GEPER_CACHE_DIR or add
+      #    a download step (cost: ~208MB Zenodo archive, real weights loaded
+      #    every run) is a human decision; this comment documents the current
+      #    gap.
+      #
+      # Summary: a passing CI run means GEPER's logic handles expected inputs
+      # correctly; model inference, device placement, real-network calls, and
+      # package-management safety are NOT exercised. To validate those, run
+      # tests locally with model packages installed, or explicitly via
+      # `pytest -m live_network` or `pytest -m real_pip`.
+      - name: Run pytest
+        # -rs prints the REASON for every skip. Without it, verbose mode
+        # reports a skip COUNT and nothing else, so a test that stopped
+        # running because its binary is absent looks exactly like one that
+        # was always meant to skip. That is not hypothetical: bwa and
+        # minimap2 are installed by no job in this file, so every test gated
+        # on them has skipped on every run, green, for as long as those
+        # steps have existed, and the log could not show it. Measured
+        # 2026-09-10 against run 34449813288, which reported totals only.
+        # Do not drop -rs to quieten the log: the noise is the coverage
+        # report.
+        run: python -m pytest tests/ api/tests/ -v -rs
+
+  # Runs in the product's base for the same reason as geper-tests -- see the
+  # note above that job.
+  kim_pipeline-tests:
+    name: kim_pipeline/ pytest
+    runs-on: ubuntu-latest
+    container: python:3.12-slim-bookworm
+    defaults:
+      run:
+        working-directory: kim_pipeline
+    steps:
+      - name: Install git
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends git
+
+      - uses: actions/checkout@v4
+
+      # IDENTICAL IN geper-tests.
+      - name: Install the SHIPPED htslib stack (versions read from the Dockerfile)
+        working-directory: .
+        run: |
+          PINS=$(tr -d '\r' < Dockerfile | grep -oE '(^| )(samtools|bcftools|tabix|libhts3)=[^ ]+' | tr -d ' ' | sort -u)
+          echo "Dockerfile pins:"; echo "$PINS"
+          N=$(printf '%s\n' "$PINS" | grep -c . || true)
+          NAMES=$(printf '%s\n' "$PINS" | cut -d= -f1 | sort -u | grep -c . || true)
+          if [ "$N" -ne 4 ] || [ "$NAMES" -ne 4 ]; then
+            echo "::error::Expected exactly ONE pinned version each for samtools, bcftools, tabix and libhts3 in the Dockerfile; found $N pin(s) over $NAMES name(s). CI installs what the Dockerfile pins, so it cannot proceed without that line."
+            exit 1
+          fi
+          apt-get update
+          apt-get install -y --no-install-recommends $PINS
+          # What apt ACTUALLY installed, not what was asked for.
+          for p in $PINS; do
+            name=${p%%=*}; want=${p#*=}
+            got=$(dpkg-query -W -f='${Version}' "$name")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name: installed $got, the Dockerfile pins $want"
+              exit 1
+            fi
+            echo "$name $got == Dockerfile pin"
+          done
+          samtools --version | head -2
+
+      - name: Install shared package (subprocess-reachable import resolution)
+        working-directory: .
+        run: pip install -e .
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v -rs
+
+
+  clinical-tests:
+    name: clinical/ pytest (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres_ci_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      CLINICAL_REQUIRE_DB: "1"
+      CLINICAL_TEST_DSN: postgresql://postgres:postgres_ci_password@localhost:5432/postgres
+      # The service above exists only for this job, so it is disposable. The
+      # suite drops its schema before every test and refuses to without this
+      # statement -- see clinical/tests/db_guard.py.
+      CLINICAL_TEST_DB_DISPOSABLE: "1"
+    defaults:
+      run:
+        working-directory: clinical
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: clinical/requirements.txt
+
+      - name: Install shared package (subprocess-reachable import resolution)
+        working-directory: .
+        run: pip install -e .
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # ONE DECLARATION, NOT TWO. This was an inline list until clinical/
+          # requirements.txt existed; now that it does, an inline list here would be a
+          # second source of truth for one answer, and the two would drift the way any
+          # pair does -- silently, and in whichever direction nobody is looking. The
+          # earlier form of this line had to be patched in a hotfix precisely because
+          # it was missing fastapi and httpx while the service's real needs lived
+          # nowhere. cache-dependency-path above already points at this file.
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v -rs
+
+  shared-tests:
+    name: shared/ pytest (process control)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install GEPER root package
+        run: pip install -e .
+
+      - name: Install dependencies
+        run: pip install psutil pytest
+
+      - name: Run pytest
+        run: |
+          python -m pytest shared/tests/ -v -rs
+          # Exit code 5 means no tests collected — treat as failure
+          # (empty test suite is not success, it's an infrastructure problem)
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 5 ]; then
+            echo "::error::No tests collected in shared/tests/ — CI job is misconfigured or tests are missing"
+            exit 1
+          fi
+          exit $EXIT_CODE

@@ -73,7 +73,8 @@ last-resort fallback for backward compatibility, so:
 --------------------------------------------------------------------
 """
 
-import contextlib
+import argparse
+import os
 import pickle
 import shutil
 import socket
@@ -86,7 +87,12 @@ import torch
 
 from config import CONFIG
 from models.base_model import BaseGenomicModel
-from utils.auto_install import ensure_pip_package_available, is_pip_package_installed
+from utils.auto_install import (
+    PackageCheckStatus,
+    check_pip_package_availability,
+    ensure_pip_package_available,
+    is_pip_package_installed,
+)
 from utils.exceptions import ModelLoadError
 
 # Download filenames `fm.pretrained` itself hardcodes per variant (see
@@ -139,8 +145,22 @@ def is_rna_fm_installed() -> bool:
 def ensure_rna_fm_available() -> bool:
     """Auto-installs the official `rna-fm` PyPI package exactly once per
     process if missing. Import name is `fm`, distinct from the pip
-    package name `rna-fm` -- see utils.auto_install.ensure_pip_package_available."""
+    package name `rna-fm` -- see utils.auto_install.ensure_pip_package_available.
+
+    Bool surface, for callers indifferent to WHY it is unavailable. If
+    you are about to write a reason string on the False branch, call
+    `check_rna_fm_availability()` below instead."""
     return ensure_pip_package_available("rna-fm", import_name="fm")
+
+
+def check_rna_fm_availability() -> PackageCheckStatus:
+    """Tri-state sibling of `ensure_rna_fm_available()`, for callers that
+    must distinguish "checked and absent" from "never checked".
+
+    Exists so the `rna-fm`/`fm` pip-name-vs-import-name mapping stays
+    encapsulated here -- the reason the bool wrapper existed at all --
+    rather than leaking to every call site that needs the tri-state."""
+    return check_pip_package_availability("rna-fm", import_name="fm")
 
 
 def _torch_hub_checkpoint_path(filename: str) -> Path:
@@ -237,67 +257,196 @@ def _is_permanent_download_error(exc: Exception) -> bool:
     return isinstance(exc, urllib.error.HTTPError)
 
 
-def _is_unpickling_error(exc: Exception) -> bool:
-    """True for the failure PyTorch >=2.6 raises against this exact
-    checkpoint now that `torch.load`'s `weights_only` default flipped
-    from `False` to `True` -- the file itself isn't corrupt, it's just
-    a plain, trusted first-party checkpoint (same trust level as
-    HyenaDNA's, which already loads with `weights_only=False`
-    explicitly -- see hyenadna.py) that predates PyTorch's newer,
-    stricter unpickling allowlist."""
-    if isinstance(exc, pickle.UnpicklingError):
-        return True
-    return "weights_only" in str(exc)
-
-
-@contextlib.contextmanager
-def _force_weights_only_false():
+def _is_weights_only_rejection(exc: Exception) -> bool:
     """
-    `fm.pretrained.<variant>(model_location=...)` calls `torch.load(...)`
-    internally with no `weights_only` argument, so there's no way to
-    pass it through the official package's API. This temporarily
-    patches `torch.load`'s default back to `weights_only=False` for the
-    duration of the call instead, so a checkpoint that only fails
-    because of PyTorch 2.6's new default can be loaded from the exact
-    same local file it already has -- instead of discarding a perfectly
-    good file and wastefully re-downloading (or re-hitting the flaky
-    upstream endpoint) for a problem re-downloading can't fix anyway.
+    True when `exc` is torch's own `weights_only=True` rejection of a
+    pickled class it does not recognise -- e.g. an already-cached
+    fairseq checkpoint whose format has drifted one field ahead of
+    `_allow_argparse_namespace_in_checkpoints`'s current allowlist --
+    as opposed to a genuinely corrupted or unreadable file.
+
+    torch.load raises exactly `pickle.UnpicklingError` for this specific
+    case (see torch/serialization.py:
+    `raise pickle.UnpicklingError(_get_wo_message(str(e))) from None`),
+    and the message names the rejected global. Both are checked --
+    UnpicklingError is torch's error class for this, but the message
+    check keeps an unrelated pickle-stream corruption that happens to
+    raise the same exception TYPE from being misclassified as an
+    allowlist gap.
+
+    Measured, not assumed: a truncated/corrupted real checkpoint raises
+    `RuntimeError: PytorchStreamReader failed reading zip archive:
+    failed finding central directory` instead -- a torch checkpoint is
+    a zip archive whose central directory sits near the end of the
+    file, so ordinary corruption breaks archive-opening itself, before
+    unpickling-mode differences ever matter. That is the case this
+    function must say NO to.
     """
-    original_load = torch.load
+    return isinstance(exc, pickle.UnpicklingError) and (
+        "Unsupported global" in str(exc) or "Weights only load failed" in str(exc)
+    )
 
-    def _patched_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        return original_load(*args, **kwargs)
 
-    torch.load = _patched_load
+def _quarantine_unreadable_checkpoint(path: Path, logger) -> None:
+    """
+    Renames a checkpoint that failed to load aside (never deletes) so a
+    subsequent retry cannot find it still present at the exact path the
+    cache-check (or torch.hub's own cache lookup) expects, and silently
+    re-read the SAME bad bytes through a different, less strict
+    unpickling path -- the risk this function exists to remove is
+    narrowed, not fully closed, by the caller's own exception
+    classification alone: "corrupted, fall through to a fresh download"
+    only actually gets FRESH bytes if the corrupted file is no longer
+    sitting at the path the next attempt will look for.
+
+    Best-effort: a rename failure (e.g. read-only filesystem) is logged
+    and swallowed -- this is a defence-in-depth improvement to an
+    already-graceful fallback path, not a new way for loading to fail
+    harder than it did before this existed.
+    """
+    quarantined = path.with_name(f"{path.name}.corrupted-{int(time.time())}-{os.getpid()}")
     try:
-        yield
-    finally:
-        torch.load = original_load
+        path.rename(quarantined)
+        logger.warning(f"Moved unreadable RNA-FM checkpoint aside to '{quarantined}' before retrying.")
+    except OSError as exc:
+        logger.warning(
+            f"Could not move unreadable RNA-FM checkpoint '{path}' aside "
+            f"({exc.__class__.__name__}: {exc}) -- a retry may find the same bad file again."
+        )
 
 
-def _load_local_checkpoint(loader, path: str, logger):
+def _allow_argparse_namespace_in_checkpoints() -> None:
+    """
+    Registers `argparse.Namespace` on PyTorch's strict-unpickling
+    allowlist so the RNA-FM checkpoint loads with `weights_only` left
+    at PyTorch's own default. Idempotent -- safe to call on every load.
+
+    WHAT IN THE FILE TRIPS THE NEWER DEFAULT. PyTorch 2.6 flipped
+    `torch.load`'s `weights_only` default from `False` to `True`. The
+    RNA-FM checkpoint is a fairseq-style *training* checkpoint, not a
+    bare state dict: alongside the 206-tensor `model` state dict it
+    carries `args`, `cfg`, optimizer history and task state. The one
+    and only thing in it the strict unpickler rejects is
+    `argparse.Namespace`, at exactly `.args` and `.cfg.model`:
+
+        WeightsUnpickler error: Unsupported global: GLOBAL
+        argparse.Namespace was not an allowed global by default.
+
+    Nothing is wrong with the file. It is a trusted first-party
+    checkpoint that simply predates PyTorch's stricter unpickling
+    allowlist. HyenaDNA's checkpoint has the same problem and is
+    handled the same way (`_allow_lightning_checkpoint_globals` in
+    hyenadna.py) -- but with a DIFFERENT set of classes, established
+    there by its own probe: a Lightning checkpoint carries omegaconf
+    config containers, not an `argparse.Namespace`. The set has to be
+    measured per checkpoint, never carried across.
+
+    WHY THE OBVIOUS FIX -- RE-SAVING THE CHECKPOINT WITHOUT THE
+    `Namespace` -- DOES NOT WORK. `args`/`cfg` are load-bearing for
+    `fm.pretrained` itself. Two re-save forms were tested through the
+    official loader with `torch.load` unpatched: stripping the file to
+    `{"model": ...}`, and keeping the full structure with every
+    `Namespace` converted to a plain dict. Both got past
+    `weights_only=True` and then died further along with
+    `FileNotFoundError: <variant>-contact-regression.pt` -- the library
+    reads that metadata, and without it takes a branch demanding a
+    companion file that does not exist beside the checkpoint. So a
+    re-save satisfies the unpickler and breaks the loader. This is NOT
+    a claim that no correct re-save is possible, only that neither
+    obvious form works, and why. If that route is ever revisited the
+    weights themselves are portable: a SHA-256 over all 206 tensors was
+    identical before and after re-saving.
+
+    WHY AN ALLOWLIST RATHER THAN `weights_only=False`. Forcing
+    `weights_only=False` permits arbitrary code execution during
+    unpickling, for every object in the file. This keeps strict
+    unpickling switched on for everything else and permits exactly one
+    inert data-holder class.
+
+    CAVEAT, ACCEPTED KNOWINGLY: `add_safe_globals` is process-global.
+    Once called, any `torch.load` in this process will also accept an
+    `argparse.Namespace`. That is far narrower than the blanket
+    `torch.load` patch this replaces, but it is a real property of the
+    change, named here so it is chosen deliberately rather than
+    inherited silently.
+    """
+    torch.serialization.add_safe_globals([argparse.Namespace])
+
+
+def _load_local_checkpoint(loader, path: str):
     """
     Loads an already-on-disk RNA-FM checkpoint via the official
-    `fm.pretrained` loader, retrying once with `weights_only` forced to
-    `False` (see `_force_weights_only_false`) if the first attempt
-    fails with an unpickling error. Any other failure (a genuinely
-    truncated/corrupt file, an unexpected format, ...) is re-raised
-    immediately for the caller's existing fallback chain to handle.
+    `fm.pretrained` loader. `weights_only` is left at PyTorch's own
+    default; `argparse.Namespace` is allowlisted first (see
+    `_allow_argparse_namespace_in_checkpoints`) so the checkpoint's
+    training metadata does not trip the strict unpickler. Any failure
+    is re-raised for the caller's existing fallback chain to handle.
     """
+    _allow_argparse_namespace_in_checkpoints()
+    return loader(model_location=path)
+
+
+def _load_hub_download_with_forced_weights_only(loader):
+    """
+    Calls `loader()` -- `fm.pretrained.rna_fm_t12` with no
+    `model_location`, i.e. Meta's own `load_hub_workaround` -> REAL
+    `torch.hub.load_state_dict_from_url` -- with PyTorch's strict
+    `weights_only` unpickling FORCED to `True` for the duration of this
+    one call, closing the ATTACK half of the residual named at
+    `_load_pretrained_with_fallback`'s step 2 (human-ruled,
+    2026-09-10): a GENUINE FRESH download carrying a pickled class
+    outside `_allow_argparse_namespace_in_checkpoints`'s allowlist must
+    be refused, not silently accepted through
+    `load_state_dict_from_url`'s own hardcoded `weights_only=False`
+    default.
+
+    HOW, WITHOUT PRE-FETCHING OR PRE-PLACING ANYTHING. `load_hub_workaround`
+    (fm/pretrained.py, confirmed by reading its installed source) calls
+    `torch.hub.load_state_dict_from_url(...)` by attribute lookup at
+    call time, not a name bound once at import time -- so replacing the
+    module attribute for the duration of this call reaches it.
+    `load_state_dict_from_url` itself forwards `weights_only` straight
+    through to its own internal `torch.load(..., weights_only=weights_only)`
+    (confirmed by reading torch's installed source) -- there is no
+    separate strict/local attempt to build here, no cache-filename
+    convention to duplicate, and torch.hub still resolves its own URL,
+    cache path, and network request exactly as before. This is the
+    reason the ruling did not ask for pre-placement: pre-placement was
+    argued against (it couples this file to torch.hub's cache-filename
+    convention, which is load-bearing for offline loading) and this
+    sidesteps that coupling entirely by never touching the file's
+    location or provenance -- only the flag PyTorch itself unpickles
+    with.
+
+    Because `_allow_argparse_namespace_in_checkpoints` is always called
+    before this runs (see the retry loop below), an ordinary legitimate
+    checkpoint -- whose only non-default-safe class is the allowlisted
+    `argparse.Namespace` -- still succeeds under this strict call. Only
+    a class OUTSIDE that allowlist is refused, loudly, by name, so the
+    reader knows what to update.
+    """
+    real_load_state_dict_from_url = torch.hub.load_state_dict_from_url
+
+    def strict_load_state_dict_from_url(*args, **kwargs):
+        kwargs["weights_only"] = True
+        return real_load_state_dict_from_url(*args, **kwargs)
+
+    torch.hub.load_state_dict_from_url = strict_load_state_dict_from_url
     try:
-        return loader(model_location=path)
-    except Exception as exc:  # noqa: BLE001 - re-raised below unless recognized
-        if not _is_unpickling_error(exc):
-            raise
-        logger.info(
-            f"RNA-FM checkpoint at '{path}' failed to load under "
-            f"PyTorch's newer weights_only=True default "
-            f"({exc.__class__.__name__}); retrying the same local file "
-            "with weights_only=False instead of re-downloading."
-        )
-        with _force_weights_only_false():
-            return loader(model_location=path)
+        return loader()
+    except Exception as exc:  # noqa: BLE001
+        if _is_weights_only_rejection(exc):
+            raise ModelLoadError(
+                "Freshly-downloaded RNA-FM checkpoint contains a pickled "
+                "class outside today's allowlist "
+                "(_allow_argparse_namespace_in_checkpoints) -- refusing "
+                "to load it with an unrestricted (weights_only=False) "
+                f"fallback. Update the allowlist for this checkpoint "
+                f"format. Original error: {exc}"
+            ) from exc
+        raise
+    finally:
+        torch.hub.load_state_dict_from_url = real_load_state_dict_from_url
 
 
 class RNAFMModel(BaseGenomicModel):
@@ -314,8 +463,30 @@ class RNAFMModel(BaseGenomicModel):
         # setup, not before it.
         return ensure_rna_fm_available()
 
+    @classmethod
+    def unavailability_reason(cls) -> str:
+        """Overrides `BaseGenomicModel`'s generic "not installed", which
+        cannot tell a package that was checked and found missing from one
+        whose availability was never checked at all."""
+        status = check_rna_fm_availability()
+        if status is PackageCheckStatus.NOT_CHECKED:
+            return "availability not checked (auto-install disabled under pytest)"
+        if status is PackageCheckStatus.ABSENT:
+            return "not installed ('pip install rna-fm' did not succeed)"
+        return "not installed"
+
     def _load_impl(self):
-        if not ensure_rna_fm_available():
+        rna_fm_status = check_rna_fm_availability()
+        if rna_fm_status is PackageCheckStatus.NOT_CHECKED:
+            raise ModelLoadError(
+                "RNA-FM requires the official 'rna-fm' package, whose "
+                "availability was not checked in this environment "
+                "(auto-install is disabled under pytest) -- it is not "
+                "confirmed missing, it was never looked for. Install it "
+                "with `pip install rna-fm`, or run outside the test "
+                "harness, to find out."
+            )
+        if rna_fm_status is PackageCheckStatus.ABSENT:
             raise ModelLoadError(
                 "RNA-FM requires the official 'rna-fm' package, and automatic "
                 "installation ('pip install rna-fm') did not "
@@ -357,26 +528,48 @@ class RNAFMModel(BaseGenomicModel):
         cached_path = _cached_weights_path(model_variant)
         if cached_path is not None:
             self.logger.info(
-                f"Using cached RNA-FM weights for '{model_variant}' at "
-                f"'{cached_path}' -- skipping network download."
+                f"Using cached RNA-FM weights for '{model_variant}' at '{cached_path}' -- skipping network download."
             )
             try:
-                return _load_local_checkpoint(loader, str(cached_path), self.logger)
+                return _load_local_checkpoint(loader, str(cached_path))
             except Exception as exc:  # noqa: BLE001
-                # A cached file that fails to load (corrupted partial
-                # download, wrong format) shouldn't be trusted silently
-                # -- fall through to a fresh network attempt instead,
-                # which is more likely to succeed than reusing bad
-                # local bytes. (An UnpicklingError caused only by
-                # PyTorch 2.6's weights_only default was already
-                # retried in-place by _load_local_checkpoint above, so
-                # reaching this branch means it genuinely didn't help.)
+                if _is_weights_only_rejection(exc):
+                    # HIGH-priority security card: a cached file that
+                    # fails ONLY because it carries a pickled class
+                    # outside today's allowlist is NOT corruption -- it
+                    # is ordinary upstream checkpoint-format drift on a
+                    # file we already hold. The old code below ("shrug,
+                    # try a wider unpickling path") silently re-read the
+                    # SAME bytes through torch.hub's own
+                    # weights_only=False default, reintroducing exactly
+                    # the risk the allowlist exists to remove, on a file
+                    # that was never corrupted at all. This is the
+                    # ACCIDENT case (drift on a file we already hold),
+                    # and stopping here -- never reaching step 2's wide
+                    # path for THIS file -- closes it.
+                    raise ModelLoadError(
+                        f"Cached RNA-FM checkpoint at '{cached_path}' contains a "
+                        "pickled class outside today's allowlist "
+                        "(_allow_argparse_namespace_in_checkpoints) -- this is not "
+                        "corruption, and must not be recovered by falling back to "
+                        "an unrestricted (weights_only=False) load. Update the "
+                        f"allowlist for this checkpoint format. Original error: {exc}"
+                    ) from exc
+                # A genuinely corrupted cached file (partial download,
+                # filesystem error) shouldn't be trusted silently --
+                # move it aside so the retry below cannot silently
+                # re-read the SAME bad bytes through a wider unpickling
+                # path (torch.hub's own cache lookup would otherwise
+                # find it still sitting at this exact path and treat it
+                # as already-downloaded), then fall through to a fresh
+                # network attempt.
                 self.logger.warning(
                     f"Cached RNA-FM checkpoint at '{cached_path}' failed "
                     f"to load ({exc.__class__.__name__}); ignoring cache "
                     "and attempting a fresh download.",
                     exc_info=True,
                 )
+                _quarantine_unreadable_checkpoint(cached_path, self.logger)
 
         # 1b. Not cached -- try the official HF mirror before ever
         # touching the upstream package's own unreliable endpoint.
@@ -393,17 +586,54 @@ class RNAFMModel(BaseGenomicModel):
                         f"'{_HF_MIRROR_REPO_ID}' -- skipping the "
                         "unreliable upstream endpoint."
                     )
-                    return _load_local_checkpoint(loader, str(mirror_path), self.logger)
+                    return _load_local_checkpoint(loader, str(mirror_path))
                 except Exception as exc:  # noqa: BLE001
+                    if _is_weights_only_rejection(exc):
+                        # Same treatment as the cache-hit branch above --
+                        # see that comment for the full reasoning.
+                        raise ModelLoadError(
+                            f"HF-mirrored RNA-FM checkpoint at '{mirror_path}' "
+                            "contains a pickled class outside today's "
+                            "allowlist (_allow_argparse_namespace_in_checkpoints) "
+                            "-- this is not corruption, and must not be recovered "
+                            "by falling back to an unrestricted (weights_only=False) "
+                            f"load. Update the allowlist. Original error: {exc}"
+                        ) from exc
                     self.logger.warning(
                         f"HF-mirrored RNA-FM checkpoint at '{mirror_path}' "
                         f"failed to load ({exc.__class__.__name__}); "
                         "falling back to the upstream endpoint.",
                         exc_info=True,
                     )
+                    _quarantine_unreadable_checkpoint(mirror_path, self.logger)
 
         # 2. Network download, with a bounded retry for genuinely
         # transient errors only (see _is_permanent_download_error).
+        #
+        # *** ATTACK-HALF RESIDUAL, CLOSED (HIGH-priority security card;
+        # human-ruled 2026-09-10): `loader()` below is
+        # `fm.pretrained.rna_fm_t12` with no `model_location`, which is
+        # Meta's own `load_hub_workaround` -> REAL
+        # `torch.hub.load_state_dict_from_url` -- and THAT function's
+        # own signature hardcodes `weights_only=False`. `_is_weights_only_rejection`
+        # above closes the ACCIDENT case (an already-held file whose
+        # format has drifted past today's allowlist); this closes the
+        # ATTACK case (a file we fetch fresh) by routing `loader()`
+        # through `_load_hub_download_with_forced_weights_only`, which
+        # forces `weights_only=True` on the underlying
+        # `torch.hub.load_state_dict_from_url` call for the duration of
+        # this one call -- WITHOUT pre-fetching or pre-placing the file
+        # ourselves. torch.hub still resolves its own cache path and
+        # issues its own request exactly as before, so this does not
+        # couple this file to torch.hub's internal cache-filename
+        # convention (the reason a pre-placement fix was rejected: it
+        # would risk silently breaking offline weight loading, which
+        # runs on every ordinary run, to close an attack case that
+        # needs a compromised upstream). A class outside today's
+        # allowlist is refused loudly, immediately, and by name; an
+        # ordinary legitimate checkpoint still loads (see
+        # `_load_hub_download_with_forced_weights_only`'s own
+        # docstring). ***
         #
         # `loader()` -> `torch.hub.load_state_dict_from_url` issues a
         # bare `urllib` request with NO timeout by default (Python's
@@ -417,27 +647,31 @@ class RNAFMModel(BaseGenomicModel):
         # `TimeoutError`, which the retry loop below already treats as
         # transient and retryable -- so this only supplies the missing
         # timeout, it doesn't change the retry/skip behavior itself.
+        # The downloaded file is the same fairseq-style checkpoint as
+        # the cached one, so it needs the same allowlist before
+        # `loader()` unpickles it (see
+        # `_allow_argparse_namespace_in_checkpoints`) -- now load-
+        # bearing on this path too, since this step is strict now, not
+        # merely harmless-if-present.
+        _allow_argparse_namespace_in_checkpoints()
         last_exc: Optional[Exception] = None
         for attempt in range(1, _MAX_DOWNLOAD_ATTEMPTS + 1):
             previous_timeout = socket.getdefaulttimeout()
             socket.setdefaulttimeout(_DOWNLOAD_TIMEOUT_SECONDS)
             try:
-                return loader()
+                return _load_hub_download_with_forced_weights_only(loader)
             except Exception as exc:  # noqa: BLE001 - translate + sanitize below
-                if _is_unpickling_error(exc):
-                    # The download itself succeeded (torch.hub already
-                    # cached the file); only the unpickling step failed,
-                    # under PyTorch 2.6's new weights_only=True default.
-                    # Retry the load in place instead of letting this
-                    # be treated as a corrupt/permanent failure below,
-                    # which would otherwise skip RNA-FM for the whole
-                    # run over a problem that was never about the file.
-                    try:
-                        with _force_weights_only_false():
-                            return loader()
-                    except Exception as retry_exc:  # noqa: BLE001
-                        exc = retry_exc
                 last_exc = exc
+                if isinstance(exc, ModelLoadError):
+                    # Fail closed: an allowlist rejection on the fresh-
+                    # download path is not a network error. It must
+                    # never be retried (retrying calls the exact same
+                    # refusal again) and must never be sanitized down
+                    # to the generic "RNA-FM model unavailable" below --
+                    # the caller needs the allowlist name, from
+                    # _load_hub_download_with_forced_weights_only's own
+                    # message, to know what to update.
+                    raise
                 permanent = _is_permanent_download_error(exc)
                 self.logger.debug(
                     f"RNA-FM weight download attempt {attempt}/"
@@ -478,9 +712,7 @@ class RNAFMModel(BaseGenomicModel):
         # context is transcribed 1:1 from the DNA window, which can be
         # multi-kb for structural-variant-scale windows -- never let
         # that overflow RNA-FM's trained context and risk a CUDA error.
-        max_length = kwargs.get("max_length") or self._resolve_safe_max_length(
-            CONFIG.models.RNA_FM_MAX_SAFE_TOKENS
-        )
+        max_length = kwargs.get("max_length") or self._resolve_safe_max_length(CONFIG.models.RNA_FM_MAX_SAFE_TOKENS)
         # The official `fm` API has no HF-tokenizer-style `truncation=`
         # kwarg -- truncate the raw sequence ourselves, leaving room for
         # the BOS/EOS special tokens the alphabet's batch_converter adds,

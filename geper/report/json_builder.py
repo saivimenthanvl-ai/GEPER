@@ -7,11 +7,13 @@ unified interpretation) into a single, stable JSON structure.
 """
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from utils.logger import get_logger
-from report.clinical_report_builder import build_clinical_report
+from report.clinical_report_builder import RESEARCH_USE_DISCLAIMER, build_clinical_report, normalize_report_revision
+from pipeline.provenance import get_stale_fallbacks
 from pipeline.stage_schemas import build_raw_evidence_bundle, validate_interpretation_result_for_report
 
 logger = get_logger(__name__)
@@ -24,11 +26,15 @@ class JSONResultBuilder:
         self,
         input_vcf_path: str,
         assembly: str = None,
+        assembly_note: Optional[str] = None,
         vcf_samples: List[str] = None,
         provenance_collector: Any = None,
         code_version: str = None,
         model_checkpoints: Dict[str, str] = None,
         patient_consent: Optional[Dict[str, Any]] = None,
+        qc_metrics: Optional[Dict[str, Any]] = None,
+        service_health_registry: Any = None,
+        report_revision: Optional[Dict[str, Any]] = None,
     ):
         self.input_vcf_path = input_vcf_path
         # Genome reference build resolved by the orchestrator's assembly
@@ -40,12 +46,23 @@ class JSONResultBuilder:
         # specified" rather than a fabricated default downstream (see
         # `report/summary.py`), never guessed as "GRCh38".
         self.assembly = assembly
+        # Why there is no build, when there legitimately is none (card #15,
+        # the all-mitochondrial exception -- see
+        # pipeline/assembly_validator.py::MITO_ONLY_NOTE). Kept SEPARATE from
+        # `assembly` on purpose: `assembly` is a build token that Ensembl
+        # lookups and the LIMS export consume, and a sentence there would
+        # break them. The renderers show this in the build's place.
+        self.assembly_note = assembly_note
         # The VCF's own genotype sample column names (`VCFParser.samples`,
         # from its header line), if any -- also previously computed but
         # never surfaced. Used by `report/summary.py` to derive a real
         # Sample ID instead of a fabricated placeholder.
         self.vcf_samples = vcf_samples or []
         self.variant_results: List[Dict[str, Any]] = []
+        # One entry per prior run whose variants this run reused --
+        # see `note_carried_forward_provenance`. Empty on a fresh
+        # run, which is the honest reading: nothing was carried.
+        self.carried_forward_provenance: List[Dict[str, Any]] = []
         # New, additive: data-source version pinning / run provenance
         # (pipeline/provenance.py) -- what makes a report reproducible
         # later. `provenance_collector` is the orchestrator's live
@@ -60,6 +77,42 @@ class JSONResultBuilder:
         self.provenance_collector = provenance_collector
         self.code_version = code_version
         self.model_checkpoints = model_checkpoints or {}
+        # Round 17: `model_checkpoints` is enriched with each model's
+        # real per-run status (USED/FAILED/DISABLED/SKIPPED --
+        # `pipeline/provenance.py::finalize_model_checkpoint_provenance`)
+        # exactly once, after `pipeline/orchestrator.py::run()`'s entire
+        # per-variant loop finishes -- but `write()` is also called
+        # periodically DURING that loop (`CONFIG.CHECKPOINT_INTERVAL`),
+        # before that enrichment has run. Without this flag, a
+        # geper_results.json left behind by a run that died mid-loop
+        # (Colab idle disconnect, quota exhaustion, a kill -9 -- all
+        # confirmed to actually happen against this pipeline) is
+        # structurally indistinguishable from a genuinely completed
+        # run's manifest: every model shows its bare config identifier,
+        # with nothing saying the enrichment step never ran (ROUND_CANDIDATES.md,
+        # round 12, "An interim checkpoint write is structurally
+        # indistinguishable from a completed run's manifest").
+        #
+        # Starts `False` (the honest default for a `write()` mid-loop);
+        # the orchestrator sets it `True` only after the post-loop
+        # rollup/enrichment, immediately before the final `write()`.
+        # Absent must read as `False` everywhere this is checked -- see
+        # `report/report_generator.py::_render_provenance` and
+        # `report/summary.py::_build_provenance_flowables`, both of
+        # which use `bool(document.get("run_complete"))` rather than a
+        # bare `.get("run_complete", True)`/truthiness-assumed default,
+        # so a pre-round-17 file (no `run_complete` key at all) reads as
+        # incomplete rather than silently claiming completeness.
+        #
+        # Adjacent fragility, named not fixed: the `or {}` above only
+        # preserves the shared reference `self.model_checkpoints.update(...)`
+        # (orchestrator.py:922) depends on when the passed-in dict is
+        # already non-empty. If `get_model_checkpoint_identifiers()` ever
+        # returned `{}`, `or {}` would bind this attribute to a NEW dict
+        # object instead of the caller's, and the later `.update()` would
+        # enrich a dict this builder no longer shares -- silently, at
+        # construction time, before the mutation even runs.
+        self.run_complete = False
         # DPDP Act 2023 consent metadata (minimal, capture-only -- see
         # report/summary.py::_parse_consent's docstring for exactly
         # what this is and, more importantly, is NOT: no storage
@@ -71,16 +124,132 @@ class JSONResultBuilder:
         # "consent" object -- both render as an explicit `null` in the
         # JSON output below, never a fabricated True/False.
         self.patient_consent = patient_consent
+        # Run-level sequencing/alignment QC, already normalised by
+        # `report/summary.py::_parse_qc_metrics` before it gets here.
+        #
+        # Lives in the document rather than only in the `qc_metrics`
+        # argument the PDF renderers take, because an argument is not
+        # durable: `review/signoff.py`'s approve()/override() re-render
+        # both PDFs from the stored document days later and have no way
+        # to know what QC file the original run was given. Without this
+        # they rendered the no-QC branch, whose text is a positive claim
+        # ("there is no run-level QC to show here, not merely an
+        # unreported one") -- so signing a run that DID have QC produced
+        # a signed PDF asserting the pipeline never observed any
+        # sequencing step. A caveat in the document survives; an
+        # argument passed once does not.
+        #
+        # `None` (the default) still means exactly what it meant before:
+        # no --qc-metrics-json was supplied, so there genuinely is no
+        # run-level QC -- never a fabricated empty table.
+        self.qc_metrics = qc_metrics
+        # External-service availability for this run
+        # (`utils/service_health.py`). Held as a live REFERENCE, exactly
+        # like `provenance_collector` above and for the same reason:
+        # `.snapshot()` is only called inside `build()`, so a mid-run
+        # checkpoint write reflects what has happened so far and the
+        # final write reflects the whole run. `None` (the default, for
+        # any caller that does not pass one) renders as an empty list.
+        # An empty list is NOT an all-clear: it means availability was
+        # not recorded for this run, which is why
+        # `report/clinical_report_builder.py::_offline_sources_caveat_text`
+        # falls back to the live registry rather than treating it as
+        # "nothing failed".
+        self.service_health_registry = service_health_registry
+        # Revision traceability (amendment / supersession / re-analysis) --
+        # see `report/clinical_report_builder.py::normalize_report_revision`.
+        # Validated HERE, at construction, so malformed facts fail before a
+        # run writes anything rather than at render time. `None` (the
+        # default, and every plain pipeline run) is written as an explicit
+        # `null`: this process cannot know whether the clinical platform
+        # will store the run as a re-analysis, so it must not claim "not a
+        # re-analysis".
+        self.report_revision = normalize_report_revision(report_revision)
 
     def add_variant_result(self, variant_result: Dict[str, Any]) -> None:
         self.variant_results.append(variant_result)
+
+    def note_carried_forward_provenance(self, prior_document: Dict[str, Any], variant_count: int) -> None:
+        """
+        Records the provenance of a run whose variants this one is
+        REUSING rather than recomputing (`pipeline/orchestrator.py`'s
+        resume-from-checkpoint path).
+
+        Why this exists: resume merges a prior document's variant
+        results into this run's builder, but every run-level field on
+        that builder -- `model_checkpoints`, `code_version`,
+        `service_health`, `generated_at` -- is this run's. So a resumed
+        document stated a model set, a code version and a timestamp
+        under which the carried-forward variants were never processed,
+        and nothing marked the difference: a merged document was
+        indistinguishable from a clean one. That is a false claim, not
+        a gap, and no amount of scanning the output could detect it.
+
+        The prior values were never missing. The resume path already
+        loads the whole prior document and reads only its `variants`
+        key; everything below was sitting in that same object and was
+        being dropped. This keeps it instead of collecting anything new.
+
+        THREE STATES, NOT TWO -- a resumed run has stages that ran now,
+        stages carried forward from a prior run, and stages whose prior
+        value is unknowable:
+
+        * `carried_forward` -- the prior document recorded its
+          checkpoints and they are preserved here verbatim. An
+          empty-but-present map stays `carried_forward`: that run DID
+          answer the question, and demoting it to unknown would discard
+          a real answer.
+        * `prior_value_unknown` -- the prior document has no
+          `model_checkpoints` key at all, because it was written before
+          this field existed. Every document already on disk when this
+          shipped is in this state. Rendering it as `carried_forward`
+          with an empty map would claim the earlier run recorded
+          nothing, when the truth is that it was never asked -- the
+          same absent-vs-unrecorded distinction `report/summary.py`'s
+          QC handling and the tri-state VAF work both turn on.
+
+        A list, not a single entry: resume can chain (a run resumed
+        from a run that was itself resumed), and each link is its own
+        provenance record. Appending is additive for every consumer.
+        """
+        checkpoints = prior_document.get("model_checkpoints")
+        known = "model_checkpoints" in prior_document and checkpoints is not None
+        self.carried_forward_provenance.append(
+            {
+                "state": "carried_forward" if known else "prior_value_unknown",
+                "variant_count": variant_count,
+                "generated_at": prior_document.get("generated_at"),
+                "code_version": prior_document.get("code_version"),
+                "model_checkpoints": checkpoints if known else None,
+                "service_health": prior_document.get("service_health") if known else None,
+                "reason": (
+                    ""
+                    if known
+                    else (
+                        "The prior run's document records no model_checkpoints -- it was written "
+                        "before this field existed, so which model versions produced these "
+                        "variants cannot be recovered from it."
+                    )
+                ),
+            }
+        )
 
     def build(self) -> Dict[str, Any]:
         return {
             "geper_version": "1.0.0",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "input_vcf": self.input_vcf_path,
+            # Additive: the argument above is recorded verbatim (and stays
+            # the field REPRODUCIBILITY_PROTOCOL.md treats as comparable
+            # between two runs of the same input) -- but a relative
+            # argument like "./test.vcf" or "../data/test.vcf" cannot be
+            # resolved back to a real file once this document is opened
+            # from a different working directory (or a different machine
+            # entirely). Resolved once, here, against this process's own
+            # cwd at build time -- the only place that cwd is still known.
+            "input_vcf_absolute_path": os.path.abspath(self.input_vcf_path),
             "assembly": self.assembly,
+            "assembly_note": self.assembly_note,
             "vcf_samples": self.vcf_samples,
             "variant_count": len(self.variant_results),
             "variants": self.variant_results,
@@ -90,6 +259,77 @@ class JSONResultBuilder:
             # the DATA each variant's evidence came from).
             "code_version": self.code_version,
             "model_checkpoints": self.model_checkpoints,
+            # Provenance of the runs whose variants this one reused
+            # rather than recomputed. `model_checkpoints` above
+            # describes THIS run only; on a resumed run it does not
+            # describe every variant in `variants`, and this is what
+            # says so. Always present, `[]` on a fresh run.
+            "carried_forward_provenance": self.carried_forward_provenance,
+            # Round 17 -- see this class's own `self.run_complete` comment.
+            "run_complete": self.run_complete,
+            # Governance control (round 30, part 2): review/sign-off state.
+            # Always written as "draft" here -- the ONLY writer of any
+            # other value is `review/signoff.py` (`approve()` -> "reviewed",
+            # `override()` -> "overridden"), which loads this exact
+            # `geper_results.json` back and rewrites it in place after this
+            # class has already produced it. `reviewed_by`/`reviewed_at`
+            # are `None` here for the same reason -- honest "not yet"
+            # rather than a fabricated identity/timestamp. See
+            # `report/export_lims.py::_require_reviewed` (the one place
+            # this field gates a real action) and
+            # `report/report_generator.py::_render_review_status_banner`
+            # (the one place it is rendered) for the two consumers.
+            # Which external sources failed and were retried this run.
+            # Every failure counted here was already handled by its
+            # client's retry loop, so none of it reaches any variant's
+            # `errors` list -- which is why a degraded run could report
+            # `errors: []` and `run_complete: true` with no other trace.
+            # See `utils/service_health.py::ServiceHealthRegistry.snapshot`.
+            "service_health": (
+                self.service_health_registry.snapshot() if self.service_health_registry is not None else []
+            ),
+            "review_status": "draft",
+            "reviewed_by": None,
+            "reviewed_at": None,
+            # Run-level caveats: statements that qualify the WHOLE run
+            # rather than any one finding. Always present, never omitted
+            # and never empty -- the research-use disclaimer applies to
+            # every run unconditionally.
+            #
+            # This is the machine-readable half of a gap found while
+            # auditing caveat parity across the four renderers: both
+            # PDFs and the Markdown report already print run-level
+            # caveats, but nothing reached this document, so an
+            # automated consumer (`report/export_lims.py` and anything
+            # else reading `geper_results.json` without opening a PDF)
+            # had no way to see them. A caveat a human might read past
+            # in a PDF is merely missed; one absent from the JSON is
+            # invisible to a consumer that cannot apply judgment at all.
+            #
+            # PER-VARIANT CAVEATS DO NOT BELONG HERE and are deliberately
+            # untouched: `clinical_report["limitations"]` (which leads
+            # with this same `RESEARCH_USE_DISCLAIMER`) already reaches
+            # this document in full, because `build_variant_result`
+            # emits the whole `clinical_report` dict. Duplicating those
+            # into this block would create a second copy that could
+            # drift from the first.
+            #
+            # A LIST, not a bare string, on purpose: this block is the
+            # run-level *set*, and the remaining run-level caveats the
+            # parity audit identified (offline data sources, the ACMG
+            # methodology statement, the evidence-completeness caption,
+            # the QC not-applicable reason, reviewer-attention flags)
+            # are queued to join it. Appending to a list is additive for
+            # every existing consumer; widening a string to a list later
+            # would be a breaking type change.
+            "caveats": [RESEARCH_USE_DISCLAIMER],
+            # Run-level sequencing/alignment QC -- see this class's own
+            # `self.qc_metrics` comment for why it belongs in the
+            # document and not only in a renderer argument. `None` when
+            # no --qc-metrics-json was supplied, which every consumer
+            # already renders as the honest "no upstream step was
+            # observed" case rather than an empty table.
+            "qc_metrics": self.qc_metrics,
             # Data-source provenance (task points 1-4, 6): one entry
             # per known external source, always present (never omitted)
             # -- a source this run never consulted still appears, with
@@ -97,6 +337,17 @@ class JSONResultBuilder:
             # source that was consulted but yielded no version
             # (`status: "unknown"`). See pipeline/provenance.py.
             "provenance": self.provenance_collector.to_list() if self.provenance_collector is not None else [],
+            # Packaging Part 3 mechanism: every "Using stale cached ...
+            # after a failed refresh" bootstrap fallback this process has
+            # hit (`pipeline/provenance.py::record_stale_fallback`),
+            # always present as a list (empty when nothing went stale)
+            # so a reader can tell "checked, nothing stale" from "never
+            # checked" -- same reasoning as `provenance` above always
+            # listing every known source. THE report layer this must
+            # reach per the standing rule that a warning nobody sees is
+            # not a warning; see `report/report_generator.py
+            # ::_render_data_freshness_warnings`.
+            "data_freshness_warnings": get_stale_fallbacks(),
             # DPDP Act 2023 consent metadata (minimal, capture-only --
             # see this class's __init__ docstring comment and
             # report/summary.py::_parse_consent). Explicit `null` in
@@ -104,6 +355,10 @@ class JSONResultBuilder:
             # fabricated default) whenever no consent object was
             # actually supplied in --patient-meta.
             "patient_consent": self.patient_consent,
+            # Revision-traceability flags + the banner text every surface
+            # prints (card HUMAN-CLINICAL-report-revision-traceability-...).
+            # `null` when no revision facts were supplied -- see __init__.
+            "report_revision": self.report_revision,
         }
 
     def write(self, output_path: str) -> str:
@@ -209,6 +464,19 @@ def build_variant_result(
         variant_ref=_variant_ref, **{f"{k}_result": v for k, v in raw_evidence_for_report.items()}
     )
     validate_interpretation_result_for_report(resolved_interpretation_result, variant_ref=_variant_ref)
+
+    # Built ONCE and emitted under two keys below. Calling
+    # `build_clinical_report()` twice would double the work and, worse,
+    # let the two copies drift apart -- the alias has to be the same
+    # object, not a second rendering of the same inputs.
+    _candidate_interpretation = build_clinical_report(
+        resolved_interpretation_result,
+        variant_dict,
+        raw_evidence=raw_evidence_for_report,
+        indigenomes_result=indigenomes_result,
+        thousand_genomes_sas_result=thousand_genomes_sas_result,
+    )
+
     result = {
         "variant": variant_dict,
         "sequence_context": sequence_context,
@@ -311,6 +579,24 @@ def build_variant_result(
         # Defaults to None exactly like `orphanet_result` above, so any
         # existing caller that doesn't pass this kwarg still gets a
         # fully backward-compatible result dict.
+        #
+        # DEFECT-a-field-present-by-in-place-mutation-rather-than-
+        # assignment-is-invisible-to-the-grep-everyone-runs, instance 4:
+        # by the time `normalization_result` reaches this function, it
+        # may already carry an `hgvs_c` key that `_run_normalization_stage`
+        # (the function that PRODUCES this dict) never wrote --
+        # `pipeline/orchestrator.py::run()::_process_variant::_attach_hgvs_c`
+        # mutates `normalization_result["hgvs_c"]` in place, called AFTER
+        # `_run_normalization_stage` returns but BEFORE `build_variant_result`
+        # (this function) is called. Unlike instances 2/3, this is
+        # PRE-BUILD, not post-build -- the field is already present and
+        # correct by the time it is emitted here, so the hazard is not
+        # "the document changes after you think it is finished"; it is
+        # that a reader tracing `_run_normalization_stage` alone (the
+        # natural place to look for how this dict is built) would not
+        # know a separate function adds `hgvs_c` to it afterward. This
+        # comment covers only this one instance; the mutation-vs-
+        # assignment class as a whole has no census.
         "normalization": normalization_result if normalization_result is not None else {"skipped": True},
         # New, additive keys (standalone SpliceFormer/SpliceBERT
         # splice-prediction plugins for BP7 -- see pipeline/acmg_rules.py::
@@ -339,21 +625,56 @@ def build_variant_result(
         # used automatically if the caller didn't pass this kwarg
         # explicitly, so orchestrator call sites don't have to thread it
         # through twice.
+        # DEFECT-a-field-present-by-in-place-mutation-rather-than-
+        # assignment-is-invisible-to-the-grep-everyone-runs, instance 2:
+        # `resolved_interpretation_result["priority_rank"]` LOOKS finished
+        # here -- `InterpretationResult.to_dict()` already emits
+        # `"priority_rank": None` -- but `pipeline/orchestrator.py::
+        # run()::_apply_priority_ranks` mutates it in place, AFTER
+        # `JSONResultBuilder.build()` has already returned the assembled
+        # document. A reader tracing only this function sees a real,
+        # already-assigned key and has no reason to suspect it changes
+        # again; an absent key would have invited a search, a present-
+        # but-stale one closes it. Load-bearing, do not convert to an
+        # assignment: the mutation is what keeps this same dict object
+        # in sync with `interpretation["interpretation_result"]` below
+        # (see `_apply_priority_ranks`'s own docstring) without a second
+        # write that could drift from the first. This comment covers only
+        # this key and `case_prioritization` (below); the mutation-vs-
+        # assignment class as a whole has no census.
         "interpretation_result": resolved_interpretation_result,
-        # New, additive key (Phase 5: Clinical Report Upgrade). Built
-        # entirely from `resolved_interpretation_result` above (the same
-        # canonical InterpretationResult dict Phase 2-4 already
-        # produced) -- reuses that logic rather than re-deriving
-        # anything from the raw provider dicts a second time. `None`
-        # when interpretation_result itself is missing/errored, never
+        # Built entirely from `resolved_interpretation_result` above (the
+        # same canonical InterpretationResult dict Phase 2-4 already
+        # produced) -- reuses that logic rather than re-deriving anything
+        # from the raw provider dicts a second time. `None` when
+        # interpretation_result itself is missing/errored, never
         # fabricated.
-        "clinical_report": build_clinical_report(
-            resolved_interpretation_result,
-            variant_dict,
-            raw_evidence=raw_evidence_for_report,
-            indigenomes_result=indigenomes_result,
-            thousand_genomes_sas_result=thousand_genomes_sas_result,
-        ),
+        #
+        # Named `candidate_interpretation`, not `clinical_report`: GEPER
+        # produces a draft classification for a qualified human to review
+        # and sign off, and does not independently provide a final
+        # clinical interpretation (EJ-01). A key called "clinical_report"
+        # states the opposite to every consumer that reads it.
+        "candidate_interpretation": _candidate_interpretation,
+        # *** DEPRECATED ALIAS. Emitted 2026-08-22. REMOVE AFTER THE NEXT
+        # RELEASE -- target removal date 2026-11-22. ***
+        #
+        # The same object as `candidate_interpretation` above, never a
+        # second copy. It exists because this key is a CONSUMED
+        # INTERFACE, not a label: `LIMS_EXPORT_MAPPING.md` publishes
+        # `variants[i]["clinical_report"][...]` as the source path for
+        # hospital LIMS integration, and every in-repo consumer reads it
+        # as `.get("clinical_report") or {}` -- so dropping the key would
+        # not raise anywhere. It would hand each of them an empty dict
+        # and let them carry on, including in the sign-off path. That is
+        # a silent degradation, which is precisely the defect class this
+        # codebase keeps finding.
+        #
+        # THE REMOVAL DATE IS THE POINT. An alias without one is not a
+        # deprecation, it is just two names for one thing, and the
+        # migration never happens. When it goes, `review/signoff.py` must
+        # already read the new key.
+        "clinical_report": _candidate_interpretation,
         # New, additive key (Objective 6: AI model status reporting).
         # Unlike `ai_splicing_ensemble` below, this key is ALWAYS
         # present -- never conditionally omitted -- because the whole
@@ -364,25 +685,71 @@ def build_variant_result(
         # `pipeline.models.status.DISPLAY_ORDER`.
         "ai_model_status": ai_model_status if ai_model_status is not None else {},
         "errors": errors,
+        # DEFECT-a-field-present-by-in-place-mutation-rather-than-
+        # assignment-is-invisible-to-the-grep-everyone-runs, instance 3:
+        # this dict does NOT have a `case_prioritization` key -- and never
+        # will from this function. `pipeline/orchestrator.py::run()::
+        # _apply_case_phenotype_ranking` adds it directly to each variant
+        # dict AFTER `JSONResultBuilder.build()` has already returned the
+        # assembled document (only when the run actually supplied
+        # observed HPO terms). Documented at the mutation site
+        # (`_apply_case_phenotype_ranking`'s own docstring: deliberately
+        # a new top-level key, never nested inside `interpretation_result`,
+        # by spec); this note is the missing receiving-side half -- a
+        # reader who only traces this function has no reason to expect a
+        # key it never assigns. Same instance-2 pointer above covers why
+        # this class of post-build mutation is load-bearing and why the
+        # class as a whole has no census -- this is the second of exactly
+        # two known instances, not a complete list.
     }
 
     # AI Splicing/Regulatory Ensemble (Enformer + Borzoi via
     # pipeline/models/ensemble.py::EnsembleManager) -- additive,
     # schema-preserving key. Only added to the result dict when real
     # ensemble evidence exists (i.e. `ai_splicing_ensemble_result` was
-    # actually passed in AND at least one model produced a result).
-    # This means:
+    # actually passed in AND at least one model produced a result OR a
+    # model genuinely crashed -- see below). This means:
     #   - Every existing/legacy caller of `build_variant_result` (which
     #     never passes this kwarg) gets a result dict with EXACTLY the
     #     same set of keys as before this change -- the key is not
     #     merely empty, it is entirely absent, which is the strongest
     #     form of schema backward compatibility.
     #   - A caller that wires the ensemble in but for a variant where
-    #     both Enformer and Borzoi were unavailable also gets no key
-    #     here (there is nothing to report), matching the Markdown
-    #     renderer's "hide the section entirely" behavior for the same
-    #     case -- see report/report_generator.py::_render_ai_splicing_ensemble.
-    if ai_splicing_ensemble_result and ai_splicing_ensemble_result.get("models_used"):
+    #     both Enformer and Borzoi were CLEANLY disabled/unavailable
+    #     also gets no key here (there is genuinely nothing to report),
+    #     matching the Markdown renderer's "hide the section entirely"
+    #     behavior for that same case -- see report/report_generator.py
+    #     ::_render_ai_splicing_ensemble.
+    #
+    # `or ai_splicing_ensemble_result.get("error") is not None` (2026-09-11
+    # fix, third surface of the same defect the Markdown renderer and
+    # EnsembleManager.evaluate() were already fixed for): `error` is set
+    # by `EnsembleManager.evaluate()` ONLY on a genuine model crash,
+    # never on a clean disable, so this does not change the clean-disable
+    # case above at all -- it only stops a genuine crash from being
+    # indistinguishable, in the JSON, from a stage that was never
+    # attempted. Before this, the Markdown said "_Failed: ..._" and the
+    # JSON said NOTHING -- no key, as if nothing had ever been tried,
+    # which is a STRONGER fabricated absence than the Markdown one: a
+    # missing key is not a claim a downstream JSON consumer can be
+    # suspicious of, and JSON is the format most likely to be read by
+    # another SYSTEM rather than a person who might notice a missing
+    # section. Every OTHER additive key in this function (gnomad,
+    # clingen, uniprot, mmsplice, etc., all immediately above) already
+    # follows this exact principle -- pass through whatever real result
+    # was actually given, including any `error` it carries, and only
+    # substitute a placeholder when nothing was given at all -- this key
+    # was the one exception, checking internal content (`models_used`)
+    # rather than mere presence. There is no other stage in this
+    # function that ALSO conditionally omits its key on content (every
+    # sibling's condition is `is not None`, never a content check), so
+    # this is not copying a second precedent for the omission shape
+    # itself -- it is bringing this one key in line with the universal
+    # "never let a genuine attempt collapse into a placeholder" principle
+    # every sibling key already follows.
+    if ai_splicing_ensemble_result and (
+        ai_splicing_ensemble_result.get("models_used") or ai_splicing_ensemble_result.get("error") is not None
+    ):
         result["ai_splicing_ensemble"] = ai_splicing_ensemble_result
 
     return result

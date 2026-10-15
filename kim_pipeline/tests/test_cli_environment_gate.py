@@ -47,8 +47,10 @@ def _make_args(**overrides):
 
 # ─── _print_startup_validation ─────────────────────────────────────────────────
 
+
 def test_startup_validation_raises_dependency_error_when_tools_missing(monkeypatch, capsys):
     import pipeline.utils.dependency_validator as dv
+
     monkeypatch.setattr(dv, "_which", lambda name: None)
 
     args = _make_args()
@@ -56,11 +58,14 @@ def test_startup_validation_raises_dependency_error_when_tools_missing(monkeypat
         geper_main._print_startup_validation(args, cfg={})
 
     out = capsys.readouterr().out
-    assert "GEPER Environment Validation" in out
+    # Was "Bij AI Environment Validation" -- scoped to the component 2026-09-11
+    # (the check covers only this component's environment).
+    assert "Bij AI sequencing-analysis component Environment Validation" in out
 
 
 def test_startup_validation_passes_when_tools_present_and_files_exist(monkeypatch, tmp_path):
     import pipeline.utils.dependency_validator as dv
+
     monkeypatch.setattr(dv, "_which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(dv, "_run_version_command", lambda path, args: "1.0.0")
 
@@ -76,6 +81,7 @@ def test_startup_validation_passes_when_tools_present_and_files_exist(monkeypatc
 
 def test_startup_validation_raises_file_not_found_for_missing_reference(monkeypatch, tmp_path):
     import pipeline.utils.dependency_validator as dv
+
     monkeypatch.setattr(dv, "_which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(dv, "_run_version_command", lambda path, args: "1.0.0")
 
@@ -115,8 +121,10 @@ def test_startup_validation_respects_minimap2_requirement(monkeypatch, tmp_path)
 
 # ─── cmd_analyze return codes on gate failure ─────────────────────────────────
 
+
 def test_cmd_analyze_returns_3_on_missing_required_tools(monkeypatch, tmp_path):
     import pipeline.utils.dependency_validator as dv
+
     monkeypatch.setattr(dv, "_which", lambda name: None)
     monkeypatch.setattr(geper_main, "_load_config", lambda path: {})
 
@@ -127,6 +135,7 @@ def test_cmd_analyze_returns_3_on_missing_required_tools(monkeypatch, tmp_path):
 
 def test_cmd_analyze_returns_1_on_missing_input_file(monkeypatch, tmp_path):
     import pipeline.utils.dependency_validator as dv
+
     monkeypatch.setattr(dv, "_which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(dv, "_run_version_command", lambda path, args: "1.0.0")
     monkeypatch.setattr(geper_main, "_load_config", lambda path: {})
@@ -138,6 +147,7 @@ def test_cmd_analyze_returns_1_on_missing_input_file(monkeypatch, tmp_path):
 
 # ─── cmd_verify_environment ─────────────────────────────────────────────────────
 
+
 def test_cmd_verify_environment_returns_zero_on_pass(monkeypatch, capsys):
     import verify_environment as ve
 
@@ -145,6 +155,7 @@ def test_cmd_verify_environment_returns_zero_on_pass(monkeypatch, capsys):
         report = ve.EnvironmentReport()
         report.checks.append(ve.CheckResult("Python version", "PASS", "ok"))
         from pipeline.utils.dependency_validator import DependencyReport
+
         report.tool_report = DependencyReport()
         return report
 
@@ -154,7 +165,9 @@ def test_cmd_verify_environment_returns_zero_on_pass(monkeypatch, capsys):
     rc = geper_main.cmd_verify_environment(args)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "GEPER Environment Verification" in out
+    # Was "Bij AI Environment Verification" -- scoped to the component 2026-09-11
+    # (the check covers only this component's environment).
+    assert "Bij AI sequencing-analysis component Environment Verification" in out
 
 
 def test_cmd_verify_environment_returns_one_on_fail(monkeypatch, capsys):
@@ -164,6 +177,7 @@ def test_cmd_verify_environment_returns_one_on_fail(monkeypatch, capsys):
         report = ve.EnvironmentReport()
         report.checks.append(ve.CheckResult("Python version", "FAIL", "too old"))
         from pipeline.utils.dependency_validator import DependencyReport
+
         report.tool_report = DependencyReport()
         return report
 
@@ -181,6 +195,7 @@ def test_cmd_verify_environment_json_output(monkeypatch, capsys):
         report = ve.EnvironmentReport()
         report.checks.append(ve.CheckResult("Python version", "PASS", "ok"))
         from pipeline.utils.dependency_validator import DependencyReport
+
         report.tool_report = DependencyReport()
         return report
 
@@ -196,13 +211,16 @@ def test_cmd_verify_environment_json_output(monkeypatch, capsys):
 
 # ─── CLI parser wiring (backward compatibility check) ─────────────────────────
 
+
 def test_all_original_subcommands_still_registered():
     parser = geper_main._build_parser()
     sub_actions = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
     assert sub_actions, "no subparsers action found"
     choices = sub_actions[0].choices
     for cmd in ("analyze", "vcf", "classify", "serve", "validate", "test"):
-        assert cmd in choices, f"existing subcommand '{cmd}' missing — backward compatibility broken"
+        assert cmd in choices, (
+            f"existing subcommand '{cmd}' missing — backward compatibility broken"
+        )
 
 
 def test_verify_environment_subcommand_registered():

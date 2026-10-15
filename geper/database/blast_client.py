@@ -20,7 +20,12 @@ Supports three modes:
     binary AND a usable database are both present on this machine
     (either passed explicitly via `local_db_path`, or discovered via
     the `GEPER_BLAST_DATABASE` / `GEPER_BLAST_LOCAL_DB` / `BLASTDB`
-    environment variables), and falls back to "remote" otherwise. This
+    environment variables), and falls back to "remote" otherwise --
+    but only when NO local BLAST was configured: since 2026-09-11, if a
+    local database or a reference FASTA IS configured and cannot be
+    used (no `blastn`, no database files, nothing could be built),
+    construction refuses instead of sending sequence off-site (see the
+    local-intent refusal in `__init__`). This
     never requires the caller to know ahead of time whether the
     deployment has local BLAST+ provisioned -- it just uses the fast
     path when available. If neither a usable local database nor a
@@ -84,7 +89,7 @@ benchmark_blast.py for before/after timing.
 "remote" mode depends on Biopython (listed in requirements.txt), which
 -- like RNA-FM's `rna-fm` -- may not actually be installed in a
 given Colab/runtime session even though it's declared as a dependency.
-`ensure_pip_package_available` auto-installs it the first time it's
+`check_pip_package_availability` auto-installs it the first time it's
 actually needed (see utils/auto_install.py), so BLAST works without a
 manual `pip install biopython` step, the same way the model wrappers do.
 """
@@ -101,8 +106,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from config import CONFIG
-from utils.auto_install import ensure_pip_package_available
-from utils.exceptions import ExternalAPIError
+from utils.auto_install import PackageCheckStatus, check_pip_package_availability
+from utils.exceptions import ExternalAPIError, PipelineError
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -175,9 +180,7 @@ def get_blast_tool_versions() -> Dict[str, Optional[str]]:
             versions[tool] = None
             continue
         try:
-            proc = subprocess.run(
-                [tool, "-version"], capture_output=True, text=True, timeout=10
-            )
+            proc = subprocess.run([tool, "-version"], capture_output=True, text=True, timeout=10)
             first_line = (proc.stdout or proc.stderr or "").strip().splitlines()
             versions[tool] = first_line[0] if first_line else "unknown version (empty -version output)"
         except Exception as exc:  # noqa: BLE001 - diagnostic only, must never raise
@@ -192,9 +195,11 @@ def ensure_local_blast_db(
     Ensure a local BLAST database exists for `fasta_path`, building one
     with `makeblastdb` if it doesn't already exist, and returning the
     resulting database path/prefix -- or None if no database could be
-    obtained (missing FASTA, missing `makeblastdb`, or a build failure),
-    in which case callers should fall back to remote BLAST rather than
-    crash.
+    obtained (missing FASTA, missing `makeblastdb`, or a build failure).
+    It never raises. What a None means is the caller's decision: since
+    2026-09-11 `BLASTClient` in mode "auto" REFUSES rather than falling
+    back to remote, because a configured FASTA is a request for local
+    BLAST (see its local-intent refusal).
 
     Never rebuilds an existing database: if `_has_local_db_files`
     already finds database files at the target path, this is a
@@ -219,8 +224,7 @@ def ensure_local_blast_db(
 
     if _has_local_db_files(resolved_db_path):
         logger.info(
-            f"Local BLAST database already exists at '{resolved_db_path}' -- "
-            "skipping makeblastdb (not rebuilding)."
+            f"Local BLAST database already exists at '{resolved_db_path}' -- skipping makeblastdb (not rebuilding)."
         )
         return resolved_db_path
 
@@ -236,9 +240,12 @@ def ensure_local_blast_db(
 
     command = [
         "makeblastdb",
-        "-in", fasta_path,
-        "-dbtype", dbtype,
-        "-out", resolved_db_path,
+        "-in",
+        fasta_path,
+        "-dbtype",
+        dbtype,
+        "-out",
+        resolved_db_path,
         "-parse_seqids",
     ]
     logger.info(
@@ -269,7 +276,9 @@ def ensure_local_blast_db(
         )
         return None
     except Exception as exc:  # noqa: BLE001 - must never crash the pipeline
-        logger.warning(f"Unexpected error running makeblastdb ({exc}); falling back without an auto-built local database.")
+        logger.warning(
+            f"Unexpected error running makeblastdb ({exc}); falling back without an auto-built local database."
+        )
         return None
 
     logger.info(f"Local BLAST database built successfully at '{resolved_db_path}'.")
@@ -326,9 +335,7 @@ class _BlastDiskCache:
             return None
         try:
             with self._lock, self._connect() as conn:
-                row = conn.execute(
-                    "SELECT result_json FROM blast_cache WHERE cache_key = ?", (key,)
-                ).fetchone()
+                row = conn.execute("SELECT result_json FROM blast_cache WHERE cache_key = ?", (key,)).fetchone()
             if row is None:
                 return None
             return json.loads(row[0])
@@ -342,8 +349,7 @@ class _BlastDiskCache:
         try:
             with self._lock, self._connect() as conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO blast_cache (cache_key, result_json, created_at) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO blast_cache (cache_key, result_json, created_at) VALUES (?, ?, ?)",
                     (key, json.dumps(result), time.time()),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -393,13 +399,90 @@ class BLASTClient:
         # below, not just on some later run. Best-effort: any failure
         # here (missing FASTA, missing makeblastdb, a build error) is
         # logged and this simply leaves `self.local_db_path` as it was
-        # -- it never raises, so a broken auto-build attempt degrades
-        # to remote/skip exactly like "no local database configured"
-        # would.
+        # -- it never raises. Since 2026-09-11 a broken auto-build no
+        # longer degrades "auto" to remote: the local-intent refusal
+        # below stops construction instead (a FASTA is a request for
+        # LOCAL BLAST). Explicit mode="remote" still proceeds.
         if self.reference_fasta and not disabled:
             built_db_path = ensure_local_blast_db(self.reference_fasta, self.local_db_path)
             if built_db_path:
                 self.local_db_path = built_db_path
+
+        # Local BLAST configured but `blastn` absent: REFUSE, never fall
+        # through to remote. Ruled 2026-09-11 by god under the human's #21
+        # ("ABSENT is a confirmed missing prerequisite and should kill the
+        # run"): once ncbi-blast+ left the shipped image, a site that set a
+        # local database to keep patient sequence on-premises was silently
+        # resolved to REMOTE by `_resolve_auto_mode` below -- the sequence
+        # left the site under an INFO line that never said a configured
+        # local database had been ignored. An operator who configured local
+        # BLAST did it on purpose; choosing remote for them is an egress
+        # decision nobody made. Every documented local-database source
+        # counts (see the module docstring), not just one variable. Only
+        # "auto" is refused, because only "auto" falls through to remote:
+        # explicit mode="remote" is the operator choosing egress, and
+        # explicit mode="local" never leaves the site (it fails at the first
+        # search, as before). The message names the SOURCE, not the path --
+        # the round-28 rule for this file (see `_search_local`): what's
+        # raised names the failure, never the local filesystem path.
+        #
+        # Extended 2026-09-11 (god, same ruling): "AN OPERATOR WHO EXPRESSED
+        # LOCAL-BLAST INTENT MUST NEVER BE SILENTLY SENT REMOTE." Two more
+        # paths fell through to remote the same way and are refused too:
+        # a configured database whose files are not there (blastn present --
+        # e.g. a volume that failed to mount), and a reference FASTA that
+        # asked for a database to be BUILT when none could be (makeblastdb
+        # absent, or the build failed).
+        if not disabled and mode == "auto" and (self.local_db_path or self.reference_fasta):
+            fasta_source = (
+                "the reference_fasta argument (--blast-reference-fasta)"
+                if reference_fasta
+                else "GEPER_BLAST_REFERENCE_FASTA"
+            )
+            # Named from the configuration inputs, not from the post-build
+            # path: a database auto-built from the FASTA is the FASTA's.
+            if local_db_path:
+                local_db_source = "the local_db_path argument (--blast-db)"
+            elif CONFIG.api.BLAST_LOCAL_DB_PATH:
+                local_db_source = next(
+                    (var for var in ("GEPER_BLAST_DATABASE", "GEPER_BLAST_LOCAL_DB") if os.environ.get(var)),
+                    "GEPER_BLAST_DATABASE / GEPER_BLAST_LOCAL_DB",
+                )
+            elif os.environ.get("BLASTDB"):
+                local_db_source = "BLASTDB"
+            else:
+                local_db_source = fasta_source
+            makeblastdb_absent = shutil.which("makeblastdb") is None
+            why_not_built = (
+                "because the `makeblastdb` binary is not on PATH" if makeblastdb_absent else "(see the log for why)"
+            )
+            problem = None
+            if self.local_db_path and shutil.which("blastn") is None:
+                problem = (
+                    f"Local BLAST is configured (via {local_db_source}) but the `blastn` binary is not "
+                    "on PATH, so local BLAST cannot run.",
+                    "Install BLAST+ so `blastn` is on PATH",
+                )
+            elif self.local_db_path and not _has_local_db_files(self.local_db_path):
+                built = f", and none could be built from {fasta_source} {why_not_built}" if self.reference_fasta else ""
+                problem = (
+                    f"Local BLAST is configured (via {local_db_source}) but no BLAST database files were "
+                    f"found at the configured location{built}.",
+                    "Make the database available at the configured location (check that its volume is mounted)",
+                )
+            elif not self.local_db_path:
+                problem = (
+                    f"A local BLAST database was requested via {fasta_source}, but none could be built "
+                    f"{why_not_built}.",
+                    "Install BLAST+ so `makeblastdb` is on PATH" if makeblastdb_absent else "Fix the database build",
+                )
+            if problem is not None:
+                what, remedy = problem
+                raise PipelineError(
+                    f"{what} Refusing rather than falling back to remote NCBI BLAST, which would send "
+                    "sequence off-site -- a decision nobody made for this deployment. "
+                    f"{remedy}, or set GEPER_BLAST_MODE=remote to choose remote BLAST explicitly."
+                )
 
         if mode == "auto" and not disabled:
             mode = self._resolve_auto_mode(self.local_db_path)
@@ -413,15 +496,27 @@ class BLASTClient:
                 # letting every search() call fail with a raised
                 # exception later (requirement: "graceful skip if both
                 # unavailable").
-                if not ensure_pip_package_available("biopython", import_name="Bio"):
-                    logger.warning(
-                        "BLAST mode 'auto': no usable local blastn/database "
-                        "found, and Biopython (required for remote NCBI "
-                        "BLAST) could not be imported or installed in this "
-                        "environment. BLAST will be skipped gracefully for "
-                        "this pipeline instance -- interpretation continues "
-                        "without BLAST evidence."
-                    )
+                biopython = check_pip_package_availability("biopython", import_name="Bio")
+                if biopython is not PackageCheckStatus.PRESENT:
+                    if biopython is PackageCheckStatus.NOT_CHECKED:
+                        logger.warning(
+                            "BLAST mode 'auto': no usable local blastn/database "
+                            "found, and Biopython's availability was not checked "
+                            "in this environment (auto-install is disabled under "
+                            "pytest), so whether remote BLAST could run here is "
+                            "unknown rather than ruled out. BLAST will be skipped "
+                            "gracefully for this pipeline instance -- "
+                            "interpretation continues without BLAST evidence."
+                        )
+                    else:
+                        logger.warning(
+                            "BLAST mode 'auto': no usable local blastn/database "
+                            "found, and Biopython (required for remote NCBI "
+                            "BLAST) could not be imported or installed in this "
+                            "environment. BLAST will be skipped gracefully for "
+                            "this pipeline instance -- interpretation continues "
+                            "without BLAST evidence."
+                        )
                     mode = "skip"
             logger.info(
                 f"BLAST mode 'auto' resolved to '{mode}' "
@@ -438,24 +533,67 @@ class BLASTClient:
         self.requested_mode = requested_mode
 
         if self.mode == "remote" and not disabled:
-            # Fail fast / auto-install here, at construction, rather
-            # than silently discovering it's missing on the first
-            # variant that reaches the BLAST stage -- same "surface
-            # setup problems immediately" philosophy as the startup
-            # model validation in the orchestrator.
-            ensure_pip_package_available("biopython", import_name="Bio")
+            # Fail fast at construction when Biopython is confirmed
+            # ABSENT -- an install was attempted and did not succeed --
+            # rather than discovering it on the first variant that
+            # reaches the BLAST stage. Ruled 2026-09-11 (card DEFECT-
+            # blast_client-457-..., option C): "NOT_CHECKED is an honest
+            # unknown and shouldn't kill a run; ABSENT is a confirmed
+            # missing prerequisite and should." So NOT_CHECKED (never
+            # looked -- auto-install disabled under pytest) constructs,
+            # exactly as the `auto` branch above treats it as unknown
+            # rather than ruled out.
+            #
+            # History: until 2026-09-11 this line called
+            # `ensure_pip_package_available` and discarded the result,
+            # under a comment promising fail-fast; construction
+            # succeeded under ABSENT and NOT_CHECKED alike. The
+            # auto-install attempt is kept: `check_pip_package_
+            # availability` is what performs it, so on a box that can
+            # reach PyPI this still installs Biopython here.
+            #
+            # Consequence worth knowing: `search()` consults the memo
+            # and disk caches before `_search_remote`, so a run that
+            # could have replayed entirely from cache also stops here
+            # when Biopython is ABSENT. That is the ruling as given.
+            # Same wording family as `_search_remote`'s ABSENT branch, but
+            # PipelineError, not ExternalAPIError (changed 2026-09-11, god):
+            # main.py catches only PipelineError for a clean one-line abort,
+            # so ExternalAPIError reached the operator as a raw traceback.
+            biopython = check_pip_package_availability("biopython", import_name="Bio")
+            if biopython is PackageCheckStatus.ABSENT:
+                raise PipelineError(
+                    "Remote BLAST requires Biopython, and automatic "
+                    "installation ('pip install biopython') did not succeed "
+                    "in this environment -- check network access to "
+                    "pypi.org, or install it yourself with "
+                    "`pip install biopython`. Raised at BLASTClient "
+                    "construction so the run stops before any variant "
+                    "is processed."
+                )
 
         # Memoizes search() results by exact (mode, program, database,
         # max_hits, sequence) for this process's lifetime.
         self._result_cache: Dict[str, Dict[str, Any]] = {}
 
+        # How many searches this run were answered by actually
+        # contacting BLAST vs replayed off the on-disk cache. Read once
+        # per run by `pipeline/orchestrator.py` and mapped onto
+        # `pipeline/provenance.py::RetrievalMode`, so a report can say
+        # which of the two produced its BLAST evidence. Kept as plain
+        # ints here rather than a RetrievalMode: `database/` must not
+        # import from `pipeline/` (provenance.py already imports THIS
+        # module, lazily, inside `capture_blast_local_tool_versions`),
+        # and the mapping is the orchestrator's job anyway.
+        self._retrieval_lock = threading.Lock()
+        self._live_query_count = 0
+        self._cache_replay_count = 0
+
         if enable_disk_cache is None:
             enable_disk_cache = CONFIG.api.BLAST_DISK_CACHE_ENABLED
         self._disk_cache: Optional[_BlastDiskCache] = None
         if enable_disk_cache and not disabled:
-            cache_path = os.path.join(
-                cache_dir or CONFIG.CACHE_DIR, "blast_cache.sqlite"
-            )
+            cache_path = os.path.join(cache_dir or CONFIG.CACHE_DIR, "blast_cache.sqlite")
             self._disk_cache = _BlastDiskCache(cache_path)
 
         # Bounds how many *distinct* sequences search_many() will
@@ -464,9 +602,7 @@ class BLASTClient:
         # "as many as we have sequences" -- local BLAST has no such
         # courtesy concern and defaults higher (bounded by CPU count).
         self.max_concurrent = (
-            CONFIG.api.BLAST_MAX_CONCURRENT_LOCAL
-            if self.mode == "local"
-            else CONFIG.api.BLAST_MAX_CONCURRENT_REMOTE
+            CONFIG.api.BLAST_MAX_CONCURRENT_LOCAL if self.mode == "local" else CONFIG.api.BLAST_MAX_CONCURRENT_REMOTE
         )
 
     @staticmethod
@@ -520,10 +656,13 @@ class BLASTClient:
 
         cached = self._result_cache.get(key)
         if cached is not None:
-            logger.info(
-                f"BLAST in-memory cache hit for a {len(sequence)}bp sequence -- "
-                "skipping a duplicate search."
-            )
+            # Deliberately NOT counted as a retrieval of either kind.
+            # An in-memory hit is this run re-using an answer this run
+            # already obtained; whichever way that first occurrence was
+            # retrieved (live or disk replay) was already counted, and
+            # counting it again would inflate one side of a ratio that
+            # exists to describe where the run's data came from.
+            logger.info(f"BLAST in-memory cache hit for a {len(sequence)}bp sequence -- skipping a duplicate search.")
             return cached
 
         if self._disk_cache is not None:
@@ -533,6 +672,8 @@ class BLASTClient:
                     f"BLAST disk cache hit for a {len(sequence)}bp sequence "
                     "(result reused from a previous run) -- skipping NCBI submission."
                 )
+                with self._retrieval_lock:
+                    self._cache_replay_count += 1
                 self._result_cache[key] = disk_hit
                 return disk_hit
 
@@ -541,10 +682,30 @@ class BLASTClient:
         else:
             result = self._search_local(sequence, program, max_hits)
 
+        with self._retrieval_lock:
+            self._live_query_count += 1
         self._result_cache[key] = result
         if self._disk_cache is not None:
             self._disk_cache.set(key, result)
         return result
+
+    def retrieval_counts(self) -> Dict[str, int]:
+        """
+        `{"live": n, "cache_replay": m}` for this client's lifetime --
+        how many BLAST searches actually contacted a BLAST backend
+        versus were answered from the on-disk cache written by an
+        EARLIER run.
+
+        Exists because the two are indistinguishable from the outside:
+        a disk-cache replay returns the same normalized dict, with the
+        same real hits, in milliseconds. Consumed by
+        `pipeline/orchestrator.py::_capture_blast_retrieval_provenance`.
+
+        In-memory (same-run, duplicate-sequence) hits are counted in
+        NEITHER bucket -- see `search`.
+        """
+        with self._retrieval_lock:
+            return {"live": self._live_query_count, "cache_replay": self._cache_replay_count}
 
     def search_many(
         self,
@@ -590,8 +751,7 @@ class BLASTClient:
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_seq = {
-                executor.submit(self.search, seq, program, database, max_hits): seq
-                for seq in unique_sequences
+                executor.submit(self.search, seq, program, database, max_hits): seq for seq in unique_sequences
             }
             for future in as_completed(future_to_seq):
                 seq = future_to_seq[future]
@@ -633,10 +793,17 @@ class BLASTClient:
     # ------------------------------------------------------------------
     # Remote (NCBI-hosted) BLAST via Biopython
     # ------------------------------------------------------------------
-    def _search_remote(
-        self, sequence: str, program: str, database: str, max_hits: int
-    ) -> Dict[str, Any]:
-        if not ensure_pip_package_available("biopython", import_name="Bio"):
+    def _search_remote(self, sequence: str, program: str, database: str, max_hits: int) -> Dict[str, Any]:
+        biopython = check_pip_package_availability("biopython", import_name="Bio")
+        if biopython is PackageCheckStatus.NOT_CHECKED:
+            raise ExternalAPIError(
+                "Remote BLAST requires Biopython, whose availability was not "
+                "checked in this environment (auto-install is disabled under "
+                "pytest). It is not confirmed missing -- it was never looked "
+                "for. Install it with `pip install biopython`, or run outside "
+                "the test harness, to find out."
+            )
+        if biopython is PackageCheckStatus.ABSENT:
             raise ExternalAPIError(
                 "Remote BLAST requires Biopython, and automatic "
                 "installation ('pip install biopython') did not succeed "
@@ -653,9 +820,7 @@ class BLASTClient:
                     f"Submitting remote BLAST ({program} vs {database}) for a "
                     f"{len(sequence)}bp sequence (attempt {attempt})..."
                 )
-                result_handle = NCBIWWW.qblast(
-                    program, database, sequence, hitlist_size=max_hits
-                )
+                result_handle = NCBIWWW.qblast(program, database, sequence, hitlist_size=max_hits)
                 record = NCBIXML.read(result_handle)
                 return self._normalize_biopython_record(record, max_hits)
             except Exception as exc:  # noqa: BLE001 - network/service errors vary widely
@@ -664,9 +829,19 @@ class BLASTClient:
                 if attempt < CONFIG.api.MAX_RETRIES:
                     time.sleep(CONFIG.api.RETRY_BACKOFF_SECS * attempt)
 
-        raise ExternalAPIError(
-            f"Remote BLAST failed after {CONFIG.api.MAX_RETRIES} attempts: {last_error}"
+        logger.warning(
+            f"Remote BLAST failed after {CONFIG.api.MAX_RETRIES} attempts: {last_error}",
+            exc_info=last_error,
         )
+        # Round 28: `last_error` here is whatever Biopython's `NCBIWWW.qblast`
+        # raised, which for a real network failure can stringify to
+        # include NCBI's request URL/host -- same leak class as every
+        # other provider in this document, reaching `report/
+        # clinical_report_builder.py`/`report/report_generator.py` via
+        # `_run_blast_stage`'s own `reason`/`error` fields (see that
+        # method's comment in `pipeline/orchestrator.py`). Full detail
+        # goes to the log line above only.
+        raise ExternalAPIError(f"Remote BLAST failed after {CONFIG.api.MAX_RETRIES} attempts")
 
     @staticmethod
     def _normalize_biopython_record(record, max_hits: int) -> Dict[str, Any]:
@@ -692,9 +867,12 @@ class BLASTClient:
         query_fasta = f">query\n{sequence}\n"
         command = [
             program,
-            "-db", self.local_db_path,
-            "-outfmt", "6 sseqid pident length evalue bitscore stitle",
-            "-max_target_seqs", str(max_hits),
+            "-db",
+            self.local_db_path,
+            "-outfmt",
+            "6 sseqid pident length evalue bitscore stitle",
+            "-max_target_seqs",
+            str(max_hits),
         ]
         try:
             proc = subprocess.run(
@@ -711,9 +889,26 @@ class BLASTClient:
                 f"NCBI BLAST+ command line tools to use mode='local'."
             ) from exc
         except subprocess.CalledProcessError as exc:
-            raise ExternalAPIError(f"Local BLAST search failed: {exc.stderr}") from exc
+            # Round 28: `exc.stderr` is the local `blastn` process's raw
+            # error output, which routinely embeds `self.local_db_path`
+            # (a local filesystem path) -- e.g. "BLAST Database error:
+            # No alias or index file found ... in search path
+            # [/local/path]". Same local-path-leak class rounds 18-22
+            # fixed for SpliceBERT's checkpoint_dir and MMSplice's
+            # h5_path/package_dir, reaching the report via
+            # `_run_blast_stage`'s `reason`/`error` fields. Full stderr
+            # goes to the log only; what's raised names the failure, not
+            # the path.
+            logger.warning(f"Local BLAST search failed (exit {exc.returncode}): {exc.stderr}", exc_info=True)
+            raise ExternalAPIError(f"Local BLAST search failed (exit code {exc.returncode}).") from exc
         except subprocess.TimeoutExpired as exc:
-            raise ExternalAPIError(f"Local BLAST search timed out: {exc}") from exc
+            # Round 28: `str(exc)` embeds the full command list, which
+            # includes `-db` and `self.local_db_path` -- same local-path
+            # leak as the `CalledProcessError` branch above.
+            logger.warning(f"Local BLAST search timed out: {exc}", exc_info=True)
+            raise ExternalAPIError(
+                f"Local BLAST search timed out after {CONFIG.api.REQUEST_TIMEOUT_SECS * 4}s."
+            ) from exc
 
         hits = []
         for line in proc.stdout.strip().splitlines():

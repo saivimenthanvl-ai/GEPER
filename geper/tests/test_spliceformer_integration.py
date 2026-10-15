@@ -29,6 +29,34 @@ from pipeline.models.pending_plugins import (
     SpliceFormerPlugin,
     build_default_registry,
 )
+from utils.auto_install import PackageCheckStatus
+
+try:
+    import enformer_pytorch  # noqa: F401
+
+    _HAS_ENFORMER_PYTORCH = True
+except ImportError:
+    _HAS_ENFORMER_PYTORCH = False
+
+try:
+    import borzoi_pytorch  # noqa: F401
+
+    _HAS_BORZOI_PYTORCH = True
+except ImportError:
+    _HAS_BORZOI_PYTORCH = False
+
+_ENFORMER_SKIP_REASON = (
+    "enformer-pytorch is not installed in this environment -- Enformer is an "
+    "optional, config-gated integration (CONFIG.splicing.ENABLE_ENFORMER; see "
+    "requirements.txt's own header comment for the rationale), not a broken "
+    "environment."
+)
+_ENFORMER_AND_BORZOI_SKIP_REASON = (
+    "enformer-pytorch and/or borzoi-pytorch is not installed in this "
+    "environment -- both are optional, config-gated integrations "
+    "(CONFIG.splicing.ENABLE_ENFORMER / ENABLE_BORZOI; see requirements.txt's "
+    "own header comment for the rationale), not a broken environment."
+)
 
 
 class _FakeSpliceFormerModel:
@@ -75,14 +103,32 @@ class TestSpliceFormerRegisteredAlongsideEnformerAndBorzoi(unittest.TestCase):
         )
 
     def test_manager_predict_never_crashes_for_any_of_the_three(self):
+        # Was `assertIsNone(...)` for all three, with Enformer/Borzoi's
+        # own `ensure_pip_package_available` mocked False but
+        # SpliceFormer's own gate (its `einops` check,
+        # pipeline/models/spliceformer_plugin.py:158-166) left
+        # unmocked -- so the assertion held only where einops happened
+        # to be absent from this box. That is a broken/absent-package
+        # proxy pinned as if it were the real contract: the moment
+        # einops is installed, SpliceFormer starts working and this
+        # test starts failing, for succeeding rather than breaking.
+        # Same class of bug as 89dc9c8/test_new_plugins_integration.py
+        # ::test_manager_predict_never_crashes_for_either -- the actual
+        # contract (this test's own name) is just "never crashes":
+        # predict() must return either None (genuinely unavailable) or
+        # a real prediction dict (genuinely available), never raise,
+        # regardless of which packages happen to be installed on this
+        # box. Deliberately does NOT mock einops/ensure_pip_package_
+        # available into a fixed state for any of the three -- doing
+        # so would just pin a *different* mocked machine state instead
+        # of removing the dependency on one.
         manager = ModelManager(registry=build_default_registry())
-        with mock.patch(
-            "pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=False
-        ), mock.patch(
-            "pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=False
-        ):
-            for key in ("enformer", "borzoi", "spliceformer"):
-                self.assertIsNone(manager.predict(key, "A" * 10, "T" * 10))
+        for key in ("enformer", "borzoi", "spliceformer"):
+            result = manager.predict(key, "A" * 10, "T" * 10)
+            self.assertTrue(
+                result is None or isinstance(result, dict),
+                f"{key}: predict() returned {result!r}, expected None or dict",
+            )
 
     def test_spliceformer_metadata_reachable_regardless_of_availability(self):
         registry = build_default_registry()
@@ -134,20 +180,29 @@ class TestSpliceFormerEnabledAlongsideEnformerAndBorzoiThroughManager(unittest.T
     def test_four_available_keys_reported_by_registry(self):
         # Was "three" before SpliceBERT's own addition; see
         # test_all_five_keys_registered's own comment above.
-        with mock.patch(
-            "pipeline.models.spliceformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "pipeline.models.splicebert_plugin.is_pip_package_installed", return_value=True
-        ), mock.patch(
-            "pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True
+        #
+        # RESTORED 2026-09-02 (borzoi patch): deleted 2026-08-31
+        # (cd46378) as decorative -- "real: borzoi_pytorch installed ->
+        # True" -- which was true only in this sandbox. This test is
+        # NOT skipUnless-gated (unlike the enformer/borzoi combination
+        # tests elsewhere in this file), so it runs unconditionally on
+        # CI, where borzoi-pytorch is genuinely absent (not pinned in
+        # requirements.txt): ensure_pip_package_available("borzoi-
+        # pytorch", ...) there returns False, which would drop "borzoi"
+        # from available_keys() and fail this assertion. The enformer
+        # patch below is the test's own control, kept the whole time --
+        # enformer-pytorch is equally absent on CI, so mocking it to
+        # True is equally load-bearing there, for the identical reason.
+        with (
+            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
         ):
             self.assertEqual(
                 sorted(self.registry.available_keys()),
                 ["borzoi", "enformer", "splicebert", "spliceformer"],
             )
 
+    @unittest.skipUnless(_HAS_ENFORMER_PYTORCH and _HAS_BORZOI_PYTORCH, _ENFORMER_AND_BORZOI_SKIP_REASON)
     def test_all_three_plugins_load_and_predict_independently(self):
         fake_enformer = mock.Mock()
         fake_enformer.to.return_value = fake_enformer
@@ -162,9 +217,7 @@ class TestSpliceFormerEnabledAlongsideEnformerAndBorzoiThroughManager(unittest.T
                 return self
 
             def __call__(self, seqs, head="human"):
-                return torch.stack(
-                    [torch.full((4, 4), 0.0), torch.full((4, 4), 1.0)], dim=0
-                )
+                return torch.stack([torch.full((4, 4), 0.0), torch.full((4, 4), 1.0)], dim=0)
 
         class _FakeBorzoiModel:
             def to(self, device):
@@ -178,23 +231,29 @@ class TestSpliceFormerEnabledAlongsideEnformerAndBorzoiThroughManager(unittest.T
 
         fake_spliceformer = _FakeSpliceFormerModel(ref_value=0.0, alt_value=0.6)
 
-        with mock.patch(
-            "pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "enformer_pytorch.from_pretrained", return_value=_FakeEnformerModel()
-        ), mock.patch(
-            "pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "borzoi_pytorch.Borzoi.from_pretrained", return_value=_FakeBorzoiModel()
-        ), mock.patch(
-            "pipeline.models.spliceformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "pipeline.models.spliceformer_plugin.spliceformer_loader.build_model",
-            return_value=fake_spliceformer,
-        ), mock.patch(
-            "pipeline.models.spliceformer_plugin.spliceformer_loader.download_checkpoint"
-        ), mock.patch(
-            "pipeline.models.spliceformer_plugin.spliceformer_loader.load_checkpoint_into"
+        with (
+            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
+            mock.patch("enformer_pytorch.from_pretrained", return_value=_FakeEnformerModel()),
+            mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
+            mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=_FakeBorzoiModel()),
+            mock.patch("pipeline.models.spliceformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.spliceformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
+            mock.patch(
+                "pipeline.models.spliceformer_plugin.spliceformer_loader.build_model",
+                return_value=fake_spliceformer,
+            ),
+            mock.patch("pipeline.models.spliceformer_plugin.spliceformer_loader.download_checkpoint"),
+            mock.patch("pipeline.models.spliceformer_plugin.spliceformer_loader.load_checkpoint_into"),
         ):
             enformer_result = self.manager.predict("enformer", "A" * 10, "T" * 10)
             borzoi_result = self.manager.predict("borzoi", "A" * 10, "T" * 10)
@@ -204,10 +263,9 @@ class TestSpliceFormerEnabledAlongsideEnformerAndBorzoiThroughManager(unittest.T
         self.assertIsNotNone(borzoi_result)
         self.assertIsNotNone(spliceformer_result)
         self.assertEqual(spliceformer_result["meta"]["model"], "spliceformer")
-        self.assertEqual(
-            sorted(self.manager.loaded_keys()), ["borzoi", "enformer", "spliceformer"]
-        )
+        self.assertEqual(sorted(self.manager.loaded_keys()), ["borzoi", "enformer", "spliceformer"])
 
+    @unittest.skipUnless(_HAS_ENFORMER_PYTORCH, _ENFORMER_SKIP_REASON)
     def test_spliceformer_failing_to_load_does_not_affect_enformer_or_borzoi(self):
         class _FakeEnformerModel:
             def to(self, device):
@@ -217,22 +275,28 @@ class TestSpliceFormerEnabledAlongsideEnformerAndBorzoiThroughManager(unittest.T
                 return self
 
             def __call__(self, seqs, head="human"):
-                return torch.stack(
-                    [torch.full((4, 4), 0.0), torch.full((4, 4), 1.0)], dim=0
-                )
+                return torch.stack([torch.full((4, 4), 0.0), torch.full((4, 4), 1.0)], dim=0)
 
-        with mock.patch(
-            "pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "enformer_pytorch.from_pretrained", return_value=_FakeEnformerModel()
-        ), mock.patch(
-            "pipeline.models.spliceformer_plugin.ensure_pip_package_available", return_value=True
-        ), mock.patch(
-            "pipeline.models.spliceformer_plugin.spliceformer_loader.build_model",
-            return_value=_FakeSpliceFormerModel(0.0, 0.6),
-        ), mock.patch(
-            "pipeline.models.spliceformer_plugin.spliceformer_loader.download_checkpoint",
-            side_effect=ConnectionError("unreachable"),
+        with (
+            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
+            mock.patch("enformer_pytorch.from_pretrained", return_value=_FakeEnformerModel()),
+            mock.patch("pipeline.models.spliceformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.spliceformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
+            mock.patch(
+                "pipeline.models.spliceformer_plugin.spliceformer_loader.build_model",
+                return_value=_FakeSpliceFormerModel(0.0, 0.6),
+            ),
+            mock.patch(
+                "pipeline.models.spliceformer_plugin.spliceformer_loader.download_checkpoint",
+                side_effect=ConnectionError("unreachable"),
+            ),
         ):
             enformer_result = self.manager.predict("enformer", "A" * 10, "T" * 10)
             spliceformer_result = self.manager.predict("spliceformer", "A" * 10, "T" * 10)

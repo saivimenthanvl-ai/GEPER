@@ -13,6 +13,51 @@ The one model considered and rejected (OpenSpliceAI) was rejected
 *specifically* for licensing reasons, and DNABERT-2 has been removed
 from GEPER entirely (see below) as part of this change.
 
+**Scope note (2026-08-20): "removed from GEPER entirely" below refers
+only to the `geper/` pipeline.** kim_pipeline (the integrated product's
+FASTQ-to-VCF engine) retains and actively uses DNABERT-2 independently
+(`kim_pipeline/pipeline/ai/engine.py::DnaBertEngine`), with a pinned
+`revision` on `from_pretrained()` to mitigate the `trust_remote_code=True`
+RCE surface -- see root `DATA_PROVENANCE.md` for the security review.
+This audit file does not cover kim_pipeline's own model/dependency
+license posture generally (that remains a separate, real, open card --
+not undertaken here). kim_pipeline's DNABERT-2 usage was reviewed for
+**security** on 2026-08-20 (the `trust_remote_code=True` RCE surface,
+mitigated with a pinned `revision` -- see root `DATA_PROVENANCE.md`);
+as of 2026-08-28 it had **not been reviewed for licensing**: no one
+had independently fetched and confirmed `zhihan1996/DNABERT-2-117M`'s
+license -- the security review fetched the model's *code* to read for
+RCE risk, not its license metadata -- and `kim_pipeline/docs/
+DATA_PROVENANCE.md`, the only license/provenance document kim_pipeline
+has, does not mention DNABERT-2 or its license at all. That was an
+open, unreviewed gap, not a completed review.
+
+**RESOLVED 2026-09-09: DNABERT-2 is Apache-2.0.** The 2026-08-28 gap
+above stood because the one thing fetched to date was the HuggingFace
+**model card body** (the rendered README) -- its own YAML frontmatter
+carries no `license:` key, and reading that absence as "unlicensed" or
+"unreviewable" was the mistake: a rendered card is a *view*, and it
+does not necessarily surface every field the underlying repository
+metadata holds. Fetching the **model-info API endpoint**
+(`huggingface.co/api/models/zhihan1996/DNABERT-2-117M`) instead shows
+a `siblings` array that lists a file literally named `LICENSE` --
+present in the repository, absent from the card. Fetching that file
+directly (`huggingface.co/zhihan1996/DNABERT-2-117M/raw/main/LICENSE`)
+returns the complete, unmodified canonical **Apache License, Version
+2.0** text. Cross-checked independently against the code repository:
+GitHub's own license-detection API for `github.com/MAGICS-LAB/
+DNABERT_2` returns `spdx_id: Apache-2.0`, consistent with the weights
+repo, not contradicting it. No `NOTICE` file exists in either repo.
+Both code and weights are therefore Apache-2.0 -- permissive,
+commercially usable, with the same NOTICE/LICENSE-preservation
+obligation as every other Apache-2.0 entry in this document. Full
+redistribution analysis (does Apache-2.0 permit *bundling* the weights
+into a customer-shipped image, not just using them) is in
+`PACKAGING_REDISTRIBUTION_LICENSE_AUDIT.md`, a separate file scoped to
+that separate question; this entry records the underlying licence
+fact the redistribution analysis depends on, not the redistribution
+verdict itself.
+
 ## Models GEPER loads and runs
 
 Code license and weights license are listed **separately** because they
@@ -30,10 +75,11 @@ grepped from that code, not inferred from the project's README.
 | ESM-2 | `esm2_t33_650M_UR50D` (Meta FAIR, via `transformers.from_pretrained`) | github.com/facebookresearch/esm | **MIT** | **MIT** (`facebook/esm2_t33_650M_UR50D` HF frontmatter, confirmed directly) | Yes | Confirmed via the repo's own `LICENSE` and the HF model card. (The separate ESM Metagenomic Atlas *dataset* is CC-BY-4.0 and is not used by GEPER.) |
 | AlphaMissense | Precomputed pathogenicity catalogue, downloaded directly from `storage.googleapis.com/dm_alphamissense/AlphaMissense_hg{19,38}.tsv.gz` (`models/alphamissense.py`) | github.com/google-deepmind/alphamissense | **Apache-2.0** (code; GEPER does not use the code, lookup-only) | **CC BY 4.0** | Yes | **Genuine internal discrepancy flagged in `config.py::AlphaMissenseConfig`'s own docstring, now resolved -- see "Full-catalogue re-verification" below.** GEPER uses an indexed `tabix` lookup against the catalogue file itself, not the model weights (none are published). |
 | MMSplice | `mmsplice` PyPI package (`--no-deps` install, `.h5` files + `layers.py` loaded directly, `mmsplice/__init__.py` never executed -- see `pipeline/models/mmsplice/loader.py`) | github.com/gagneurlab/MMSplice_MTSplice | **MIT** | **MIT** | Yes | Confirmed directly against the repo's own `LICENSE` (Jun Cheng, 2018) and the MMSplice paper's own data-availability statement. |
+| TensorFlow | Required, unconditional dependency of `pipeline/models/mmsplice/` (MMSplice's Keras submodels; see `requirements.txt`) -- not a model GEPER trains or loads weights into directly, but a mandatory runtime dependency | github.com/tensorflow/tensorflow | **Apache-2.0** | N/A -- framework, not a trained-weights artifact | Yes | Used indirectly via MMSplice's dependency chain, not invoked by GEPER's own code directly. Added to this audit 2026-08-20 (was previously missing from the table despite being a required dependency). |
 | Enformer | `enformer-pytorch` wrapper (`CONFIG.splicing.ENFORMER_HF_REPO`, default `EleutherAI/enformer-official-rough`, loaded via `enformer_pytorch.from_pretrained` -- `pipeline/models/enformer_plugin.py`) | github.com/lucidrains/enformer-pytorch | **MIT** | **CC BY 4.0** | Yes | **Corrected 2026-08-08** -- see "Full-catalogue re-verification" below: the exact HF repo GEPER downloads from declares `license: cc-by-4.0` in its own frontmatter, not Apache-2.0 (the previous row's Apache-2.0 claim cited Kaggle's separately-hosted `deepmind/enformer` listing, a different distribution channel than the one GEPER's code actually points at). Still fully permissive/commercial-safe; the correction is about which permissive license applies, not a new risk. Enabled by default (`CONFIG.splicing.ENABLE_ENFORMER=true`). |
 | Borzoi | `borzoi-pytorch` wrapper (`CONFIG.splicing.BORZOI_HF_REPO`, default `johahi/borzoi-replicate-0`, `_load_impl` hard-refuses any repo id outside the `johahi/` namespace -- `pipeline/models/borzoi_plugin.py`) | github.com/johahi/borzoi-pytorch | **Apache-2.0** | **CC BY 4.0** | Yes | **Corrected 2026-08-08** -- see "Full-catalogue re-verification" below: both the `johahi/borzoi-pytorch` GitHub `LICENSE` and the `johahi/borzoi-replicate-0` HF frontmatter were fetched directly; neither says MIT (the previous row's MIT claim, cited to the Flashzoi paper's wording, does not match either primary source directly). Still fully permissive/commercial-safe. The code-level guard restricting weight loads to the `johahi/` namespace (never Calico's unlicensed original `.h5` files) is unaffected by this correction and was independently confirmed still in place. |
 | SpliceFormer | Vendored official source (`Code/src/model.py`/`weight_init.py`) + one official pretrained replicate checkpoint (`transformer_encoder_45k_171022_0`), pinned to release tag `v1.0.0` | github.com/benniatli/Spliceformer | **MIT** | **MIT** | Yes | Confirmed directly against the repo's own `LICENSE` (Benedikt Atli Jónsson, 2024). Distinct from the Zenodo archive deposit's separate, archive-level CC-BY-4.0 metadata tag (deposit metadata, not the operative code license). Enabled by default (`CONFIG.splicing.ENABLE_SPLICEFORMER=true`). |
-| SpliceBERT | Official pretrained checkpoint (`SpliceBERT.1024nt`) fetched from the author's own Zenodo archive (DOI 10.5281/zenodo.7995778, `models.tar.gz`) | github.com/biomed-AI/SpliceBERT | **BSD-3-Clause** | **CC-BY-4.0** (confirmed directly via Zenodo's own record API, not inferred from the GitHub repo) | Yes | **Verified 2026-08-08 in response to a specific licensing concern** -- see "SpliceBERT source verification" below. GEPER downloads exclusively from `zenodo.org/record/7995778/...`, the same URL the official repo's own `download.sh` fetches; never touches `huggingface.co/multimolecule/...` (a different, AGPL-3.0-licensed re-hosting under the same model name). `multimolecule` is not a dependency anywhere in `requirements.txt`. Enabled by default (`CONFIG.splicing.ENABLE_SPLICEBERT=true`). |
+| SpliceBERT | Official pretrained checkpoint (`SpliceBERT.1024nt`) fetched from the author's own Zenodo archive (DOI 10.5281/zenodo.7995778, `models.tar.gz`) | github.com/biomed-AI/SpliceBERT | **BSD-3-Clause** | **CC-BY-4.0** (confirmed directly via Zenodo's own record API, not inferred from the GitHub repo) | Yes | **Verified 2026-08-08 in response to a specific licensing concern** -- see "SpliceBERT source verification" below. GEPER downloads exclusively from `zenodo.org/record/7995778/...`, the same URL the official repo's own `download.sh` fetches; never touches `huggingface.co/multimolecule/...` (a different, AGPL-3.0-licensed re-hosting under the same model name). `multimolecule` is not a dependency anywhere in `requirements.txt`. **Disabled by default as of 2026-08-20** (`CONFIG.splicing.ENABLE_SPLICEBERT=false`) due to a known load-timeout failure against `transformers` 5.13.1 (see DATA_PROVENANCE.md); this is a runtime-stability gate, not a licensing concern -- the licensing findings in this row are unaffected. |
 | SPiP | Vendored official, unmodified R source (`SPiPv2.1_main.r`, run as an `Rscript` subprocess) + reference data (trained randomForest model, RefSeq transcript annotation, genome sequence) from the official repo/its linked SourceForge host (`pipeline/models/spip_plugin.py`, `pipeline/models/spip/loader.py`) | github.com/LBGC-CFB/SPiP (mirrored at github.com/raphaelleman/SPiP, same content, primary author's own account) | **MIT** | N/A -- reference data (NCBI RefSeq transcript annotation + hg19/hg38 genome sequence), not a third party's trained model weights; public-domain/unrestricted, same category as the RefSeq/genome-coordinate data every other GEPER stage already reads | Yes | **Added to this audit 2026-08-08 -- was missing from the table entirely, same gap SpliceBERT had before today.** Confirmed directly against `raphaelleman/SPiP`'s own `LICENSE` (raphaelleman, 2020). Enabled by default (`CONFIG.splicing.ENABLE_SPIP=true`); not wired into ensemble/ACMG evaluation, same as SpliceFormer/SpliceBERT. |
 
 ## Models evaluated and explicitly not integrated
@@ -41,8 +87,8 @@ grepped from that code, not inferred from the project's README.
 | Model | Repository | License | Commercial use permitted | Reason not integrated |
 |---|---|---|---|---|
 | OpenSpliceAI | github.com/Kuanhao-Chao/OpenSpliceAI | **GPL-3.0** (code and bundled pretrained models) | **No** (for a proprietary commercial codebase) | Linking GPL-3.0 code/weights into GEPER's proprietary codebase would require distributing the combined work under GPL-3.0. Was registered as a hard-disabled placeholder (`pipeline/models/pending_plugins.py::OpenSpliceAIPlugin`) so it reported **Disabled** in every report rather than silently not existing; that placeholder was removed from the codebase entirely (no longer revisited -- SpliceFormer, SpliceBERT, and MMSplice already cover splice prediction). Listed here for audit-trail completeness only. |
-| DNABERT-2 | github.com/MAGICS-LAB/DNABERT_2 | Apache-2.0 (permissive) | Yes (was) | **Removed from GEPER entirely as part of this change** -- not a licensing rejection. HyenaDNA now serves as the universal default DNA model in its place (see `pipeline/router.py`). Listed here only for audit-trail completeness, since it was present in the codebase before this change. |
-| SpliceAI (Illumina) | github.com/Illumina/SpliceAI | **GPL-3.0** (code) / **CC BY-NC 4.0** (pretrained models, as of Illumina's Dec 2023 relicense) | **No** | Evaluated in an earlier audit (see `PERFORMANCE_REPORT.md` / project memory); both the GPL-3.0 code license and the CC BY-NC 4.0 model license are commercial blockers. Never integrated into GEPER. Not the same project as OpenSpliceAI (a different, GPL-3.0-only reimplementation, above) -- listed separately to avoid conflating the two. |
+| DNABERT-2 | github.com/MAGICS-LAB/DNABERT_2 | Apache-2.0 (permissive) | Yes (was) | **Removed from `geper/` entirely as part of this change** -- not a licensing rejection. HyenaDNA now serves as the universal default DNA model in its place (see `pipeline/router.py`). Listed here only for audit-trail completeness, since it was present in the codebase before this change. **Not removed product-wide**: kim_pipeline (the integrated product) retains and actively uses DNABERT-2 -- see scope note above. |
+| SpliceAI (Illumina) | github.com/Illumina/SpliceAI | **GPL-3.0** (code) / **CC BY-NC 4.0** (pretrained models, as of Illumina's Dec 2023 relicense) | **No** | Evaluated in an earlier audit (see `PERFORMANCE_REPORT.md` / project memory); both the GPL-3.0 code license and the CC BY-NC 4.0 model license are commercial blockers. **Never integrated into `geper/`** -- this row's scope, like the rest of this file, is `geper/` only. **Not the same claim product-wide**: kim_pipeline (the other half of the two-repo product) also removed SpliceAI's VEP-plugin path for the same licence reason (2026-08-22). **Corrected 2026-09-10** -- this row previously said a separate fallback in `kim_pipeline/pipeline/annotation/stage.py` "still parses SpliceAI's own `SpliceAI=`/`DS_AG`/`DS_AL`/`DS_DG`/`DS_DL` delta-score fields directly out of an input VCF's INFO and feeds a live score to PP3/BP4 when the caller has pre-annotated with SpliceAI upstream." That fallback has since been closed: commit `b394bfa` ("close the SpliceAI INPUT, not another route") removed it, and `kim_pipeline/tests/test_spliceai_input_is_closed.py` (9 tests) now asserts on the ACMG classification outcome itself -- a benign SpliceAI score no longer moves PP3/BP4 -- not merely on parsing, so no SpliceAI-derived score can reach an ACMG classification through this path any longer. See `docs/BIJ_AI_CAPABILITY_AUDIT.md`'s combined-scope entry for that half of the product. Not the same project as OpenSpliceAI (a different, GPL-3.0-only reimplementation, above) -- listed separately to avoid conflating the two. |
 
 ## Full-catalogue re-verification (2026-08-08)
 

@@ -1,4 +1,4 @@
-# GEPER v8 — Installation Guide
+# Bij AI sequencing-analysis component v8 — Installation Guide
 
 ## System Requirements
 
@@ -11,7 +11,20 @@
 
 ```bash
 git clone https://github.com/your-org/geper.git
-cd geper_v8
+cd kim_pipeline
+
+# Create and activate a virtual environment before the first `pip install`
+# below. Every `pip install` later in this file -- including
+# `pip install gunicorn` in "Start the API Server" -- must land in this
+# same interpreter, or the gunicorn arbiter can end up with a different
+# dependency set than the app it's serving (a pip-generated console
+# script embeds the absolute path of whichever interpreter ran that
+# install). This file had no existing venv convention, so this is the
+# plain stdlib one.
+python -m venv .venv
+source .venv/bin/activate      # Linux/macOS/WSL2
+# .venv\Scripts\activate       # Windows (PowerShell/cmd), if not using WSL2
+
 pip install -r requirements.txt
 ```
 
@@ -47,7 +60,7 @@ Set in `config/production.yaml`:
 clinvar:
   tsv_gz_path: "/data/clinvar/variant_summary.txt.gz"
 ```
-Without this file, GEPER falls back to live NCBI Entrez REST queries (requires internet, rate-limited to 3 req/s without API key).
+Without this file, the sequencing-analysis component falls back to live NCBI Entrez REST queries (requires internet, rate-limited to 3 req/s without API key).
 
 ### gnomAD (local — optional)
 ```bash
@@ -59,16 +72,17 @@ for CHR in {1..22} X Y; do
        -O /data/gnomad/gnomad.genomes.v4.1.sites.chr${CHR}.vcf.bgz.tbi
 done
 ```
-Without this, GEPER uses the gnomAD GraphQL API (live, requires internet).
+Without this, the sequencing-analysis component uses the gnomAD GraphQL API (live, requires internet).
 
-### OMIM (requires free registration)
-1. Register at https://omim.org/api and obtain API key
-2. Download genemap2.txt from https://data.omim.org/downloads/<api_key>/genemap2.txt
-3. Set in config:
-```yaml
-omim:
-  genemap_path: "/data/omim/genemap2.txt"
-```
+### OMIM (retired 2026-08-20)
+**OMIM has been removed from kim_pipeline effective 2026-08-20 due to licensing restrictions.** OMIM's terms state: "This resource is intended for purely research purposes" and "Commercial use of the resource would require licensing." GEPER's ratified positioning as a commercial product is what conflicts with OMIM's "purely research purposes" terms, independent of whether it interprets, prioritises, or performs any diagnostic function.
+
+- Previous setup (now deprecated): free registration at https://omim.org/api, genemap2.txt download from https://data.omim.org/downloads/
+- Code status: `pipeline/omim/` module and all caller references have been removed from the pipeline
+- Future reinstatement: possible if a commercial license from OMIM is obtained
+- For new deployments: do not attempt to configure OMIM; existing workflows continue without it
+
+See `geper/DATA_SOURCE_LICENSE_AUDIT.md` (OMIM retirement entry) for the full regulatory analysis.
 
 ### RefSeq GFF3 (for transcript-aware RNA analysis)
 ```bash
@@ -93,7 +107,7 @@ vim config/production.yaml
 
 ## PDF Report Generation
 
-GEPER tries WeasyPrint first, then wkhtmltopdf:
+The sequencing-analysis component tries WeasyPrint first, then wkhtmltopdf:
 
 ```bash
 # Option 1: WeasyPrint (recommended)
@@ -108,33 +122,77 @@ sudo apt-get install wkhtmltopdf
 ## Start the API Server
 
 ```bash
-# Development
+# Development (keyless local)
+# The API server requires GEPER_DEV_INSECURE=1 to start without real
+# GEPER_API_KEYS and GEPER_CORS_ORIGINS set (FIX #3 -- it refuses to
+# start with insecure defaults unless this is set explicitly). This is
+# dev-mode only:
+export GEPER_DEV_INSECURE=1
 python main.py serve
 
 # With custom config and port
 python main.py serve --config config/production.yaml --port 8080
 
 # Production (gunicorn + uvicorn workers)
+#
+# REQUIRED first: api/main.py refuses to start without both of these set
+# (FIX #3 -- a dev/test default of no auth + CORS "*" is fine locally,
+# but never in a real deployment):
+#   export GEPER_API_KEYS=key1,key2        # comma-separated, checked against the X-Api-Key header
+#   export GEPER_CORS_ORIGINS=https://your-frontend.example.com
 pip install gunicorn
-gunicorn geper.api.app:create_app -k uvicorn.workers.UvicornWorker \
+gunicorn api.main:app -k uvicorn.workers.UvicornWorker \
   --workers 4 --bind 0.0.0.0:8000
 
 # Docker
 docker build -t geper-v8 .
+
+# The image built above has NO default entrypoint that serves anything: its
+# CMD is a bare interactive shell (see the root Dockerfile's own comment on
+# that line -- it deliberately does not force one of GEPER-standalone /
+# Kim-standalone / the combined bridge as THE entrypoint, since hard-coding
+# one would demote the other two). `docker run` with no command override
+# does not start the API -- it starts (and, with no -it flags, immediately
+# exits) a shell. Override the command explicitly to serve it:
 docker run -p 8000:8000 \
   -v /data:/data \
   -e NCBI_API_KEY=your_key \
-  geper-v8
+  -e GEPER_API_KEYS=key1,key2 \
+  -e GEPER_CORS_ORIGINS=https://your-frontend.example.com \
+  geper-v8 \
+  python kim_pipeline/main.py serve --host 0.0.0.0
+
+# GEPER_API_KEYS/GEPER_CORS_ORIGINS are not optional here -- api/main.py
+# refuses to start without them (FIX #3, same gate as the bare-metal
+# examples above); set GEPER_DEV_INSECURE=1 instead for a throwaway local
+# container only. --host 0.0.0.0 is required on this specific invocation
+# even though `main.py serve` itself now defaults to 127.0.0.1 -- a
+# container must bind every interface to be reachable via -p from outside
+# it; that default is correct for a bare-metal/local run and wrong here.
+#
+# NOT VERIFIED BY ACTUALLY RUNNING THIS CONTAINER -- reasoned from reading
+# the Dockerfile and main.py, not confirmed by execution (this session was
+# not authorised to build or run an image; see clinical/Dockerfile's own
+# commit 1b895b3 for what an actually-started-and-probed verification
+# looks like, for contrast). What IS confirmed by reading rather than
+# assumed: fastapi and uvicorn are installed into this image
+# (kim_pipeline/requirements.txt is pip-installed at Dockerfile:243), and
+# `python <script>` sets sys.path[0] to the script's own directory
+# regardless of the process's cwd (standard CPython behaviour, not
+# specific to this image) -- so `api.main:app` should resolve correctly
+# from WORKDIR /app once main.py runs. If this does not work as written,
+# that gap is real and worth reporting, not a reason to fall back to
+# reading this as a shell.
 ```
 
 ## Run Tests
 
 ```bash
 # All tests
-pytest tests/test_geper_v8.py -v
+pytest tests/ -v
 
 # With coverage report (target >80%)
-pytest tests/test_geper_v8.py -v --cov=geper --cov-report=term-missing
+pytest tests/ -v --cov=geper --cov-report=term-missing
 
 # Via main.py
 python main.py test --coverage

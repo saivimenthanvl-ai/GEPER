@@ -41,14 +41,19 @@ every subsequent variant.
 
 import importlib.util
 import os
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import CONFIG
 from models.base_model import BaseGenomicModel
 from pipeline.models.mmsplice.models import MODEL_FILENAMES, MODULE_NAMES, ModularScores
 from pipeline.models.mmsplice.utils import SeqSplitter, encode_batch
-from utils.auto_install import ensure_pip_package_available, is_pip_package_installed
+from utils.auto_install import (
+    PackageCheckStatus,
+    _auto_install_disabled_for_tests,
+    check_pip_package_availability,
+    ensure_pip_package_available,
+    is_pip_package_installed,
+)
 from utils.exceptions import ModelInferenceError, ModelLoadError
 from utils.logger import get_logger
 
@@ -57,10 +62,16 @@ logger = get_logger(__name__)
 _MMSPLICE_PIP_NAME = "mmsplice"
 # Cache of the --no-deps auto-install outcome, same "cheap check,
 # install-once, cache the outcome" shape as utils/auto_install.py.
+#
+# INVARIANT: this only ever holds the outcome of a REAL install attempt.
+# A check skipped under pytest is not a result and is never written here
+# -- see the guard in `_ensure_mmsplice_package_files_available` -- so a
+# cached False always means "attempted, and it failed", never "we did
+# not look".
 _NO_DEPS_INSTALL_RESULT: Dict[str, bool] = {}
 
 
-def _ensure_mmsplice_package_files_available() -> bool:
+def _ensure_mmsplice_package_files_available() -> PackageCheckStatus:
     """
     Idempotent, automatic setup: installs the `mmsplice` PyPI package
     with `--no-deps` (see module docstring) if it isn't already
@@ -69,9 +80,26 @@ def _ensure_mmsplice_package_files_available() -> bool:
     in this process.
     """
     if is_pip_package_installed(_MMSPLICE_PIP_NAME):
-        return True
+        return PackageCheckStatus.PRESENT
     if _MMSPLICE_PIP_NAME in _NO_DEPS_INSTALL_RESULT:
-        return _NO_DEPS_INSTALL_RESULT[_MMSPLICE_PIP_NAME]
+        # A real attempt already happened this process; its outcome stands.
+        return PackageCheckStatus.PRESENT if _NO_DEPS_INSTALL_RESULT[_MMSPLICE_PIP_NAME] else PackageCheckStatus.ABSENT
+    if _auto_install_disabled_for_tests():
+        # THE SECOND SEAM. `utils/auto_install.py` refuses to spawn a
+        # live `pip install` under pytest -- an unpinned install running
+        # mid-run makes package availability mutable process state, so
+        # outcomes start depending on test order and network reach (see
+        # that guard's docstring for the CI run that proved it). This
+        # install path is separate code and honoured none of that: it
+        # shelled out regardless, and was safe only because both callers
+        # happen to short-circuit first.
+        #
+        # NOT memoised, deliberately: the cache exists solely to avoid
+        # re-running the subprocess, this branch never reaches the
+        # subprocess, so the write would buy nothing -- while a cached
+        # False would be read straight back as a confirmed ABSENT,
+        # reintroducing the conflation inside its own fix.
+        return PackageCheckStatus.NOT_CHECKED
 
     import subprocess
     import sys
@@ -86,17 +114,12 @@ def _ensure_mmsplice_package_files_available() -> bool:
     base_cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", _MMSPLICE_PIP_NAME]
     result = subprocess.run(base_cmd, capture_output=True, text=True)
     if result.returncode != 0 and "externally-managed-environment" in (result.stderr or ""):
-        result = subprocess.run(
-            base_cmd + ["--break-system-packages"], capture_output=True, text=True
-        )
+        result = subprocess.run(base_cmd + ["--break-system-packages"], capture_output=True, text=True)
     ok = result.returncode == 0 and is_pip_package_installed(_MMSPLICE_PIP_NAME)
     if not ok:
-        logger.error(
-            f"Automatic 'mmsplice --no-deps' installation failed: "
-            f"{(result.stderr or '').strip()[-500:]}"
-        )
+        logger.error(f"Automatic 'mmsplice --no-deps' installation failed: {(result.stderr or '').strip()[-500:]}")
     _NO_DEPS_INSTALL_RESULT[_MMSPLICE_PIP_NAME] = ok
-    return ok
+    return PackageCheckStatus.PRESENT if ok else PackageCheckStatus.ABSENT
 
 
 def _resolve_mmsplice_package_dir() -> Optional[str]:
@@ -113,6 +136,38 @@ def _resolve_mmsplice_package_dir() -> Optional[str]:
     if spec is None or not spec.submodule_search_locations:
         return None
     return list(spec.submodule_search_locations)[0]
+
+
+def _mmsplice_model_dir_missing_files(model_dir: str) -> List[str]:
+    """
+    Human-ruled 2026-09-10: `GEPER_MMSPLICE_MODEL_DIR` set is a
+    declaration of intent by an operator who knows their host is
+    air-gapped -- once set, MMSplice must never attempt a pip install,
+    complete or not. This is the completeness check that decision
+    depends on: returns the required files missing from `model_dir`
+    (empty list means complete), checked against the EXACT same
+    `layers.py` + `MODEL_FILENAMES` entries `_load_impl` itself
+    verifies further down (:289-317+) -- kept in lock-step so this can
+    never claim "complete" for a directory `_load_impl` would still
+    reject, and never claim "incomplete" for one it would accept.
+
+    Follows the RNA-FM `_cached_weights_path` precedent (check local
+    first, rather than failing into a local check only after a network
+    attempt already failed): this runs BEFORE
+    `_ensure_mmsplice_package_files_available` is ever called, so a
+    complete MODEL_DIR is used immediately with no pip/network attempt,
+    and an incomplete one fails immediately with an accurate reason
+    instead of a misleading "could not be installed automatically"
+    after a network attempt that could never have succeeded anyway
+    (there is no network on the host this setting exists for).
+    """
+    missing = []
+    if not os.path.isfile(os.path.join(model_dir, "layers.py")):
+        missing.append("layers.py")
+    for filename in MODEL_FILENAMES.values():
+        if not os.path.isfile(os.path.join(model_dir, "models", filename)):
+            missing.append(f"models/{filename}")
+    return missing
 
 
 def _load_module_from_path(module_name: str, file_path: str):
@@ -162,14 +217,43 @@ class MMSpliceModel(BaseGenomicModel):
             return False
         if not ensure_pip_package_available("tensorflow"):
             return False
-        return _ensure_mmsplice_package_files_available()
+        if CONFIG.mmsplice.MODEL_DIR and not _mmsplice_model_dir_missing_files(CONFIG.mmsplice.MODEL_DIR):
+            # REACHABILITY FIX ONLY (human-ruled 2026-09-10) -- see
+            # _load_impl's identical branch for the full comment and
+            # what remains on hold (a set-but-incomplete MODEL_DIR
+            # falls through below, unchanged from before this card).
+            return True
+        return _ensure_mmsplice_package_files_available() is PackageCheckStatus.PRESENT
 
     @classmethod
     def unavailability_reason(cls) -> str:
         if not CONFIG.mmsplice.ENABLED:
             return "disabled via configuration (GEPER_ENABLE_MMSPLICE=false)"
-        if not is_pip_package_installed("tensorflow"):
+        # Was reading `is_pip_package_installed` directly and hardcoding a
+        # reason it cannot support: that function answers "is it importable
+        # right now", never "was an install attempted". Consult the seam.
+        tensorflow = check_pip_package_availability("tensorflow")
+        if tensorflow is PackageCheckStatus.NOT_CHECKED:
+            return "tensorflow availability not checked (auto-install disabled under pytest)"
+        if tensorflow is PackageCheckStatus.ABSENT:
             return "tensorflow could not be installed automatically"
+        # A COMPLETE MODEL_DIR makes is_available() True, so this
+        # method is never reached for that case; a set-but-incomplete
+        # MODEL_DIR is deliberately UNCHANGED from before this card --
+        # HOLD (human-ruled 2026-09-10), see _load_impl's identical
+        # branch for the full context of what is and isn't decided yet.
+        # Read the memo cache DIRECTLY rather than calling the seam. A
+        # function named `unavailability_reason` must not be able to
+        # trigger an install, and the seam's pytest guard is a property
+        # of the ENVIRONMENT, not of this function -- so the first caller
+        # in a new context would inherit the trap. `.get()` returning
+        # None (nobody attempted) is deliberately distinguished from a
+        # cached False (attempted, failed); `if not cached:` would
+        # collapse exactly those two, which is the bug class this whole
+        # type exists to prevent.
+        attempted = _NO_DEPS_INSTALL_RESULT.get(_MMSPLICE_PIP_NAME)
+        if attempted is None:
+            return "mmsplice package-file availability not checked (no install has been attempted)"
         return "mmsplice package files could not be installed automatically (--no-deps)"
 
     def _tf_device(self) -> str:
@@ -191,29 +275,92 @@ class MMSpliceModel(BaseGenomicModel):
 
     def _load_impl(self):
         if not CONFIG.mmsplice.ENABLED:
+            raise ModelLoadError("MMSplice is disabled via configuration (GEPER_ENABLE_MMSPLICE=false).")
+        tensorflow_status = check_pip_package_availability("tensorflow")
+        if tensorflow_status is PackageCheckStatus.NOT_CHECKED:
             raise ModelLoadError(
-                "MMSplice is disabled via configuration (GEPER_ENABLE_MMSPLICE=false)."
+                "MMSplice requires 'tensorflow', whose availability was not "
+                "checked in this environment (auto-install is disabled under "
+                "pytest) -- it is not confirmed missing, it was never looked for."
             )
-        if not ensure_pip_package_available("tensorflow"):
+        if tensorflow_status is PackageCheckStatus.ABSENT:
             raise ModelLoadError("MMSplice requires 'tensorflow', which could not be installed automatically.")
-        if not _ensure_mmsplice_package_files_available():
-            raise ModelLoadError(
-                "MMSplice requires the 'mmsplice' package's bundled model files, which "
-                "could not be installed automatically (pip install mmsplice --no-deps)."
-            )
 
+        # REACHABILITY FIX ONLY (human-ruled 2026-09-10), following the
+        # RNA-FM `_cached_weights_path` precedent (check local first,
+        # rather than failing into a local check only after a network
+        # attempt already failed): a COMPLETE MODEL_DIR is used
+        # directly below, with `_ensure_mmsplice_package_files_available`
+        # (which shells out to `pip install`) never called at all --
+        # closing the defect where the function that actually reads
+        # MODEL_DIR (`_resolve_mmsplice_package_dir`) was unreachable
+        # on this path. See `_mmsplice_model_dir_missing_files`'s own
+        # docstring.
+        #
+        # HOLD, DELIBERATELY NOT BUILT: whether a set-but-INCOMPLETE
+        # MODEL_DIR should instead fail immediately, naming MODEL_DIR
+        # and the missing file(s), is a separate clinical failure-path
+        # decision (silent degradation vs. hard failure vs.
+        # disclose-on-report) this card does not own -- an earlier
+        # version of this fix built that behaviour and it was withdrawn
+        # pending the human's own ruling. Until it lands, a
+        # set-but-incomplete MODEL_DIR falls through to the SAME
+        # branch as an unset one, unchanged: this is a one-branch edit
+        # away from wherever that ruling lands, not a rewrite.
+        model_dir_complete = bool(CONFIG.mmsplice.MODEL_DIR) and not _mmsplice_model_dir_missing_files(
+            CONFIG.mmsplice.MODEL_DIR
+        )
+        if not model_dir_complete:
+            package_files_status = _ensure_mmsplice_package_files_available()
+            if package_files_status is PackageCheckStatus.NOT_CHECKED:
+                raise ModelLoadError(
+                    "MMSplice requires the 'mmsplice' package's bundled model files, whose "
+                    "availability was not checked in this environment (auto-install is "
+                    "disabled under pytest) -- they are not confirmed missing, they were "
+                    "never looked for."
+                )
+            if package_files_status is PackageCheckStatus.ABSENT:
+                raise ModelLoadError(
+                    "MMSplice requires the 'mmsplice' package's bundled model files, which "
+                    "could not be installed automatically (pip install mmsplice --no-deps)."
+                )
+
+        # Round 22: every raise below this point used to embed a local
+        # filesystem path directly into the exception it raises. This
+        # method is called (via `instance.predict(dummy_sequence)`) from
+        # `pipeline/orchestrator.py`'s startup validation loop, whose
+        # `except (ModelLoadError, ModelInferenceError)` branch stores
+        # `str(exc)[:600]` verbatim in `self._model_stage_errors["mmsplice"]`
+        # -- which `pipeline/models/status.py::_mmsplice_status` then
+        # returns as-is as the "reason" for a FAILED MMSplice entry in
+        # `build_ai_model_status()`'s output, which
+        # `report/report_generator.py::_render_ai_model_status` renders
+        # into the "### AI Models" table on EVERY report unconditionally
+        # (that method's own docstring: never allowed to return empty).
+        # Same leak class round 20/21 fixed for SpliceBERT, traced end to
+        # end here rather than assumed. Full detail (including every
+        # path) now goes to `self.logger.warning(..., exc_info=True)`
+        # only; what's raised keeps enough to be actionable (env var
+        # names, bare filenames) without naming this machine's own
+        # directory layout.
         package_dir = _resolve_mmsplice_package_dir()
         if not package_dir or not os.path.isdir(package_dir):
+            self.logger.warning(
+                f"Could not resolve the installed 'mmsplice' package directory (resolved: {package_dir!r})."
+            )
             raise ModelLoadError(
-                f"Could not resolve the installed 'mmsplice' package directory "
-                f"(resolved: {package_dir!r}). Set GEPER_MMSPLICE_MODEL_DIR to a "
-                "directory containing layers.py and a models/ subdirectory with "
-                "Acceptor.h5, Donor.h5, Exon.h5, Intron3.h5, Intron5.h5."
+                "Could not resolve the installed 'mmsplice' package directory. Set "
+                "GEPER_MMSPLICE_MODEL_DIR to a directory containing layers.py and a "
+                "models/ subdirectory with Acceptor.h5, Donor.h5, Exon.h5, Intron3.h5, "
+                "Intron5.h5."
             )
 
         layers_path = os.path.join(package_dir, "layers.py")
         if not os.path.isfile(layers_path):
-            raise ModelLoadError(f"'{layers_path}' not found -- cannot load MMSplice's custom Keras layers.")
+            self.logger.warning(f"'{layers_path}' not found -- cannot load MMSplice's custom Keras layers.")
+            raise ModelLoadError(
+                "MMSplice's custom Keras layers file ('layers.py') was not found in the resolved package directory."
+            )
         layers_module = _load_module_from_path("_geper_mmsplice_layers", layers_path)
 
         from tensorflow.keras.models import load_model  # local import: only needed once loaded
@@ -231,17 +378,19 @@ class MMSpliceModel(BaseGenomicModel):
                 for module_name, filename in MODEL_FILENAMES.items():
                     h5_path = os.path.join(package_dir, "models", filename)
                     if not os.path.isfile(h5_path):
-                        raise ModelLoadError(
+                        self.logger.warning(
                             f"MMSplice weight file '{h5_path}' not found under the "
                             f"resolved package directory '{package_dir}'."
                         )
-                    self._keras_models[module_name] = load_model(
-                        h5_path, compile=False, custom_objects=custom_objects
-                    )
+                        raise ModelLoadError(f"MMSplice weight file '{filename}' not found in the installed package.")
+                    self._keras_models[module_name] = load_model(h5_path, compile=False, custom_objects=custom_objects)
         except ModelLoadError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise ModelLoadError(f"Failed to load one or more MMSplice Keras submodels: {exc}") from exc
+            self.logger.warning(f"Failed to load one or more MMSplice Keras submodels: {exc}", exc_info=True)
+            raise ModelLoadError(
+                "Failed to load one or more MMSplice Keras submodels; see server logs for detail."
+            ) from exc
 
         self.model = self._keras_models  # satisfies BaseGenomicModel._verify_materialized's `is None` check
         self.tokenizer = None
@@ -318,9 +467,7 @@ class MMSpliceModel(BaseGenomicModel):
 
         return ModularScores.from_list([raw_scores[name] for name in MODULE_NAMES])
 
-    def score_modular_batch(
-        self, window_sequences: List[str], overhang: Tuple[int, int]
-    ) -> List[ModularScores]:
+    def score_modular_batch(self, window_sequences: List[str], overhang: Tuple[int, int]) -> List[ModularScores]:
         """
         Batch variant of `score_modular` -- splits every window first,
         then runs each of the five submodels once per batch (one Keras
@@ -339,7 +486,6 @@ class MMSpliceModel(BaseGenomicModel):
             for module_name in MODULE_NAMES:
                 splits_per_module[module_name].append(splits[module_name])
 
-        import numpy as np
         import tensorflow as tf
 
         from pipeline.models.mmsplice.utils import logit as _logit
@@ -358,9 +504,7 @@ class MMSpliceModel(BaseGenomicModel):
 
         results = []
         for i in range(len(window_sequences)):
-            results.append(
-                ModularScores.from_list([per_module_values[name][i] for name in MODULE_NAMES])
-            )
+            results.append(ModularScores.from_list([per_module_values[name][i] for name in MODULE_NAMES]))
         return results
 
     def score_single_module(self, module_name: str, seq: str) -> float:
@@ -383,16 +527,17 @@ class MMSpliceModel(BaseGenomicModel):
         if module_name not in self._keras_models:
             raise ModelInferenceError(f"Unknown MMSplice module '{module_name}'.")
 
-        import numpy as np
         import tensorflow as tf
 
         from pipeline.models.mmsplice.utils import logit as _logit
 
         with tf.device(getattr(self, "_tf_device_str", "/CPU:0")):
             encoded = encode_batch(seqs)
-            values = self._keras_models[module_name].predict(
-                encoded, verbose=0, batch_size=CONFIG.mmsplice.BATCH_SIZE
-            )[:, 0].astype(float)
+            values = (
+                self._keras_models[module_name]
+                .predict(encoded, verbose=0, batch_size=CONFIG.mmsplice.BATCH_SIZE)[:, 0]
+                .astype(float)
+            )
         if module_name in ("acceptor", "donor"):
             values = _logit(values)
         return values.tolist()

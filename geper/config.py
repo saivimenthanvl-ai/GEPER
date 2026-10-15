@@ -8,7 +8,7 @@ touching pipeline logic -- only this file.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Dict, FrozenSet, Tuple
 
 
 def _load_yaml_config_overrides() -> None:
@@ -136,6 +136,55 @@ def _load_yaml_config_overrides() -> None:
 
 
 _load_yaml_config_overrides()
+
+
+# --- Shared splice/regulatory delta-score classification thresholds -------
+# The single source of truth for the three-way
+# no_significant_effect / moderate_effect / large_effect bucketing used by
+# SpliceFormer, SpliceBERT, Enformer/Borzoi and the ensemble.
+#
+# SCALE, STATED BECAUSE THE WRONG NAME WOULD BE BELIEVED: these are on the
+# 0..~1 PROBABILITY-DELTA scale those models' summaries share -- SpliceFormer's
+# "raw acceptor/donor probability delta", SpliceBERT's masked-marginal
+# P(ref)-P(alt) change. They are NOT on MMSplice's delta_logit_psi scale, which
+# lives in MMSpliceConfig below, is an unbounded logit scale, and where 2.0 is
+# the SMALL value. Naming these "delta_logit" was proposed and rejected for
+# exactly that reason: a constant whose name asserts the wrong scale is worse
+# than the bare literal it replaces, because the name gets believed while a
+# literal would at least have been looked up.
+#
+# PROVENANCE -- THESE ARE OURS, NOT A PAPER'S. No published SpliceFormer or
+# SpliceBERT threshold sets 0.1/0.5. They are this repository's own
+# presentational bucketing, adopted from the convention already used for
+# Enformer/Borzoi so every plugin's `classification` field sits on one scale
+# rather than several. Both plugins additionally carry an explicit "NOT a
+# clinically calibrated score" caveat, and that caveat is unchanged by naming
+# these constants. No citation is attached deliberately: attaching a paper to a
+# number the paper never chose would be a fabricated provenance, and it would be
+# believed by exactly the readers least able to check it.
+#
+# WHY SHARED RATHER THAN PER-MODEL: these two numbers previously existed as
+# identical private literals in five files. They agreed only because nobody had
+# edited them. Extracting some but not all would have left the rest holding
+# literals, so a later edit here would silently fail to reach them -- see
+# tests/test_splice_delta_thresholds_shared.py, which changes these values and
+# asserts every call site follows.
+#
+# *** ONE UNREPOINTED MIRROR EXISTS, AND IT IS NAMED HERE BECAUSE IT CANNOT BE
+# NAMED THERE: kaggle_bp7_verification/bp7_kaggle_verification.py:397-398 still
+# holds its own `_NO_EFFECT_THRESHOLD = 0.1` / `_MODERATE_EFFECT_THRESHOLD = 0.5`.
+# IF YOU CHANGE THE VALUES ABOVE, CHANGE THEM THERE TOO. ***
+# That script is a STANDALONE Kaggle GPU notebook export (its own first
+# docstring line) which imports nothing from geper, because it runs where the
+# geper package is not installed -- importing config would break it exactly
+# where it is meant to run. It also cannot carry this warning as a comment of
+# its own: editing it at all pulls it into pre-commit's ruff scope, where its
+# cell-style mid-file imports are pre-existing E402 failures. So the warning
+# lives here, next to the values whose change would invalidate it.
+SPLICE_DELTA_NO_EFFECT_THRESHOLD: float = float(os.environ.get("GEPER_SPLICE_DELTA_NO_EFFECT_THRESHOLD", "0.1"))
+SPLICE_DELTA_MODERATE_EFFECT_THRESHOLD: float = float(
+    os.environ.get("GEPER_SPLICE_DELTA_MODERATE_EFFECT_THRESHOLD", "0.5")
+)
 
 
 @dataclass(frozen=True)
@@ -300,24 +349,33 @@ class AlphaMissenseConfig:
     catalogue -- via the `tabix` CLI, matched by (chrom, pos, ref, alt)
     -- rather than as a loaded neural network. See models/alphamissense.py.
 
-    LICENSING -- read before commercial deployment:
+    LICENSING:
     The AlphaMissense *code* is Apache-2.0. The *predictions catalogue*
-    itself has been distributed under different terms at different
-    times/venues: the current official repository (github.com/
-    google-deepmind/alphamissense, archived 2025-05-16) states the
-    predictions are licensed CC BY 4.0 (attribution only, commercial
-    use permitted). However, the Google Cloud Storage download page,
-    the Ensembl VEP plugin docs, the EBI announcement, and the
-    HuggingFace dataset mirror all instead describe the predictions as
-    "CC BY-NC-SA 4.0 -- non-commercial research use only", and note
-    that use of the GCS-hosted files is additionally subject to the
-    Google Cloud Platform Terms of Service. These sources disagree and
-    this is a genuine, unresolved discrepancy -- GEPER does not know
-    which currently governs the specific file your deployment
-    downloads. Before relying on AlphaMissense output in a commercial
-    product, confirm the license terms that apply to the exact file
-    you download directly with Google DeepMind (alphamissense@google.com)
-    or counsel; do not assume CC BY 4.0 from this comment alone.
+    -- the file this config's HG38_URL/HG19_URL point at -- is CC BY 4.0
+    (attribution required, commercial use permitted). This is confirmed
+    directly from the primary source, not inferred: the GCS bucket's own
+    README.pdf at the exact URL below (`timeCreated` 2024-03-13, the day
+    of DeepMind's public relicense) states verbatim: "Copyright (2023)
+    DeepMind Technologies Limited. All materials are licensed under the
+    Creative Commons Attribution 4.0 International License (CC-BY)."
+    (https://storage.googleapis.com/dm_alphamissense/README.pdf)
+
+    This resolves what used to be flagged here as a genuine discrepancy
+    between sources -- kept explicit rather than silently deleted, since
+    it explains WHY the NC-SA claim keeps resurfacing elsewhere: the
+    Ensembl VEP plugin's current `main` branch agrees (CC BY 4.0), but
+    its old `release/110` tag still reads CC BY-NC-SA 4.0 (predates the
+    relicense), and the unofficial `huggingface.co/datasets/katielink/
+    dm_alphamissense` mirror still reads CC BY-NC-SA 4.0 (never updated
+    after it). GEPER reads none of those three -- only the GCS bucket
+    above, which is unambiguous and dated after the relicense.
+
+    NOTE WHAT THIS DOES NOT SETTLE: confirming CC BY 4.0 governs is a
+    different question from whether its attribution condition is
+    actually TRIGGERED by GEPER's use -- an indexed tabix lookup that
+    extracts one row's score from a ~71M-row catalogue into a clinical
+    report, not a redistribution of the catalogue itself. That question
+    remains open and is not resolved by this comment.
     """
 
     ENABLED: bool = os.environ.get("GEPER_ENABLE_ALPHAMISSENSE", "true").strip().lower() not in (
@@ -949,11 +1007,44 @@ class ClinGenConfig:
     CACHE_DISK_PATH: str = os.environ.get("GEPER_CLINGEN_CACHE_DISK_PATH", "")
     MAX_CONCURRENT: int = int(os.environ.get("GEPER_CLINGEN_MAX_CONCURRENT", "8"))
 
-    # ACMG-integration thresholds (requirement #5). Kept configurable
-    # rather than hard-coded, matching every other ACMG threshold in
-    # this codebase (e.g. CONFIG.gnomad.BA1_AF_THRESHOLD).
-    DOSAGE_SUFFICIENT_EVIDENCE_SCORE: int = int(os.environ.get("GEPER_CLINGEN_DOSAGE_SUFFICIENT_SCORE", "3"))
-    DOSAGE_UNLIKELY_SCORE: int = int(os.environ.get("GEPER_CLINGEN_DOSAGE_UNLIKELY_SCORE", "40"))
+    # ACMG-integration constants. Every other ACMG knob in this
+    # codebase is deployer-tunable; this one deliberately is not,
+    # because it is not a threshold -- it is a whitelist of coded
+    # values.
+    #
+    # ClinGen's haploinsufficiency Score column is not one ordinal
+    # range: 0-3 are graded evidence levels, while 30 ("gene associated
+    # with autosomal recessive phenotype") and 40 ("dosage sensitivity
+    # unlikely") are special codes. A threshold is therefore not merely
+    # a poor fit here, it is unsound -- `30 >= 3` and `40 >= 3` are
+    # both True, so any `>=` reads the two codes that argue AGAINST
+    # haploinsufficiency as the strongest evidence FOR it.
+    #
+    # These were environment-overridable, justified in the README as
+    # "matching every other ACMG threshold in this codebase". That is a
+    # false analogy, and it is worth naming because it is what licensed
+    # the inequality: every other ACMG threshold here (CADD, REVEL,
+    # pLI, LOEUF, oe_mis) is a CONTINUOUS score, where a tunable
+    # cut-point is genuinely meaningful. This is a coded, non-ordinal
+    # scale, where it is not -- set the cut-point to 30 and you admit
+    # the recessive code, set it to 40 and you admit both. There is no
+    # value a deployer could correctly choose that {3} does not already
+    # express, so the override is removed rather than retuned.
+    #
+    # Whitelist what qualifies; never blacklist the special codes. A
+    # blacklist passes every test we can write today and breaks the
+    # first time ClinGen adds a code. That is not hypothetical: the
+    # comparison this replaced excluded 40 by name and never excluded
+    # 30, so it caught the code its author thought of and missed the
+    # one they did not.
+    DOSAGE_SUFFICIENT_EVIDENCE_SCORES: FrozenSet[int] = frozenset({3})
+
+    # The two special codes, named so they can be recognised rather
+    # than compared against. Not tunable for the same reason: they
+    # identify ClinGen codes, and a deployment has no more business
+    # renumbering them than renaming the scale.
+    DOSAGE_UNLIKELY_SCORE: int = 40
+    DOSAGE_AUTOSOMAL_RECESSIVE_SCORE: int = 30
 
     # -- self-provisioning local dataset (see pipeline/clingen/bootstrap.py) --
     #
@@ -2052,7 +2143,65 @@ class HealthCheckConfig:
     # a real query. Run in parallel across services (see
     # `service_health.run_startup_checks`), so total startup overhead is
     # bounded by this single timeout, not the sum of all services.
+    # This is the FAST-PATH budget only: it decides how quickly a healthy
+    # service is confirmed, and it no longer decides on its own whether a
+    # service is latched offline -- see PROBE_ATTEMPTS and
+    # LATCH_CONFIRM_TIMEOUT_SECS below.
     TIMEOUT_SECS: float = float(os.environ.get("GEPER_HEALTH_CHECK_TIMEOUT", "4.0"))
+
+    # How many probe attempts must fail before a service is latched
+    # offline for the whole run. `utils/service_health.py` treats an
+    # offline verdict as CONFIRMED and clients then skip their own retry
+    # loops entirely (see that module's docstring), so that verdict has to
+    # rest on more than one sample: a single unlucky request is exactly
+    # what a one-shot probe cannot distinguish from a real outage.
+    # Observed real Ensembl startup probes have ranged 1290-21931 ms, so
+    # jitter at this scale is normal, not exceptional.
+    # Only a network-level failure is retried; a 5xx is a real answer from
+    # a live host and is never retried (see `_http_probe`).
+    PROBE_ATTEMPTS: int = int(os.environ.get("GEPER_HEALTH_CHECK_ATTEMPTS", "3"))
+
+    # Pause between those attempts, so a brief blip is not sampled three
+    # times inside the same instant.
+    PROBE_BACKOFF_SECS: float = float(os.environ.get("GEPER_HEALTH_CHECK_BACKOFF", "0.5"))
+
+    # -- bounded re-probe after a latch (card health-probe-bounded-reprobe) --
+    #
+    # A latch is a whole-run verdict, so a service that comes back up
+    # stays skipped for the rest of the run unless something re-checks
+    # it. These three bound that re-check: it fires when EITHER enough
+    # skips have accumulated OR enough time has passed since the last
+    # attempt, and never more than MAX_ATTEMPTS times per service per
+    # run.
+    #
+    # UNLIKE the ClinGen dosage constants, these are genuinely
+    # deployer-tunable: they are counts and seconds on continuous
+    # scales, where moving the boundary is a real trade-off between
+    # recovery latency and probe traffic, not a category error.
+    #
+    # THE DEFAULTS ARE REASONED, NOT MEASURED, AND THAT IS RECORDED
+    # RATHER THAN HIDDEN. No recovery has ever been observed in the
+    # logs, because nothing re-probed until this feature existed -- the
+    # data that would size these can only be produced by the feature
+    # they size. 20 skips is roughly one re-probe per 20 variants on a
+    # skipping service; 120s is short enough to recover inside a
+    # typical run and long enough that a hard-down service is not
+    # polled tightly; 3 attempts bounds worst-case added probe traffic
+    # to 3 x TIMEOUT_SECS per service per run. Revisit once
+    # `measure_latched_services()` has produced real recovery samples.
+    REPROBE_AFTER_SKIPS: int = int(os.environ.get("GEPER_HEALTH_REPROBE_AFTER_SKIPS", "20"))
+    REPROBE_AFTER_SECS: float = float(os.environ.get("GEPER_HEALTH_REPROBE_AFTER_SECS", "120"))
+    REPROBE_MAX_ATTEMPTS: int = int(os.environ.get("GEPER_HEALTH_REPROBE_MAX_ATTEMPTS", "3"))
+
+    # Timeout for the FINAL attempt only -- the one that actually decides
+    # to latch. Set to a full client budget (matching the 30s
+    # REQUEST_TIMEOUT_SECS referenced above) on purpose: it is not
+    # defensible for the probe to declare a service dead after 4s when a
+    # real client would happily have waited 30s for the same host. Earlier
+    # attempts keep the short TIMEOUT_SECS above, so a healthy service is
+    # still confirmed fast and only a failing one pays this cost -- once
+    # per run, in parallel across services.
+    LATCH_CONFIRM_TIMEOUT_SECS: float = float(os.environ.get("GEPER_HEALTH_CHECK_CONFIRM_TIMEOUT", "30.0"))
 
 
 @dataclass(frozen=True)
@@ -2464,7 +2613,7 @@ class SplicingConfig:
         "no",
         "off",
     )
-    ENABLE_SPLICEBERT: bool = os.environ.get("GEPER_ENABLE_SPLICEBERT", "true").strip().lower() not in (
+    ENABLE_SPLICEBERT: bool = os.environ.get("GEPER_ENABLE_SPLICEBERT", "false").strip().lower() not in (
         "0",
         "false",
         "no",
@@ -2605,6 +2754,20 @@ class GeperConfig:
 
     OUTPUT_DIR: str = os.environ.get("GEPER_OUTPUT_DIR", "./geper_output")
     CACHE_DIR: str = os.environ.get("GEPER_CACHE_DIR", "./model_cache")
+
+    # Stream every loaded model's weight bytes and check them against the
+    # sha256 its cache filename declares (`pipeline/provenance.py::
+    # verify_loaded_model_artifacts`). OFF by default because the cost is
+    # measured, not guessed: ~3.9s per 2.6GB model per run. Every run records
+    # the free declared hash regardless; this only decides whether the bytes
+    # are actually read to confirm it. Turn it on when the question is "were
+    # these the right weights", not "which weights did we mean to use".
+    VERIFY_MODEL_ARTIFACT_HASHES: bool = os.environ.get("GEPER_VERIFY_MODEL_HASHES", "false").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
     # How often (in variants) the orchestrator flushes geper_results.json
     # to disk mid-run. Small enough to survive a Colab disconnect without

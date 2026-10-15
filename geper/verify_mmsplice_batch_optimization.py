@@ -1,3 +1,25 @@
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: Before/after benchmark for the MMSplice execution-speed optimization
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 Before/after benchmark for the MMSplice execution-speed optimization
 (orchestrator now calls the existing `MMSpliceService.predict_batch()`
@@ -107,7 +129,9 @@ def run_after(n: int) -> float:
 if __name__ == "__main__":
     before_s = run_before(N_VARIANTS)
     after_s = run_after(N_VARIANTS)
-    print(f"MMSplice scoring stage, {N_VARIANTS} variants (simulated {PER_CALL_OVERHEAD_SECONDS * 1000:.0f}ms/Keras-call dispatch overhead):")
+    print(
+        f"MMSplice scoring stage, {N_VARIANTS} variants (simulated {PER_CALL_OVERHEAD_SECONDS * 1000:.0f}ms/Keras-call dispatch overhead):"
+    )
     print(f"  BEFORE (predict() x {N_VARIANTS}, unbatched):      {before_s:.2f}s")
     print(f"  AFTER  (predict_batch() x 1):               {after_s:.2f}s")
     print(f"  Speedup on MMSplice's Keras-call dispatch cost: {before_s / after_s:.1f}x")

@@ -22,6 +22,21 @@ from pipeline.models.borzoi_plugin import (
 from pipeline.models.manager import ModelManager, PluginUnavailableError
 from pipeline.models.registry import ModelRegistry
 from utils.exceptions import ModelLoadError
+from utils.auto_install import PackageCheckStatus
+
+try:
+    import borzoi_pytorch  # noqa: F401
+
+    _HAS_BORZOI_PYTORCH = True
+except ImportError:
+    _HAS_BORZOI_PYTORCH = False
+
+_BORZOI_SKIP_REASON = (
+    "borzoi-pytorch is not installed in this environment -- Borzoi is an "
+    "optional, config-gated integration (CONFIG.splicing.ENABLE_BORZOI; see "
+    "requirements.txt's own header comment for the rationale), not a broken "
+    "environment."
+)
 
 
 class _FakeBorzoiModel:
@@ -144,10 +159,30 @@ class TestBorzoiLoadImpl(unittest.TestCase):
         self.instance._weight_cache = mock.Mock()
         self.instance._weight_cache.ensure_dir.return_value = "/tmp/fake_borzoi_cache"
 
+    @unittest.skipUnless(_HAS_BORZOI_PYTORCH, _BORZOI_SKIP_REASON)
     def test_successful_load_calls_to_and_eval(self):
+        # RESTORED 2026-09-02: deleted 2026-08-31 as decorative because
+        # it patched check_pip_package_availability to a value equal to
+        # what the real call returns IN THIS SANDBOX, where
+        # borzoi-pytorch is genuinely installed. That equality is not a
+        # property of the test -- it is a property of one environment.
+        # This whole class is skipUnless(_HAS_BORZOI_PYTORCH)-gated, so
+        # it CANNOT run on CI (borzoi-pytorch absent there) and CI's
+        # silence about it is not a verdict on the mock: a test that
+        # cannot execute cannot prove its mock decorative. The mock is
+        # load-bearing in any environment where this test actually DOES
+        # run -- a developer machine with borzoi-pytorch installed, or
+        # a future CI image that installs it -- because
+        # check_pip_package_availability's own pytest-disabled-auto-
+        # install branch (see auto_install.py) makes its return value
+        # environment-dependent, not a constant. Its removal was proven
+        # safe only by observing one such environment, not by reasoning
+        # about the function.
         fake_model = _FakeBorzoiModel(value=1.0)
         with (
-            mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
             mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_model),
         ):
             self.instance._load_impl()
@@ -156,9 +191,16 @@ class TestBorzoiLoadImpl(unittest.TestCase):
         self.assertEqual(fake_model.to_calls, ["cpu"])
         self.assertTrue(fake_model.eval_called)
 
+    @unittest.skipUnless(_HAS_BORZOI_PYTORCH, _BORZOI_SKIP_REASON)
     def test_network_failure_is_sanitized(self):
+        # RESTORED 2026-09-02: same reasoning as
+        # test_successful_load_calls_to_and_eval above -- decorative
+        # only in this sandbox, load-bearing in any environment where
+        # this skipUnless-gated test actually runs.
         with (
-            mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
             mock.patch(
                 "borzoi_pytorch.Borzoi.from_pretrained",
                 side_effect=ConnectionError("could not reach huggingface.co"),
@@ -170,7 +212,9 @@ class TestBorzoiLoadImpl(unittest.TestCase):
         self.assertNotIn("huggingface.co", str(ctx.exception))
 
     def test_missing_package_raises_clear_error(self):
-        with mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=False):
+        with mock.patch(
+            "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.ABSENT
+        ):
             with self.assertRaises(RuntimeError) as ctx:
                 self.instance._load_impl()
         self.assertIn("borzoi-pytorch", str(ctx.exception))
@@ -183,12 +227,16 @@ class TestBorzoiLoadImpl(unittest.TestCase):
         self.assertIn("johahi", str(ctx.exception))
         self.assertIn("calico/borzoi-original-weights", str(ctx.exception))
 
+    @unittest.skipUnless(_HAS_BORZOI_PYTORCH, _BORZOI_SKIP_REASON)
     def test_license_guard_allows_johahi_repo(self):
         fake_model = _FakeBorzoiModel(value=1.0)
         with mock.patch("pipeline.models.borzoi_plugin.CONFIG") as mock_config:
             mock_config.splicing.BORZOI_HF_REPO = "johahi/borzoi-replicate-2"
             with (
-                mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
+                mock.patch(
+                    "pipeline.models.borzoi_plugin.check_pip_package_availability",
+                    return_value=PackageCheckStatus.PRESENT,
+                ),
                 mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_model),
             ):
                 self.instance._load_impl()
@@ -199,6 +247,148 @@ class TestBorzoiLoadImpl(unittest.TestCase):
             mock_config.splicing.BORZOI_HF_REPO = "some/other-repo"
             with self.assertRaises(ModelLoadError):
                 self.instance.load()
+
+
+@unittest.skipUnless(_HAS_BORZOI_PYTORCH, _BORZOI_SKIP_REASON)
+class TestBorzoiAllTiedWeightsKeysShim(unittest.TestCase):
+    """
+    Regression test for the upstream compatibility bug confirmed live
+    in a real Colab GPU run (2026-08-17, transformers>=5 installed):
+    `borzoi_pytorch.Borzoi` subclasses `transformers.PreTrainedModel`
+    but never calls `self.post_init()`, so
+    `PreTrainedModel.from_pretrained`'s `_finalize_model_loading` ->
+    `_move_missing_keys_from_meta_to_device` unconditionally reads
+    `self.all_tied_weights_keys.keys()`, which Borzoi never has set --
+    raising `AttributeError: 'Borzoi' object has no attribute
+    'all_tied_weights_keys'` before any real weight loads. Same class
+    of bug `pipeline/models/enformer_plugin.py` already shims for
+    Enformer (see that file's `_load_impl` for the full upstream
+    explanation) -- `BorzoiPlugin._load_impl` now applies the
+    identical fix.
+
+    This sandbox's own installed `transformers` predates the version
+    that actually enforces this attribute at load time (confirmed
+    below), so the original crash cannot be reproduced end-to-end here
+    via a real `from_pretrained()` call -- there is also no network
+    access to huggingface.co in this environment either way. Instead,
+    this proves the shim's mechanics directly against the REAL
+    `borzoi_pytorch.Borzoi` class (not a fake/mock class), since that
+    real-class behavior is what silently regresses if this code is
+    ever "cleaned up" by someone who doesn't know why it's there.
+    """
+
+    def setUp(self):
+        import borzoi_pytorch
+
+        self.Borzoi = borzoi_pytorch.Borzoi
+        # Undo the shim if an earlier test in this process already
+        # applied it (BorzoiPlugin._load_impl mutates the class
+        # itself, not an instance -- see the shim's own comment for
+        # why), so each test here starts from the same "unshimmed"
+        # state a fresh process would.
+        if "all_tied_weights_keys" in vars(self.Borzoi):
+            del self.Borzoi.all_tied_weights_keys
+
+    def tearDown(self):
+        # Leave the real, shared borzoi_pytorch.Borzoi class clean for
+        # any other test module that imports it in the same process.
+        if "all_tied_weights_keys" in vars(self.Borzoi):
+            del self.Borzoi.all_tied_weights_keys
+        if "_tied_weights_keys" in vars(self.Borzoi) and self.Borzoi._tied_weights_keys == {
+            "decoder.weight": "encoder.weight"
+        }:
+            del self.Borzoi._tied_weights_keys
+
+    def _make_instance(self):
+        instance = BorzoiPlugin.__new__(BorzoiPlugin)
+        instance.logger = mock.Mock()
+        instance.device = "cpu"
+        instance._loaded = False
+        instance.model = None
+        instance._weight_cache = mock.Mock()
+        instance._weight_cache.ensure_dir.return_value = "/tmp/fake_borzoi_cache"
+        return instance
+
+    def test_real_borzoi_class_lacks_the_attribute_before_the_shim(self):
+        # Confirms the bug's precondition against the REAL upstream
+        # class, not an assumption: this is exactly what
+        # `_finalize_model_loading` reads and what was missing in the
+        # live Colab crash.
+        self.assertFalse(hasattr(self.Borzoi, "all_tied_weights_keys"))
+
+    def test_load_impl_shim_sets_the_attribute_on_the_real_class(self):
+        # RESTORED 2026-09-02: same reasoning as
+        # TestBorzoiLoadImpl.test_successful_load_calls_to_and_eval --
+        # this whole class is skipUnless(_HAS_BORZOI_PYTORCH)-gated, so
+        # it cannot run on CI and CI's silence is not a verdict on this
+        # mock. Load-bearing in any environment where the class
+        # actually executes.
+        instance = self._make_instance()
+        fake_model = _FakeBorzoiModel(value=1.0)
+        with (
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
+            mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_model),
+        ):
+            instance._load_impl()
+
+        # The exact attribute access that crashed in the live traceback
+        # (`self.all_tied_weights_keys.keys()`) now succeeds on the
+        # real class.
+        self.assertTrue(hasattr(self.Borzoi, "all_tied_weights_keys"))
+        self.assertEqual(dict(self.Borzoi.all_tied_weights_keys), {})
+
+    def test_shim_does_not_override_a_real_tied_weights_keys(self):
+        # If a future borzoi_pytorch release ever DOES set a real,
+        # non-empty _tied_weights_keys, the shim must use that value,
+        # not silently clobber it with an empty dict -- exactly what
+        # `getattr(Borzoi, "_tied_weights_keys", None) or {}` already
+        # guarantees; pinned here so that behavior can't regress.
+        #
+        # RESTORED 2026-09-02: same class-level-skip reasoning as above.
+        self.Borzoi._tied_weights_keys = {"decoder.weight": "encoder.weight"}
+        instance = self._make_instance()
+        fake_model = _FakeBorzoiModel(value=1.0)
+        with (
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
+            mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=fake_model),
+        ):
+            instance._load_impl()
+        self.assertEqual(self.Borzoi.all_tied_weights_keys, {"decoder.weight": "encoder.weight"})
+
+    def test_shim_is_idempotent_across_repeated_loads(self):
+        # BorzoiPlugin.__new__ bypasses the singleton ModelCache a real
+        # run would use, so this exercises what a second _load_impl()
+        # call (e.g. a second BorzoiPlugin instance in the same
+        # process) sees: the class attribute already set, and the
+        # `if not hasattr(...)` guard leaving it untouched rather than
+        # resetting it.
+        #
+        # RESTORED 2026-09-02 (both mocks below): same class-level-skip
+        # reasoning as this class's other restored sites.
+        instance1 = self._make_instance()
+        with (
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
+            mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=_FakeBorzoiModel(value=1.0)),
+        ):
+            instance1._load_impl()
+        first_value = self.Borzoi.all_tied_weights_keys
+
+        instance2 = self._make_instance()
+        with (
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability", return_value=PackageCheckStatus.PRESENT
+            ),
+            mock.patch("borzoi_pytorch.Borzoi.from_pretrained", return_value=_FakeBorzoiModel(value=2.0)),
+        ):
+            instance2._load_impl()
+
+        self.assertIs(self.Borzoi.all_tied_weights_keys, first_value)
 
 
 class TestBorzoiMetadataAndAvailability(unittest.TestCase):
@@ -225,9 +415,85 @@ class TestBorzoiMetadataAndAvailability(unittest.TestCase):
             self.assertIn("ENABLE_BORZOI", BorzoiPlugin.unavailability_reason())
 
     def test_available_when_flag_on_and_package_installed(self):
-        with mock.patch("pipeline.models.borzoi_plugin.CONFIG") as mock_config:
+        # RESTORED 2026-09-02: CI evidence, not the removal sweep's
+        # per-package model, is why this mock is back. This exact test
+        # FAILED in CI after the 2026-08-31 deletion below --
+        # `AssertionError: False is not true` -- because CI has no
+        # warm cache: borzoi-pytorch is not pinned in requirements.txt
+        # (deliberate omission, see that file), so on a fresh checkout
+        # ensure_pip_package_available("borzoi-pytorch", ...) genuinely
+        # returns False there, where this sandbox's cached install made
+        # it return True. The mock is required in an environment where
+        # the package is absent, and its removal was proven safe only
+        # against a warm cache CI does not have.
+        #
+        # AMENDMENT 2026-09-02, REVISED SAME DAY: this is the ONLY test
+        # in this file that is not gated on _HAS_BORZOI_PYTORCH. Its
+        # structurally similar siblings -- TestBorzoiLoadImpl's
+        # test_successful_load_calls_to_and_eval,
+        # test_network_failure_is_sanitized, test_license_guard_allows_
+        # johahi_repo, and every test in TestBorzoiAllTiedWeightsKeysShim
+        # -- are skipUnless-gated on the same flag. skipUnless is
+        # resolved at import time against the real import, not by
+        # anything a mock can reach, so those six SKIP on CI (where
+        # borzoi-pytorch is absent) regardless of what mocks they carry;
+        # CI's silence about them is not a verdict on their mocks, only
+        # on whether they ran. THIS earlier amendment originally said
+        # those six "carry no mocks" -- that was true of five of them
+        # (test_license_guard_allows_johahi_repo always kept its own)
+        # at the moment this was written, but is no longer true: this
+        # same commit restores check_pip_package_availability in
+        # test_successful_load_calls_to_and_eval,
+        # test_network_failure_is_sanitized, and all three
+        # TestBorzoiAllTiedWeightsKeysShim tests, on the reasoning that
+        # a mock decorative in one environment (this sandbox, where
+        # borzoi-pytorch is installed) can be load-bearing in another
+        # (a developer machine or future CI image running the same
+        # gated tests) -- CI's inability to observe them is not proof
+        # they were safe to remove. What remains true and does not need
+        # revising: this test is still the only one in the file that
+        # ALWAYS executes regardless of borzoi-pytorch's presence, so it
+        # is still the only one whose mock CI itself can verify. Whether
+        # an ungated test naming an "installed" precondition should
+        # instead be gated like its siblings remains an open question
+        # under separate investigation -- not resolved here.
+        with (
+            mock.patch("pipeline.models.borzoi_plugin.CONFIG") as mock_config,
+            mock.patch("pipeline.models.borzoi_plugin.ensure_pip_package_available", return_value=True),
+        ):
             mock_config.splicing.ENABLE_BORZOI = True
-            self.assertTrue(BorzoiPlugin.is_available())  # borzoi_pytorch really is installed
+            self.assertTrue(BorzoiPlugin.is_available())
+
+    def test_unavailability_reason_under_absent_does_not_claim_no_attempt(self):
+        """The dangerous case (Commit 2): once a real install attempt has
+        happened and failed (ABSENT), the reason text must not say
+        installation "has not been attempted" -- that specific false
+        claim, made under the opposite state, is the defect this
+        migration exists to close. See design v2 section 6."""
+        with (
+            mock.patch("pipeline.models.borzoi_plugin.CONFIG") as mock_config,
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.ABSENT,
+            ),
+        ):
+            mock_config.splicing.ENABLE_BORZOI = True
+            reason = BorzoiPlugin.unavailability_reason()
+        self.assertIn("borzoi-pytorch", reason)
+        self.assertNotIn("has not been attempted", reason)
+
+    def test_unavailability_reason_under_not_checked_says_not_checked(self):
+        with (
+            mock.patch("pipeline.models.borzoi_plugin.CONFIG") as mock_config,
+            mock.patch(
+                "pipeline.models.borzoi_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.NOT_CHECKED,
+            ),
+        ):
+            mock_config.splicing.ENABLE_BORZOI = True
+            reason = BorzoiPlugin.unavailability_reason()
+        self.assertIn("borzoi-pytorch", reason)
+        self.assertIn("not checked", reason)
 
 
 class TestBorzoiThroughModelManager(unittest.TestCase):

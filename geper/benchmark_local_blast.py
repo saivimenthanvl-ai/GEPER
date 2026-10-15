@@ -1,3 +1,25 @@
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: Local BLAST+ vs remote NCBI BLAST performance benchmark
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 Local BLAST+ vs remote NCBI BLAST performance benchmark.
 
@@ -53,8 +75,10 @@ _TEST_SEQUENCES = [
 
 def main() -> int:
     if not all(shutil.which(t) for t in ("blastn", "makeblastdb")):
-        print("blastn/makeblastdb not found on PATH -- install NCBI BLAST+ "
-              "(see verify_environment.py) to run this benchmark.")
+        print(
+            "blastn/makeblastdb not found on PATH -- install NCBI BLAST+ "
+            "(see verify_environment.py) to run this benchmark."
+        )
         return 1
 
     from database.blast_client import BLASTClient, ensure_local_blast_db
@@ -93,16 +117,20 @@ def main() -> int:
             local_results.append(client.search(seq))
         local_elapsed = time.perf_counter() - local_start
         total_hits = sum(r.get("hit_count", 0) for r in local_results)
-        print(f"  {len(_TEST_SEQUENCES)} sequences searched in {local_elapsed:.3f}s total "
-              f"({local_elapsed / len(_TEST_SEQUENCES) * 1000:.1f}ms/sequence average).")
+        print(
+            f"  {len(_TEST_SEQUENCES)} sequences searched in {local_elapsed:.3f}s total "
+            f"({local_elapsed / len(_TEST_SEQUENCES) * 1000:.1f}ms/sequence average)."
+        )
         print(f"  Total hits found: {total_hits} (real blastn output, not simulated).\n")
 
         simulated_remote_elapsed = len(_TEST_SEQUENCES) * _CONSERVATIVE_REMOTE_LATENCY_SECS
         print("=" * 78)
         print("SIMULATED remote NCBI BLAST (conservative published queue latency)")
         print("=" * 78)
-        print(f"  {len(_TEST_SEQUENCES)} sequences x {_CONSERVATIVE_REMOTE_LATENCY_SECS:.1f}s/submission "
-              f"(serial, no local batching) = {simulated_remote_elapsed:.1f}s.")
+        print(
+            f"  {len(_TEST_SEQUENCES)} sequences x {_CONSERVATIVE_REMOTE_LATENCY_SECS:.1f}s/submission "
+            f"(serial, no local batching) = {simulated_remote_elapsed:.1f}s."
+        )
         print("  (This is the conservative low end; real remote runs are commonly")
         print("   30s-several minutes per submission, so the real-world gap is larger.)\n")
 

@@ -65,22 +65,94 @@ WHAT THIS DOES NOT DO
   GEPER pipeline dependency at import time beyond `pydantic` (already
   a GEPER requirement -- see `pipeline/stage_schemas.py`, the same
   validation-at-a-boundary pattern this module follows).
+- Does not carry three fields that exist in `geper_results.json` and
+  reach every other renderer -- run-level QC metrics, patient consent,
+  and per-variant `clinical_report` limitations -- by design, not
+  oversight: see `LIMS_EXPORT_MAPPING.md`'s "Documented design
+  boundaries" section for the rationale and the per-field nuances
+  (consent's regulatory caveat; why per-variant limitations is the
+  mildest of the three).
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
+from pipeline.stage_schemas import StageStatus as _StageStatus
+from pipeline.vcf_parser import VAF_NO_SAMPLE_COLUMNS_REASON
+from report.clinical_report_builder import (
+    VAF_FIELD_NOT_CAPTURED_REASON,
+    _variant_allele_fraction_found,
+    _variant_allele_fraction_states,
+    candidate_interpretation_of,
+)
 from report.summary import _derive_run_id, _derive_sample_id
+from review.signoff import require_reviewed as _require_reviewed_general
+from utils.exceptions import LIMSExportBlockedError, SignoffError
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 EXPORT_FORMAT_VERSION = "1.0.0"
+
+# Same filename `review/signoff.py::AUDIT_LOG_FILENAME` already uses --
+# a blocked-export attempt is a governance event exactly like
+# approve()/override(), and reusing the filename means both land in one
+# combined audit trail whenever the LIMS export directory is the run's
+# own --output-dir (the common case: exporting straight from a
+# completed run's directory).
+_AUDIT_LOG_FILENAME = "geper_signoff_audit.log"
+
+
+def _append_export_audit_log(directory: str, entry: Dict[str, Any]) -> None:
+    """Append one JSON-Lines record to `directory`'s audit log. Mirrors `review/signoff.py::_append_audit_log`'s shape (append-only, never truncates)."""
+    log_path = os.path.join(directory or ".", _AUDIT_LOG_FILENAME)
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def _require_reviewed(document: Dict[str, Any]) -> None:
+    """
+    Governance gate (round 30 part 2): refuses to build a LIMS export
+    unless `document["review_status"] == "reviewed"` (see
+    `report/json_builder.py`/`review/signoff.py`). A LIMS is an
+    automated downstream consumer -- nobody opens the PDF a human
+    clinician would see the DRAFT/OVERRIDDEN status on before this
+    data reaches a hospital's own system, so this must be a hard,
+    loud failure here, not a silent pass-through.
+
+    `"overridden"` is deliberately NOT treated as good enough --
+    export requires review_status to be EXACTLY `"reviewed"`, so a run
+    a clinician has changed since it was last (or ever) approved stays
+    blocked until a fresh `review/signoff.py::approve()` call. See
+    `override()`'s docstring in that module for why this is the
+    correct, intended re-block, not an oversight.
+
+    Delegates to `review/signoff.py::require_reviewed` (2026-08-22) --
+    the general form of this exact check, extracted so any future
+    automated consumer besides this one has it too. Catches that
+    function's `SignoffError` and re-raises `LIMSExportBlockedError`
+    with the same message, preserving this module's existing public
+    exception contract (`tests/test_export_lims.py` and
+    `tests/test_review_status_governance.py` both catch
+    `LIMSExportBlockedError` specifically).
+
+    Raises `LIMSExportBlockedError` (never returns a value) -- callers
+    with a directory to log to should catch this, write an audit entry
+    via `_append_export_audit_log`, then re-raise (see
+    `export_lims_json`/`export_lims_csv` below), so a blocked attempt
+    is never silently swallowed.
+    """
+    try:
+        _require_reviewed_general(document, consumer="LIMS export")
+    except SignoffError as exc:
+        raise LIMSExportBlockedError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +178,20 @@ class LIMSVariant(BaseModel):
     coding_hgvs: Optional[str] = None  # HGVS.c -- only when a transcript resolved for this variant
     protein_hgvs: Optional[str] = None  # HGVS.p -- see docstring on _protein_hgvs() below for the honest gap here
     protein_hgvs_source: Optional[str] = None  # "alphamissense_catalogue" | None -- see _protein_hgvs()
+    # Within-sample allele fraction (NABL 112A s.7.8.5(b)(iii)). NOT the
+    # gnomAD population allele frequency, which this export already
+    # carries separately as `evidence.gnomad_global_af` -- different
+    # quantity, same name. See `_variant_allele_fraction()` below.
+    #
+    # `variant_allele_fraction_status` is REQUIRED and never None: it is
+    # the only thing that keeps a null fraction meaning "never measured"
+    # apart from a null fraction meaning "measurement failed". A
+    # downstream LIMS that reads the number alone and ignores the status
+    # cannot tell those apart, and neither could a CSV cell.
+    variant_allele_fraction: Optional[float] = None
+    variant_allele_fraction_status: str = _StageStatus.NOT_RUN.value  # found|not_run|error|multiple_samples
+    variant_allele_fraction_sample: Optional[str] = None  # sample the fraction came from; never a bare number
+    variant_allele_fraction_reason: Optional[str] = None
 
 
 class LIMSGene(BaseModel):
@@ -224,6 +310,19 @@ class LIMSRun(BaseModel):
     variant_count: Optional[int] = None
     geper_code_version: Optional[str] = None
     generated_at: Optional[str] = None  # ISO 8601, as GEPER's own document already stores it
+    # Run-level caveats: statements qualifying the WHOLE run rather than
+    # any one finding (`geper_results.json`'s own `caveats` field, see
+    # report/json_builder.py). Carried here because a LIMS integration
+    # built against this export rather than against the raw results file
+    # would otherwise never see them -- and an automated consumer, unlike
+    # a clinician reading a PDF, cannot notice a caveat it was never
+    # given. Defaults to `[]` for a pre-428a77d document with no such
+    # field, never a fabricated placeholder.
+    #
+    # Deliberately NOT merged with any finding's own caveats: per-variant
+    # limitations already ride in `clinical_report` and belong to the
+    # finding that produced them. These qualify the run.
+    caveats: List[str] = []
 
 
 class LIMSExport(BaseModel):
@@ -270,10 +369,69 @@ def _protein_hgvs(variant_result: Dict[str, Any]) -> tuple:
     return None, None
 
 
+# A LIMS row is one variant, so a per-sample mapping has to resolve to one
+# cell. This token marks the case where it honestly cannot: several samples
+# carry real fractions and no single one of them is "the" answer. It is a
+# LIMS-surface value only -- `StageStatus` itself is deliberately NOT
+# extended, because in the pipeline the mapping keeps every sample's own
+# status and nothing needs collapsing there.
+LIMS_VAF_MULTIPLE_SAMPLES = "multiple_samples"
+
+_LIMS_VAF_MULTIPLE_SAMPLES_REASON = (
+    "More than one sample carries an allele fraction for this variant; a single-valued export cell "
+    "cannot represent them. Per-sample values are in geper_results.json under "
+    "variants[].variant.variant_allele_fractions."
+)
+
+
+def _variant_allele_fraction(variant_result: Dict[str, Any]) -> tuple:
+    """
+    Collapses the per-sample VAF mapping into the one (value, status,
+    sample, reason) a flat LIMS record can carry, under the SAME
+    precedence the report renderers use (`report/clinical_report_builder
+    .py::variant_allele_fraction_text`): the tri-state resolves first, the
+    sample count second.
+
+    A number is emitted ONLY when exactly one sample carries one, and it
+    is always accompanied by the sample name -- an unlabelled fraction on
+    a multi-sample run reads as though it applied to the whole record.
+    Every other case emits `None` WITH a status that says which "none"
+    this is: never measured (`not_run`), measurement failed (`error`), or
+    more than one real answer (`multiple_samples`). A bare `None` would
+    make the first two indistinguishable, and in the CSV -- where
+    `csv.DictWriter` renders `None` as an empty cell -- indistinguishable
+    from each other and from a blank column, which is why the status
+    column ships alongside the value rather than only in the JSON.
+    """
+    states = _variant_allele_fraction_states(variant_result)
+    if states is None:
+        # Document predates the field. `not_run` is still the honest
+        # status -- nothing was measured -- but the reason must not claim
+        # anything about what the VCF did or didn't carry.
+        return None, _StageStatus.NOT_RUN.value, None, VAF_FIELD_NOT_CAPTURED_REASON
+    if not states:
+        return None, _StageStatus.NOT_RUN.value, None, VAF_NO_SAMPLE_COLUMNS_REASON
+
+    found = _variant_allele_fraction_found(states)
+    if len(found) == 1:
+        name, state = next(iter(found.items()))
+        return float(state["value"]), _StageStatus.FOUND.value, name, state.get("reason")
+    if len(found) > 1:
+        return None, LIMS_VAF_MULTIPLE_SAMPLES, None, _LIMS_VAF_MULTIPLE_SAMPLES_REASON
+
+    errored = {name: s for name, s in states.items() if s.get("status") == _StageStatus.ERROR.value}
+    if errored:
+        reasons = sorted({(s.get("reason") or "No reason recorded.") for s in errored.values()})
+        return None, _StageStatus.ERROR.value, None, " ".join(reasons)
+    reasons = sorted({(s.get("reason") or VAF_NO_SAMPLE_COLUMNS_REASON) for s in states.values()})
+    return None, _StageStatus.NOT_RUN.value, None, " ".join(reasons)
+
+
 def _variant(variant_result: Dict[str, Any]) -> LIMSVariant:
     v = variant_result.get("variant") or {}
     norm = variant_result.get("normalization") or {}
     protein_hgvs, protein_hgvs_source = _protein_hgvs(variant_result)
+    vaf, vaf_status, vaf_sample, vaf_reason = _variant_allele_fraction(variant_result)
     return LIMSVariant(
         chromosome=v.get("chrom"),
         position=v.get("pos"),
@@ -286,6 +444,10 @@ def _variant(variant_result: Dict[str, Any]) -> LIMSVariant:
         coding_hgvs=norm.get("hgvs_c"),
         protein_hgvs=protein_hgvs,
         protein_hgvs_source=protein_hgvs_source,
+        variant_allele_fraction=vaf,
+        variant_allele_fraction_status=vaf_status,
+        variant_allele_fraction_sample=vaf_sample,
+        variant_allele_fraction_reason=vaf_reason,
     )
 
 
@@ -331,7 +493,7 @@ def _population_frequency(variant_result: Dict[str, Any]) -> LIMSPopulationFrequ
     gnomad = variant_result.get("gnomad") or {}
     dbsnp = variant_result.get("dbsnp") or {}
     return LIMSPopulationFrequency(
-        gnomad_queried=not (gnomad.get("skipped") or gnomad.get("error")),
+        gnomad_queried=not (gnomad.get("skipped") or gnomad.get("error") is not None),
         gnomad_found=bool(gnomad.get("found")),
         gnomad_global_af=gnomad.get("global_af"),
         dbsnp_rsid=dbsnp.get("rsid") if dbsnp.get("found") else None,
@@ -352,7 +514,7 @@ def _clinical_database(variant_result: Dict[str, Any]) -> LIMSClinicalDatabase:
 
 def _build_finding(finding_number: int, variant_result: Dict[str, Any]) -> LIMSFinding:
     ir = variant_result.get("interpretation_result")
-    clinical = variant_result.get("clinical_report")
+    clinical = candidate_interpretation_of(variant_result)
     interpretation_available = isinstance(ir, dict) and "error" not in ir and clinical is not None
 
     if not interpretation_available:
@@ -421,7 +583,14 @@ def build_lims_export(document: Dict[str, Any], run_id: Optional[str] = None) ->
     authoritative run/accession ID; falls back to the same derivation
     `_derive_run_id` already uses for the PDF report, so the two stay
     consistent when both are generated from the same document.
+
+    Raises `LIMSExportBlockedError` (round 30 part 2) if `document`
+    is not `review_status == "reviewed"` -- checked first, before any
+    of the mapping below runs, so this function stays a genuine single
+    choke point regardless of which of its callers (JSON export, CSV
+    export, or a caller using this function directly) reaches it.
     """
+    _require_reviewed(document)
     variants = document.get("variants") or []
     findings = [_build_finding(i, vr) for i, vr in enumerate(variants, start=1)]
 
@@ -434,6 +603,7 @@ def build_lims_export(document: Dict[str, Any], run_id: Optional[str] = None) ->
             variant_count=document.get("variant_count"),
             geper_code_version=document.get("code_version"),
             generated_at=document.get("generated_at"),
+            caveats=list(document.get("caveats") or []),
         ),
         case_phenotype_ranking_active=any(f.case_prioritization is not None for f in findings),
         findings=findings,
@@ -446,7 +616,23 @@ def build_lims_export(document: Dict[str, Any], run_id: Optional[str] = None) ->
 
 
 def export_lims_json(document: Dict[str, Any], output_path: str, run_id: Optional[str] = None) -> str:
-    export = build_lims_export(document, run_id=run_id)
+    """Raises `LIMSExportBlockedError` (see `_require_reviewed`) when `document` is not yet reviewed -- an audit-log entry is written to `output_path`'s directory before the exception propagates, so the blocked attempt is never silently swallowed."""
+    try:
+        export = build_lims_export(document, run_id=run_id)
+    except LIMSExportBlockedError as exc:
+        _append_export_audit_log(
+            os.path.dirname(output_path),
+            {
+                "action": "export_blocked",
+                "format": "json",
+                "output_path": os.path.abspath(output_path),
+                "review_status": document.get("review_status"),
+                "reason": str(exc),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        logger.warning(f"LIMS JSON export to '{output_path}' blocked: {exc}")
+        raise
     with open(output_path, "w", encoding="utf-8") as fh:
         fh.write(export.model_dump_json(indent=2))
     logger.info(f"Wrote LIMS JSON export to '{output_path}' ({len(export.findings)} finding(s)).")
@@ -495,6 +681,33 @@ _CSV_COLUMNS = [
     "evidence_sources",
     "stage_errors",
     "interpretation_available",
+    # Run-level, so identical in every row of a given export -- the same
+    # denormalisation `sample_id`/`run_id` above already use. Repeated
+    # rather than omitted on purpose: a CSV-only consumer is exactly the
+    # integration that cannot go and read `geper_results.json` for the
+    # caveats instead, and leaving the column out would recreate, for
+    # tabular consumers, the same blind spot adding this field to the
+    # export was meant to close. Appended last so existing column
+    # positions are unchanged for anything already parsing this file.
+    "run_caveats",
+    # Within-sample allele fraction and, inseparably, its status --
+    # appended last for the same column-stability reason `run_caveats`
+    # above was. The two columns ship TOGETHER and neither is useful
+    # alone: `csv.DictWriter` writes `None` as an empty cell, so the
+    # value column by itself renders "never measured", "measurement
+    # failed", and "several samples, no single answer" as the same blank.
+    # The status column is what a tabular consumer reads to tell them
+    # apart. Note this is within-sample read support, NOT the population
+    # frequency in `gnomad_global_af` above.
+    "variant_allele_fraction",
+    "variant_allele_fraction_status",
+    # Run-level genome build (`run.reference_assembly`), repeated in every
+    # row exactly as `run_caveats` is. Ruled 2026-09-11: "put the build on
+    # every rendered surface" -- and this was the one surface without it,
+    # although the LIMS JSON export already carried it. A CSV-only consumer
+    # cannot go and read the JSON for it. Appended last, for the same
+    # column-stability reason as the two entries above.
+    "reference_assembly",
 ]
 
 
@@ -539,6 +752,16 @@ def _csv_row(run: LIMSRun, finding: LIMSFinding) -> Dict[str, Any]:
         "evidence_sources": ";".join(finding.evidence_sources),
         "stage_errors": ";".join(finding.stage_errors),
         "interpretation_available": finding.interpretation_available,
+        # Named `run_caveats`, not `caveats`, because the flat CSV loses
+        # the nesting that makes the scope obvious in the JSON export
+        # (`run.caveats`) -- without the prefix a reader scanning a
+        # per-finding row would reasonably take it for per-finding data.
+        "run_caveats": ";".join(run.caveats),
+        # Last two, mirroring `_CSV_COLUMNS`' order. Emitted as a pair,
+        # never one without the other -- see that list's comment.
+        "variant_allele_fraction": v.variant_allele_fraction,
+        "variant_allele_fraction_status": v.variant_allele_fraction_status,
+        "reference_assembly": run.reference_assembly,
     }
 
 
@@ -548,11 +771,36 @@ def export_lims_csv(document: Dict[str, Any], output_path: str, run_id: Optional
     systems that ingest tabular/spreadsheet data rather than nested
     JSON (common for smaller diagnostic labs without an HL7/FHIR
     interface). List-valued fields (evidence sources, ACMG criteria
-    codes, stage errors) are semicolon-joined single cells rather than
-    exploded into repeated rows, so this stays exactly one row per
-    finding -- matching `LIMS_EXPORT_MAPPING.md`'s documented contract.
+    codes, stage errors, run caveats) are semicolon-joined single cells
+    rather than exploded into repeated rows, so this stays exactly one
+    row per finding -- matching `LIMS_EXPORT_MAPPING.md`'s documented
+    contract.
+
+    `run_caveats` is run-level and therefore identical in every row, the
+    same denormalisation `sample_id`/`run_id` already use -- see
+    `_CSV_COLUMNS` for why it is repeated rather than omitted.
+
+    Raises `LIMSExportBlockedError` (see `_require_reviewed`) when
+    `document` is not yet reviewed -- same audit-log-then-raise
+    behavior as `export_lims_json`, so a blocked CSV attempt is
+    recorded and never a silent empty file.
     """
-    export = build_lims_export(document, run_id=run_id)
+    try:
+        export = build_lims_export(document, run_id=run_id)
+    except LIMSExportBlockedError as exc:
+        _append_export_audit_log(
+            os.path.dirname(output_path),
+            {
+                "action": "export_blocked",
+                "format": "csv",
+                "output_path": os.path.abspath(output_path),
+                "review_status": document.get("review_status"),
+                "reason": str(exc),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        logger.warning(f"LIMS CSV export to '{output_path}' blocked: {exc}")
+        raise
     with open(output_path, "w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS)
         writer.writeheader()

@@ -3,9 +3,17 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "geper"
-version = "12.0.0"
-description = "GEPER — Genomic Evidence Pipeline with Evidence-based Risk assessment (v8)"
+# Renamed from "geper" on 2026-09-09. This distribution is KIM, and it
+# was claiming the platform's name: the root package is "geper-platform",
+# so anything depending on a package called "geper" resolved to KIM --
+# which also carried version 12.0.0 against the root's 1.0.0, so any
+# resolution decided by a version number went the same way, silently.
+name = "kim-pipeline"
+# Read from Kim's single version source at build time -- see
+# [tool.setuptools.dynamic] below. 12.0.0 was typed here in the first
+# commit (cb79edc) with no basis; nothing ever read it.
+dynamic = ["version"]
+description = "Bij AI sequencing-analysis component v8 — Sequencing analysis from FASTQ: QC, alignment and variant calling, with ACMG classification of the variants called here."
 readme = "docs/INSTALL.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -28,6 +36,7 @@ dependencies = [
     "pydantic>=2.7.0",
     "python-multipart>=0.0.9",
     "reportlab>=4.0.0",
+    "psutil>=5.9.0",
 ]
 
 [project.optional-dependencies]
@@ -51,15 +60,30 @@ dev = [
     "pytest-anyio>=0.0.0",
 ]
 all = [
-    "geper[ai,bio,pdf,dev]",
+    "kim-pipeline[ai,bio,pdf,dev]",
 ]
 
 [project.scripts]
-geper = "main:cli"
+# Named for the project this CLI belongs to. It was `geper` until
+# 2026-09-09, which installed a command called `geper` that ran KIM --
+# and the root `geper` package declares no console script at all, so the
+# name was not contested, it was simply taken by the wrong project. That
+# is why nothing ever errored and nobody noticed.
+kim-pipeline = "main:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pipeline*", "geper*", "api*"]
+# `geper*` dropped 2026-09-09: this is KIM, and claiming the platform's
+# package names was the same defect as the distribution name above.
+# `pipeline*` is deliberately LEFT: two different packages are named
+# `pipeline` in this repository (geper/pipeline and kim_pipeline/
+# pipeline) and untangling them is separate, carded work -- see
+# CONTRIBUTING.md, "Why not just pytest at the repo root".
+include = ["pipeline*", "api*"]
+
+[tool.setuptools.dynamic]
+# Static read (setuptools parses the literal; nothing is imported).
+version = { attr = "pipeline.reporting.component_identity.VERSION" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -69,6 +93,55 @@ python_files = ["test_*.py"]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# Must mirror the root ruff.toml's `select`. Ruff resolves the *nearest*
+# config to each file, so this block -- not the repo root's -- is what
+# applies to everything under kim_pipeline/. Without an explicit
+# `select` here, this subtree silently fell back to a much broader rule
+# set than the repo intends (BLE001, S110, RUF059, C408 and friends),
+# which is the opposite of root ruff.toml's stated aim of catching real
+# errors "without also forcing an unrelated style migration". Keep the
+# two lists in sync.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
+
+[tool.ruff.lint.per-file-ignores]
+# Paths here are relative to kim_pipeline/, since this is the config ruff
+# resolves for this subtree (see the note on `select` above).
+#
+# PRE-EXISTING patterns, present at HEAD before the commit that first
+# staged these files -- surfaced by ruff only running against files in a
+# given commit, not introduced by the change that exposed them.
+#
+# E402 (module import not at top of file): each of these modules MUST
+# import after executing setup code -- `sys.path.insert` to make a
+# sibling package importable, or stub registration that the real imports
+# then resolve against. *** MOVING THESE IMPORTS TO THE TOP OF THE FILE
+# WOULD BREAK THE MODULE AT IMPORT TIME. *** The ignore is the correct
+# resolution here, not a deferral of one.
+"api/main.py" = ["E402", "F841"]
+"tests/test_gap_fixes.py" = ["E402"]
+#
+# F841 (local assigned but never used): pre-existing, verified present at
+# HEAD. Genuine tidy candidates, ignored here only to keep an unrelated
+# commit from making unreviewed edits to reviewed files -- NOT because
+# they are right. Worth a pass of their own.
+# F821 USED TO BE IGNORED HERE AND IS NOT ANY MORE, BECAUSE IT WAS FIXED
+# RATHER THAN TOLERATED. The undefined name was `RnaTranscriptAnalyser` in
+# a return annotation on `_make_analyser`. The class is real
+# (pipeline/rna/transcript.py:67) but is imported function-locally, so the
+# annotation resolved against module scope where the name does not exist.
+# The same helper is defined three times in that file and only one copy
+# carried the annotation -- a stray, not a typing decision -- so it was
+# removed. An ignore left in place for a resolved error is a false
+# statement in the config: it reads as protection and provides none.
+# THE SAME IS NOW TRUE OF THIS ENTRY'S E402 HALF: verified inert against an
+# isolated config (2026-09-10 per-file-ignore audit) -- zero E402
+# violations remain in this file, only the one F841 below. Narrowed rather
+# than left as a half-dead entry for the same reason F821 was removed
+# above: an ignore for a resolved error reads as protection and provides
+# none.
+"tests/test_all_fixes_regression.py" = ["F841"]

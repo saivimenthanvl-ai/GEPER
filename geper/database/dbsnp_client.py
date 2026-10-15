@@ -56,12 +56,34 @@ from utils.service_health import HEALTH, is_transient_http_error
 logger = get_logger(__name__)
 
 
+def _entrez_chrom(chrom: str) -> str:
+    """
+    Strip an optional 'chr' prefix for NCBI Entrez's dbSNP `[CHR]`
+    field -- which, for the mitochondrial contig specifically, wants
+    'MT', never 'M'. Confirmed live (round 15): `MT[CHR]` returns
+    hits, `M[CHR]` returns zero with an NCBI "phrase not found"
+    warning. Mirrors `database/clinvar_client.py::_entrez_chrom`
+    (kept as its own module-local copy, not shared, matching this
+    codebase's existing per-module-utils convention).
+    """
+    bare = chrom[3:] if chrom.lower().startswith("chr") else chrom
+    return "MT" if bare.upper() in ("M", "MT") else bare
+
+
 class DbSNPMatchStatus(str, enum.Enum):
     """Mirrors `database/clinvar_client.py::ClinVarMatchStatus` -- see this module's docstring for why it's a separate type."""
 
     NOT_FOUND = "not_found"  # esearch returned nothing at this position at all
     POSITION_ONLY = "position_only"  # rsID(s) exist at this position, but none match this allele
     MATCHED = "matched"  # at least one rsID's allele (and position) matches the query variant
+
+    def __bool__(self):
+        raise TypeError(
+            "DbSNPMatchStatus has no truth value -- every member of a `str` enum is truthy, "
+            "so `if x:`/`if not x:` silently collapses NOT_FOUND, POSITION_ONLY and MATCHED "
+            "into one answer, which is exactly the distinction this type exists to "
+            "keep. Compare explicitly, e.g. `x is DbSNPMatchStatus.MATCHED`."
+        )
 
 
 class DbSNPClient:
@@ -122,7 +144,7 @@ class DbSNPClient:
                 "primary_record": record,
             }
 
-        chrom = variant.chrom.replace("chr", "")
+        chrom = _entrez_chrom(variant.chrom)
         position_field = self._position_field(assembly)
         # Indels get a 3-position range (pos-1:pos+1), not a
         # single-point query -- same reasoning and same fix shape as
@@ -394,7 +416,17 @@ class DbSNPClient:
         """
         if HEALTH.is_offline("dbSNP"):
             HEALTH.note_skip("dbSNP")
-            raise ExternalAPIError(f"dbSNP request to '{url}' skipped: dbSNP was confirmed offline at startup.")
+            logger.warning(f"dbSNP request to '{url}' skipped: dbSNP was confirmed offline at startup.")
+            # Round 28: the message actually raised reaches
+            # `pipeline/orchestrator.py::_run_dbsnp_stage`'s
+            # `errors.append(...)` (rendered unconditionally into every
+            # Markdown report's "Stage Warnings / Errors" section) AND
+            # its `{"error": str(exc)}` result, embedded verbatim under
+            # geper_results.json's `dbsnp` key by `report/json_builder.py`.
+            # Must not embed `url`; full detail goes to the log line
+            # above only. Same pattern rounds 20-27 applied to the rest
+            # of this leak class.
+            raise ExternalAPIError("dbSNP request skipped: dbSNP was confirmed offline at startup.")
 
         last_error: Optional[Exception] = None
         for attempt in range(1, CONFIG.api.MAX_RETRIES + 1):
@@ -423,4 +455,8 @@ class DbSNPClient:
                 if attempt < CONFIG.api.MAX_RETRIES:
                     time.sleep(CONFIG.api.RETRY_BACKOFF_SECS * attempt)
         HEALTH.note_failure("dbSNP")
-        raise ExternalAPIError(f"dbSNP request to '{url}' failed after {CONFIG.api.MAX_RETRIES} attempts: {last_error}")
+        logger.warning(
+            f"dbSNP request to '{url}' failed after {CONFIG.api.MAX_RETRIES} attempts: {last_error}",
+            exc_info=last_error,
+        )
+        raise ExternalAPIError(f"dbSNP request failed after {CONFIG.api.MAX_RETRIES} attempts")

@@ -29,12 +29,14 @@ import logging
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from geper.pipeline.fastq.pipeline import FastqPipelineError
+
+from shared.process_control import spawn_tracked
 
 from pipeline.reporting.clinical_sections import (
     normalize_patient_metadata,
@@ -42,14 +44,19 @@ from pipeline.reporting.clinical_sections import (
     variant_dashboard,
     clinical_interpretation,
     merge_variants_with_acmg,
+    consequence_display_label,
+    SCOPE_LINE,
 )
 from pipeline.reporting import pdf_report as _pdf_report_mod
 
 logger = logging.getLogger("geper.pipeline.reporting.stage")
 
 # Single source of truth for the pipeline version string, shared by the
-# JSON payload, HTML report, and PDF report so they can never disagree.
-PIPELINE_VERSION = "GEPER v8"
+# JSON payload, HTML report, and PDF report so they can never disagree --
+# and by main.py's --version/help, which is why it is defined in the
+# import-free pipeline/reporting/component_identity.py and re-exported here.
+from pipeline.reporting.component_identity import PIPELINE_VERSION  # noqa: E402
+from pipeline.reporting.component_identity import RESEARCH_USE_DISCLAIMER  # noqa: E402
 
 # Shared ACMG classification -> style mapping. HTML uses the CSS-string
 # values directly; pipeline/reporting/pdf_report.py uses the same keys
@@ -140,10 +147,6 @@ _HTML_TEMPLATE = """\
   }}
   .interpretation-box p {{ margin: 0 0 10px 0; }}
   .interpretation-box p:last-child {{ margin-bottom: 0; }}
-  .signature-block {{
-    display: flex; gap: 60px; margin-top: 40px; padding-top: 16px;
-  }}
-  .signature-line {{ flex: 1; border-top: 1px solid var(--ink); padding-top: 6px; font-size: 0.85em; color: var(--muted); }}
   footer.report-footer {{
     max-width: 1100px; margin: 40px auto 0 auto; padding: 14px 24px;
     border-top: 1px solid var(--border); font-size: 0.75em; color: var(--muted);
@@ -168,7 +171,8 @@ _HTML_TEMPLATE = """\
 
 <div class="report-header">
   <h1>{pipeline_version} — Clinical Genomic Report</h1>
-  <div class="meta">Generated: {generated_at}<br/>Reference genome: {reference_genome}</div>
+  <div class="meta">{scope_line}</div>
+  <div class="meta">Generated: {generated_at}<br/>Report Rendered: {report_rendered}<br/>Reference genome: {reference_genome}</div>
 </div>
 
 <div class="section">
@@ -195,7 +199,6 @@ _HTML_TEMPLATE = """\
   <div class="dash-tile Likely_Pathogenic"><span class="dash-value">{dash_likely_pathogenic}</span><span class="dash-label">Likely Pathogenic</span></div>
   <div class="dash-tile VUS"><span class="dash-value">{dash_vus}</span><span class="dash-label">VUS</span></div>
   <div class="dash-tile Benign"><span class="dash-value">{dash_benign_total}</span><span class="dash-label">Benign / Likely Benign</span></div>
-  <div class="dash-tile"><span class="dash-value">{dash_pgx}</span><span class="dash-label">PGx Findings</span></div>
 </div>
 <p class="meta" style="margin-top:10px;">Ancestry: <strong>{dash_ancestry}</strong></p>
 </div>
@@ -234,19 +237,8 @@ _HTML_TEMPLATE = """\
 </div>
 
 <div class="section">
-<h2 class="section-title">Pharmacogenomics (PGx)</h2>
-{pgx_section}
-</div>
-
-
-<div class="section">
 <h2 class="section-title">Ancestry Inference</h2>
 {ancestry_section}
-</div>
-
-<div class="section signature-block">
-  <div class="signature-line">Reviewing Pathologist / Director, Signature</div>
-  <div class="signature-line">Date</div>
 </div>
 
 </div>
@@ -254,7 +246,7 @@ _HTML_TEMPLATE = """\
 <footer class="report-footer">
   <p>{lab_disclaimer}</p>
   <p>Reference genome: {reference_genome} &nbsp;|&nbsp; Pipeline: {pipeline_version} &nbsp;|&nbsp;
-  Generated: {generated_at}</p>
+  Generated: {generated_at} &nbsp;|&nbsp; Report Rendered: {report_rendered}</p>
 </footer>
 
 </body>
@@ -269,7 +261,7 @@ def _qc_status_to_html_table(qc_rows: List[Dict[str, Any]]) -> str:
         return "<p><em>No QC data available.</em></p>"
     rows_html = "".join(
         f"<tr><td>{r['label']}</td><td>{r['value']}</td>"
-        f"<td><span class=\"badge {r['status']}\">{r['status']}</span></td></tr>"
+        f'<td><span class="badge {r["status"]}">{r["status"]}</span></td></tr>'
         for r in qc_rows
     )
     return f"<table><tr><th>Metric</th><th>Value</th><th>Status</th></tr>{rows_html}</table>"
@@ -277,11 +269,43 @@ def _qc_status_to_html_table(qc_rows: List[Dict[str, Any]]) -> str:
 
 def _dict_to_html_table(data: Dict[str, Any], title: Optional[str] = None) -> str:
     """Render a flat dict as an HTML two-column table."""
-    rows = "".join(
-        f"<tr><td><strong>{k}</strong></td><td>{v}</td></tr>"
-        for k, v in data.items()
-    )
+    rows = "".join(f"<tr><td><strong>{k}</strong></td><td>{v}</td></tr>" for k, v in data.items())
     return f"<table><tr><th>Field</th><th>Value</th></tr>{rows}</table>"
+
+
+def _consequence_disagreement_caveat(acmg_results: List[Dict]) -> str:
+    """Disclose, beneath the ACMG table, every variant whose two protein-
+    consequence derivations disagree (orchestration/shared.py's
+    `consequence_disagreement`). T3-F3, ruled (b) REPORT CAVEAT,
+    2026-09-11: "Disclose it and let the reviewer weigh it." Not a table
+    column: a caveat qualifies the row rather than being a value of it.
+    Returns "" when no variant disagrees -- silence here means "compared and
+    agreed" or "nothing to compare", never "not checked" (a record without
+    the field never reached the comparison and is skipped). Values are
+    escaped: vep_consequence comes straight from the input VCF's CSQ field."""
+    from html import escape
+
+    items = []
+    for item in acmg_results:
+        disagreement = item.get("consequence_disagreement") if isinstance(item, dict) else None
+        if not disagreement:
+            continue
+        variant_str = f"{item.get('chrom', '')}:{item.get('pos', '')} {item.get('ref', '')}>{item.get('alt', '')}"
+        items.append(
+            f"<li><strong>{escape(variant_str)}</strong>: kim_pipeline's own transcript derivation gives "
+            f"<code>{escape(str(disagreement.get('kim_consequence', '')))}</code>; VEP's most-severe "
+            f"consequence gives <code>{escape(str(disagreement.get('vep_consequence', '')))}</code>.</li>"
+        )
+    if not items:
+        return ""
+    return (
+        '<div class="consequence-disagreement" style="font-size:0.85em;margin-top:8px;">'
+        "<p><strong>Protein consequence: two derivations disagree</strong> for the variant(s) below. "
+        "The ACMG criteria were evaluated on kim_pipeline's own derivation and were not withheld; "
+        "the two derivations may be keyed to different transcripts (e.g. alternative splicing). "
+        "The reviewer should weigh this disagreement when assessing the classification.</p>"
+        f"<ul>{''.join(items)}</ul></div>"
+    )
 
 
 def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
@@ -302,9 +326,17 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
     _CLASS_STYLES = ACMG_CLASS_STYLES
 
     headers = [
-        "Variant", "Gene", "ACMG Class", "ACMG Score",
-        "Criteria Met", "Criteria Unknown", "ClinVar", "gnomAD",
-        "Exploratory Tier*", "Exploratory Score*",
+        "Variant",
+        "Gene",
+        "ACMG Class",
+        "ACMG Score",
+        "Criteria Met",
+        "Criteria Unknown",
+        "ClinVar",
+        "gnomAD",
+        "AI Models Used",
+        "Exploratory Tier*",
+        "Exploratory Score*",
     ]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
 
@@ -324,34 +356,65 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
         else:
             reason = item.get("gene_unavailable_reason") or "Unknown reason"
             gene_cell = f"<em>Gene annotation unavailable<br/>Reason: {reason}</em>"
-        classification = item.get("classification", "Uncertain_Significance")
         acmg_score = item.get("score", "")
         criteria_met = ", ".join(item.get("criteria_met") or []) or "—"
         # FIX (Issue 6): surface criteria that could not be evaluated
         # (Unknown / Insufficient Data) distinctly from "not met".
         criteria_unknown = ", ".join(item.get("criteria_unknown") or []) or "—"
-        # FIX (Issue 7): ClinVar/gnomAD cells always carry a reason when
-        # the value itself is unavailable, rather than a bare blank/dash.
-        clinvar_reason = item.get("clinvar_unavailable_reason")
-        clinvar_cell = clinvar_reason or "Found"
-        gnomad_reason = item.get("gnomad_unavailable_reason")
-        if gnomad_reason:
-            gnomad_cell = gnomad_reason
+        # FIX: a variant whose per-variant classification raised (shared.py's
+        # per-variant handler appends {..., "error": ...} with no
+        # classification/clinvar_unavailable_reason/gnomad_unavailable_reason
+        # keys, by construction) must render as failed, not as a genuine
+        # Uncertain_Significance/Found/Found row -- the same
+        # never-render-a-fabricated-default principle Issue 7 already applies
+        # to `gene` two fields above, extended to the two fields it missed.
+        error = item.get("error")
+        if error:
+            classification = "Classification failed"
+            clinvar_cell = f"<em>Classification failed<br/>Reason: {error}</em>"
+            gnomad_cell = f"<em>Classification failed<br/>Reason: {error}</em>"
         else:
-            gnomad_af = item.get("gnomad_af")
-            gnomad_af_popmax = item.get("gnomad_af_popmax")
-            if gnomad_af is not None:
-                gnomad_cell = f"AF: {gnomad_af:.2e}"
-                if gnomad_af_popmax is not None:
-                    gnomad_cell += f" (popmax: {gnomad_af_popmax:.2e})"
+            classification = item.get("classification", "Uncertain_Significance")
+            # FIX (Issue 7): ClinVar/gnomAD cells always carry a reason when
+            # the value itself is unavailable, rather than a bare blank/dash.
+            clinvar_reason = item.get("clinvar_unavailable_reason")
+            clinvar_cell = clinvar_reason or "Found"
+            gnomad_reason = item.get("gnomad_unavailable_reason")
+            if gnomad_reason:
+                gnomad_cell = gnomad_reason
             else:
-                # "found" status without a numeric AF is unexpected but
-                # must never render a bare blank cell (Issue 7 principle).
-                gnomad_cell = "Found (frequency not available)"
+                gnomad_af = item.get("gnomad_af")
+                gnomad_af_popmax = item.get("gnomad_af_popmax")
+                if gnomad_af is not None:
+                    gnomad_cell = f"AF: {gnomad_af:.2e}"
+                    if gnomad_af_popmax is not None:
+                        gnomad_cell += f" (popmax: {gnomad_af_popmax:.2e})"
+                else:
+                    # "found" status without a numeric AF is unexpected but
+                    # must never render a bare blank cell (Issue 7 principle).
+                    gnomad_cell = "Found (frequency not available)"
         final_tier = item.get("final_tier", "—")
         composite = item.get("composite_score", "—")
         if disclaimer is None and item.get("disclaimer"):
             disclaimer = item["disclaimer"]
+
+        # HUMAN-DECISION-kim-s-TWO-AI-MODELS-ARE-LIVE...-ruled-(C), 2026-09-11:
+        # DNABERT-2/ESM-2 fire independently per variant (see
+        # orchestration/shared.py's ai_models_used comment) -- this cell
+        # states what actually ran for THIS row, not whether the AI stream
+        # was available for the run as a whole. "ai_models_used" absent
+        # entirely (the per-variant error-record shape, no AI scoring was
+        # ever attempted) reads as "Not attempted"; present but empty
+        # (AI stream ran, but neither model had usable input for this
+        # variant) reads as "None" -- the two are different facts and must
+        # not collapse into the same cell text.
+        ai_models_field = item.get("ai_models_used")
+        if ai_models_field is None:
+            ai_models_cell = "Not attempted"
+        elif ai_models_field:
+            ai_models_cell = ", ".join(ai_models_field)
+        else:
+            ai_models_cell = "None"
 
         cls_style = _CLASS_STYLES.get(classification, "")
         cls_cell = f'<td style="{cls_style}">{classification}</td>'
@@ -366,6 +429,7 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
             f"<td>{criteria_unknown}</td>"
             f"<td>{clinvar_cell}</td>"
             f"<td>{gnomad_cell}</td>"
+            f"<td>{ai_models_cell}</td>"
             f"<td>{final_tier}</td>"
             f"<td>{composite}</td>"
             f"</tr>"
@@ -378,6 +442,7 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
     # aggregation ran), so the warning is never silently dropped.
     if disclaimer is None:
         from pipeline.evidence.aggregator import EvidenceResult
+
         disclaimer = EvidenceResult().disclaimer
 
     footnote = (
@@ -387,7 +452,7 @@ def _acmg_to_html_table(acmg_results: Optional[List[Dict]]) -> str:
         f"</p>"
     )
 
-    return table_html + footnote
+    return table_html + footnote + _consequence_disagreement_caveat(acmg_results)
 
 
 def _annotation_summary_to_html(ann_d: Dict) -> str:
@@ -399,16 +464,30 @@ def _annotation_summary_to_html(ann_d: Dict) -> str:
     skipped.
     """
     summary = {k: v for k, v in ann_d.items() if k not in ("variants", "skipped_symbolic")}
-    table = _dict_to_html_table(summary) if summary else "<p><em>No annotation summary available.</em></p>"
+    table = (
+        _dict_to_html_table(summary)
+        if summary
+        else "<p><em>No annotation summary available.</em></p>"
+    )
+
+    if not ann_d.get("codon_resolution_available", True):
+        disclaimer = (
+            "<p><strong>Codon-level consequence resolution (missense / synonymous / "
+            "stop-gained, etc.) was not available for this run</strong> -- no reference "
+            "FASTA + GFF3 CDS source was configured. Every exonic single-nucleotide "
+            'variant in this report is annotated "Not determined" for Consequence '
+            "rather than a specific molecular effect.</p>"
+        )
+        table = disclaimer + table
 
     skipped = ann_d.get("skipped_symbolic") or []
     if not skipped:
         return table
 
     rows = "".join(
-        f"<tr><td>{s.get('chrom','')}:{s.get('pos','')}</td>"
-        f"<td>{s.get('ref','')}</td><td>{s.get('alt','')}</td>"
-        f"<td>{s.get('reason','')}</td></tr>"
+        f"<tr><td>{s.get('chrom', '')}:{s.get('pos', '')}</td>"
+        f"<td>{s.get('ref', '')}</td><td>{s.get('alt', '')}</td>"
+        f"<td>{s.get('reason', '')}</td></tr>"
         for s in skipped
     )
     skipped_table = (
@@ -419,14 +498,27 @@ def _annotation_summary_to_html(ann_d: Dict) -> str:
     return table + skipped_table
 
 
-def _variants_to_html_table(variants: List[Dict], gene_unavailable_reason: str = "Gene annotation unavailable") -> str:
+def _variants_to_html_table(
+    variants: List[Dict], gene_unavailable_reason: str = "Gene annotation unavailable"
+) -> str:
     """Render the variant list as an HTML table."""
     if not variants:
         return "<p><em>No PASS variants.</em></p>"
 
     headers = [
-        "CHROM", "POS", "REF", "ALT", "QUAL", "Gene", "Transcript",
-        "HGVS", "Consequence", "Zygosity", "GT", "DP", "AD",
+        "CHROM",
+        "POS",
+        "REF",
+        "ALT",
+        "QUAL",
+        "Gene",
+        "Transcript",
+        "HGVS",
+        "Consequence",
+        "Zygosity",
+        "GT",
+        "DP",
+        "AD",
     ]
     header_html = "".join(f"<th>{h}</th>" for h in headers)
 
@@ -434,7 +526,24 @@ def _variants_to_html_table(variants: List[Dict], gene_unavailable_reason: str =
     for v in variants:
         # FIX (Issue 7): never silently render a null gene as a bare
         # "intergenic" guess — state the actual reason it's unavailable.
-        gene_cell = v.get("gene_name") or f"<em>Gene annotation unavailable<br/>Reason: {gene_unavailable_reason}</em>"
+        gene_cell = (
+            v.get("gene_name")
+            or f"<em>Gene annotation unavailable<br/>Reason: {gene_unavailable_reason}</em>"
+        )
+        # DEFECT-zygosity-collapses-absent-and-malformed: a malformed GT
+        # token (empty/non-numeric) still produces a best-effort zygosity
+        # category -- do not render it as a plain confident value, and do
+        # not blank the cell either (a blank cell reads as "nothing found",
+        # the same fabricated-absence defect this floor has been removing
+        # all day). Say the category, that it is unreliable, and why --
+        # the cause is the GT column in this same row.
+        zygosity_val = v.get("zygosity", "")
+        zygosity_cell = (
+            f"{zygosity_val} <strong>(unreliable: GT field unparseable, "
+            "do not trust this category -- see GT column)</strong>"
+            if v.get("zygosity_malformed")
+            else zygosity_val
+        )
         cells = [
             v.get("chrom", ""),
             v.get("pos", ""),
@@ -444,8 +553,8 @@ def _variants_to_html_table(variants: List[Dict], gene_unavailable_reason: str =
             gene_cell,
             v.get("transcript_id") or "",
             v.get("hgvs", ""),
-            v.get("consequence") or "—",
-            v.get("zygosity", ""),
+            consequence_display_label(v.get("consequence")),
+            zygosity_cell,
             v.get("gt", ""),
             v.get("dp", ""),
             v.get("ad", ""),
@@ -454,36 +563,6 @@ def _variants_to_html_table(variants: List[Dict], gene_unavailable_reason: str =
         rows_html += f"<tr>{row}</tr>"
 
     return f"<table><tr>{header_html}</tr>{rows_html}</table>"
-
-
-def _pgx_to_html_section(pgx_result: Any) -> str:
-    """Render PGx annotations as an HTML table section."""
-    if not pgx_result:
-        return "<p><em>PGx analysis not performed.</em></p>"
-    annotations = getattr(pgx_result, "annotations", None) or pgx_result.get("annotations", []) if isinstance(pgx_result, dict) else []
-    if not annotations:
-        return "<p><em>No PGx annotations available.</em></p>"
-    header = "<tr><th>Gene</th><th>Diplotype</th><th>Phenotype</th><th>Activity Score</th><th>Drug Implications</th><th>Evidence</th></tr>"
-    rows = ""
-    for ann in annotations:
-        if isinstance(ann, dict):
-            gene = ann.get("gene", "")
-            diplotype = ann.get("diplotype", "")
-            phenotype = ann.get("phenotype", "")
-            score = ann.get("activity_score")
-            drugs = ann.get("affected_drugs", [])
-            evidence = ann.get("evidence_level", "")
-        else:
-            gene = getattr(ann, "gene", "")
-            diplotype = getattr(ann, "diplotype", "")
-            phenotype = getattr(ann, "phenotype", "")
-            score = getattr(ann, "activity_score", None)
-            drugs = getattr(ann, "affected_drugs", [])
-            evidence = getattr(ann, "evidence_level", "")
-        drug_str = "; ".join(f"{d.get('drug','')}: {d.get('implication','')}" for d in drugs) or "None"
-        score_str = f"{score:.1f}" if score is not None else "N/A"
-        rows += f"<tr><td>{gene}</td><td>{diplotype}</td><td>{phenotype}</td><td>{score_str}</td><td style='font-size:0.85em'>{drug_str}</td><td>{evidence}</td></tr>"
-    return f"<table>{header}{rows}</table>"
 
 
 def _ancestry_to_html_section(ancestry_result: Any) -> str:
@@ -516,6 +595,7 @@ def _ancestry_to_html_section(ancestry_result: Any) -> str:
 
 # ─── Stage result ─────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ReportResult:
     sample_id: str = ""
@@ -535,6 +615,7 @@ class ReportResult:
 
 
 # ─── Stage ────────────────────────────────────────────────────────────────────
+
 
 class ReportingStage:
     """Generate a single sample-level clinical report.
@@ -598,10 +679,10 @@ class ReportingStage:
         variant_stats: Any = None,
         annotation_result: Any = None,
         acmg_results: Optional[Dict] = None,
-        pgx_result: Any = None,
         ancestry_result: Any = None,
         reference_versions: Optional[Dict] = None,  # FIX 14
         patient_metadata: Optional[Dict] = None,  # Issue 3: optional patient metadata JSON
+        analysis_started_at: Optional[str] = None,  # DEFECT-kim-reporting-stage-658
     ) -> ReportResult:
         """Generate the report and write files to *output_dir*.
 
@@ -625,9 +706,12 @@ class ReportingStage:
         ann_d = self._to_dict(annotation_result)
         acmg_d = acmg_results or []
 
-        # PGx and Ancestry sections
-        pgx_d = pgx_result.to_dict() if pgx_result is not None and hasattr(pgx_result, "to_dict") else {}
-        ancestry_d = ancestry_result.to_dict() if ancestry_result is not None and hasattr(ancestry_result, "to_dict") else {}
+        # Ancestry section
+        ancestry_d = (
+            ancestry_result.to_dict()
+            if ancestry_result is not None and hasattr(ancestry_result, "to_dict")
+            else {}
+        )
 
         # Extract variant list from annotation result
         variants: List[Dict] = []
@@ -638,9 +722,16 @@ class ReportingStage:
             ]
 
         # ── JSON report ──────────────────────────────────────────────────────
+        # `generated_at` is the persisted analysis start time (set once, in
+        # `PipelineRunner.run()`, and carried unchanged across a checkpoint
+        # resume) -- NOT `datetime.now()`. A resumed run stamping the resume
+        # moment here would answer a question nobody asked
+        # (DEFECT-kim-reporting-stage-658). A checkpoint written before this
+        # field existed has no value to read; "Not available" says so rather
+        # than fabricating one.
         report_payload = {
             "sample_id": sample_id,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": analysis_started_at or "Not available",
             "pipeline": PIPELINE_VERSION,
             "reference_versions": reference_versions or {},  # FIX 14
             "qc_summary": qc_d,
@@ -650,7 +741,6 @@ class ReportingStage:
             "acmg_evidence": acmg_d,
             "acmg_results": acmg_d,
             "variants": variants,
-            "pharmacogenomics": pgx_d,
             "ancestry": ancestry_d,
         }
         json_path = str(out / "report.json")
@@ -659,29 +749,40 @@ class ReportingStage:
 
         # ── HTML report ──────────────────────────────────────────────────────
         html_path = str(out / "report.html")
-        generated_at_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        # Two different facts, not alternatives (same shape as the GEPER PDF
+        # fix, #17/#20): "Generated" is the persisted analysis start time,
+        # and "Report Rendered" is separately the moment THIS HTML/PDF file
+        # was produced, which can be long after the analysis on a resumed
+        # run. Never fabricate the former from `datetime.now()`.
+        if analysis_started_at:
+            try:
+                generated_at_str = datetime.fromisoformat(analysis_started_at).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+            except ValueError:
+                generated_at_str = str(analysis_started_at)
+        else:
+            generated_at_str = "Not available"
+        report_rendered_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         reference_genome = (reference_versions or {}).get("reference_genome") or (
             (reference_versions or {}).get("reference") or "Not specified"
         )
-        lab_disclaimer = (
-            "This report was generated by an in-development bioinformatics pipeline. "
-            "Results have not been independently validated for diagnostic use and must "
-            "be confirmed by orthogonal clinical-grade testing before any clinical "
-            "action is taken."
-        )
+        lab_disclaimer = RESEARCH_USE_DISCLAIMER
 
         patient_meta = normalize_patient_metadata(patient_metadata)
         acmg_list = acmg_d if isinstance(acmg_d, list) else []
         qc_thresholds = (self._full_cfg.get("reporting") or {}).get("qc_thresholds")
         qc_rows = qc_status_summary(qc_d, align_d, qc_thresholds)
-        dashboard = variant_dashboard(acmg_list, pgx_d, ancestry_d)
+        dashboard = variant_dashboard(acmg_list, ancestry_d)
         interpretation = clinical_interpretation(dashboard)
         merged_variants = merge_variants_with_acmg(variants, acmg_list)
 
         html_content = _HTML_TEMPLATE.format(
             sample_id=sample_id,
             generated_at=generated_at_str,
+            report_rendered=report_rendered_str,
             pipeline_version=PIPELINE_VERSION,
+            scope_line=SCOPE_LINE,
             reference_genome=reference_genome,
             patient_name=patient_meta["name"],
             patient_dob=patient_meta["dob"],
@@ -693,7 +794,6 @@ class ReportingStage:
             dash_likely_pathogenic=dashboard["likely_pathogenic"],
             dash_vus=dashboard["vus"],
             dash_benign_total=dashboard["benign"] + dashboard["likely_benign"],
-            dash_pgx=dashboard["pgx_findings"],
             dash_ancestry=dashboard["ancestry_summary"],
             interpretation_summary=interpretation["summary"],
             interpretation_follow_up=interpretation["follow_up"],
@@ -709,7 +809,6 @@ class ReportingStage:
                 variants, self._gene_unavailable_reason(self._full_cfg)
             ),
             n_variants=len(variants),
-            pgx_section=_pgx_to_html_section(pgx_result),
             ancestry_section=_ancestry_to_html_section(ancestry_result),
             lab_disclaimer=lab_disclaimer,
         )
@@ -720,14 +819,25 @@ class ReportingStage:
         pdf_path: Optional[str] = None
         if self._generate_pdf:
             pdf_path = self._try_render_pdf(
-                html_path, str(out / "report.pdf"), sample_id,
-                patient_meta=patient_meta, qc_rows=qc_rows,
-                dashboard=dashboard, interpretation=interpretation,
+                html_path,
+                str(out / "report.pdf"),
+                sample_id,
+                patient_meta=patient_meta,
+                qc_rows=qc_rows,
+                dashboard=dashboard,
+                interpretation=interpretation,
                 merged_variants=merged_variants,
-                pgx_annotations=pgx_d.get("annotations") if isinstance(pgx_d, dict) else None,
                 ancestry_summary=dashboard["ancestry_summary"],
-                reference_genome=reference_genome, pipeline_version=PIPELINE_VERSION,
-                generated_at=generated_at_str, lab_disclaimer=lab_disclaimer,
+                reference_genome=reference_genome,
+                pipeline_version=PIPELINE_VERSION,
+                generated_at=generated_at_str,
+                lab_disclaimer=lab_disclaimer,
+                codon_resolution_disclaimer=(
+                    None
+                    if ann_d.get("codon_resolution_available", True)
+                    else "Codon-level consequence resolution was not available for this run -- every exonic "
+                    'SNV is annotated "Not determined" for Consequence.'
+                ),
             )
 
         result = ReportResult(
@@ -739,8 +849,11 @@ class ReportingStage:
         )
         logger.info(
             "[%s] ReportingStage complete in %.2fs: JSON=%s HTML=%s PDF=%s",
-            sample_id, result.elapsed_seconds,
-            json_path, html_path, pdf_path or "<not generated>",
+            sample_id,
+            result.elapsed_seconds,
+            json_path,
+            html_path,
+            pdf_path or "<not generated>",
         )
         return result
 
@@ -762,23 +875,29 @@ class ReportingStage:
         if nothing is available — PDF is optional, not a blocker.
         """
         try:
-            _pdf_report_mod.render_clinical_pdf(pdf_path, sample_id=sample_id, **clinical_pdf_kwargs)
+            _pdf_report_mod.render_clinical_pdf(
+                pdf_path, sample_id=sample_id, **clinical_pdf_kwargs
+            )
             logger.info("[%s] PDF written via ReportLab: %s", sample_id, pdf_path)
             return pdf_path
         except _pdf_report_mod.ReportLabUnavailableError:
             logger.info(
                 "[%s] reportlab not installed — falling back to WeasyPrint/wkhtmltopdf "
-                "(HTML-to-PDF conversion) for report.pdf.", sample_id,
+                "(HTML-to-PDF conversion) for report.pdf.",
+                sample_id,
             )
         except Exception as exc:
             logger.warning(
                 "[%s] ReportLab PDF generation failed (%s) — falling back to "
-                "WeasyPrint/wkhtmltopdf.", sample_id, exc,
+                "WeasyPrint/wkhtmltopdf.",
+                sample_id,
+                exc,
             )
 
         # Try WeasyPrint (Python library)
         try:
             from weasyprint import HTML  # type: ignore
+
             HTML(filename=html_path).write_pdf(pdf_path)
             logger.info("[%s] PDF written via WeasyPrint: %s", sample_id, pdf_path)
             return pdf_path
@@ -790,16 +909,19 @@ class ReportingStage:
         # Try wkhtmltopdf (system binary)
         if shutil.which("wkhtmltopdf"):
             try:
-                subprocess.run(
+                proc = spawn_tracked(
                     ["wkhtmltopdf", html_path, pdf_path],
-                    capture_output=True, check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                 )
-                logger.info("[%s] PDF written via wkhtmltopdf: %s", sample_id, pdf_path)
-                return pdf_path
-            except subprocess.CalledProcessError as exc:
-                logger.warning(
-                    "[%s] wkhtmltopdf failed: %s", sample_id, exc.stderr[:500]
-                )
+                proc.communicate()
+                if proc.returncode == 0:
+                    logger.info("[%s] PDF written via wkhtmltopdf: %s", sample_id, pdf_path)
+                    return pdf_path
+                else:
+                    logger.warning("[%s] wkhtmltopdf failed (rc=%d)", sample_id, proc.returncode)
+            except Exception as exc:
+                logger.warning("[%s] wkhtmltopdf failed: %s", sample_id, exc)
 
         logger.warning(
             "[%s] PDF generation skipped: neither ReportLab, WeasyPrint, nor "

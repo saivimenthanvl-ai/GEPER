@@ -1,3 +1,25 @@
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: Verification harness for the deletion/spanning-allele '*' fix
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 Verification harness for the deletion/spanning-allele '*' fix.
 
@@ -37,7 +59,6 @@ already used to skip a record with a missing REF/ALT allele.
 import sys
 import tempfile
 import types
-from typing import Dict
 from unittest import mock
 
 import os as _os
@@ -115,9 +136,7 @@ def main() -> int:
     print("PART 1 -- Unit-level: VCFParser skips '*' and symbolic ALT alleles")
     print("=" * 78)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".vcf", delete=False
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".vcf", delete=False) as tmp:
         tmp.write(_TEST_VCF_TEXT)
         tmp_path = tmp.name
 
@@ -138,8 +157,7 @@ def main() -> int:
         print(f"  FAILURE: expected kept variants {expected_kept}, got {actual_kept}")
         all_ok = False
     else:
-        print("  OK: exactly the 3 real-sequence variants were kept "
-              "(plain SNV, plain deletion, plain SNV).")
+        print("  OK: exactly the 3 real-sequence variants were kept (plain SNV, plain deletion, plain SNV).")
 
     if any(v.alt in ("*",) or v.alt.startswith("<") for v in variants):
         print("  FAILURE: a spanning-deletion or symbolic ALT allele leaked through parsing!")
@@ -163,9 +181,11 @@ def main() -> int:
     print("=" * 78)
     print("PART 2 -- Regression proof: the OLD behavior really did crash")
     print("=" * 78)
-    print("(Constructing a '*'-ALT Variant directly -- bypassing the new parser\n"
-          " guard -- to prove build_context + RNAGenerator would still blow up\n"
-          " on this input today if the parser ever let one through again.)\n")
+    print(
+        "(Constructing a '*'-ALT Variant directly -- bypassing the new parser\n"
+        " guard -- to prove build_context + RNAGenerator would still blow up\n"
+        " on this input today if the parser ever let one through again.)\n"
+    )
 
     from pipeline.vcf_parser import Variant
 
@@ -186,9 +206,11 @@ def main() -> int:
     if not reproduced:
         print("\nPART 2: FAILED (could not reproduce the original bug for comparison)")
         return 1
-    print("\nPART 2: PASSED -- confirms *why* the parser-level fix is the right one: "
-          "once a '*'/symbolic ALT reaches sequence context generation, transcription "
-          "always fails. The fix in Part 1 stops that from ever happening.")
+    print(
+        "\nPART 2: PASSED -- confirms *why* the parser-level fix is the right one: "
+        "once a '*'/symbolic ALT reaches sequence context generation, transcription "
+        "always fails. The fix in Part 1 stops that from ever happening."
+    )
 
     print()
     print("=" * 78)
@@ -197,8 +219,10 @@ def main() -> int:
 
     from pipeline.orchestrator import GeperPipeline
 
-    with mock.patch.object(GeperPipeline, "_run_startup_validation", lambda self: None), \
-         mock.patch.object(SequenceContextGenerator, "_fetch_region", _fake_fetch_region):
+    with (
+        mock.patch.object(GeperPipeline, "_run_startup_validation", lambda self: None),
+        mock.patch.object(SequenceContextGenerator, "_fetch_region", _fake_fetch_region),
+    ):
 
         def _noop_route(self, variant, sequence_context):
             return []
@@ -218,28 +242,31 @@ def main() -> int:
         def _noop_clinvar(self, variant, dbsnp_result, errors):
             return {"query": None, "found": False}
 
-        with mock.patch("pipeline.router.SequenceRouter.route", _noop_route), \
-             mock.patch.object(GeperPipeline, "_run_rna_stage", _noop_rna), \
-             mock.patch.object(GeperPipeline, "_run_protein_stage", _noop_protein), \
-             mock.patch.object(GeperPipeline, "_run_blast_stage", _noop_blast), \
-             mock.patch.object(GeperPipeline, "_run_dbsnp_stage", _noop_dbsnp), \
-             mock.patch.object(GeperPipeline, "_run_clinvar_stage", _noop_clinvar):
-
-            pipeline = GeperPipeline(
-                output_dir="/home/claude/work/verify_star_output", assembly="GRCh38"
-            )
+        with (
+            mock.patch("pipeline.router.SequenceRouter.route", _noop_route),
+            mock.patch.object(GeperPipeline, "_run_rna_stage", _noop_rna),
+            mock.patch.object(GeperPipeline, "_run_protein_stage", _noop_protein),
+            mock.patch.object(GeperPipeline, "_run_blast_stage", _noop_blast),
+            mock.patch.object(GeperPipeline, "_run_dbsnp_stage", _noop_dbsnp),
+            mock.patch.object(GeperPipeline, "_run_clinvar_stage", _noop_clinvar),
+        ):
+            pipeline = GeperPipeline(output_dir="/home/claude/work/verify_star_output", assembly="GRCh38")
             result = pipeline.run(tmp_path, resume=False)
 
-    print(f"\nOrchestrator produced {len(result['variants'])} variant result(s) "
-          f"(expected 3 -- the '*' and '<DEL>' records must never even reach "
-          f"_process_variant):")
+    print(
+        f"\nOrchestrator produced {len(result['variants'])} variant result(s) "
+        f"(expected 3 -- the '*' and '<DEL>' records must never even reach "
+        f"_process_variant):"
+    )
     ok = True
     for entry in result["variants"]:
         v = entry["variant"]
         has_error = bool(entry.get("errors"))
         ctx = entry.get("sequence_context", {})
-        print(f"  {v['chrom']}:{v['pos']} {v['ref']}>{v['alt']}  "
-              f"context_length={ctx.get('length')}  errors={entry.get('errors')}")
+        print(
+            f"  {v['chrom']}:{v['pos']} {v['ref']}>{v['alt']}  "
+            f"context_length={ctx.get('length')}  errors={entry.get('errors')}"
+        )
         if has_error:
             ok = False
 
@@ -249,9 +276,11 @@ def main() -> int:
     if not ok:
         print("\nPART 3: FAILED")
         return 1
-    print("\nPART 3: PASSED -- full pipeline run completes with zero errors; the "
-          "spanning-deletion and symbolic-structural records were filtered out "
-          "before processing, exactly as designed.")
+    print(
+        "\nPART 3: PASSED -- full pipeline run completes with zero errors; the "
+        "spanning-deletion and symbolic-structural records were filtered out "
+        "before processing, exactly as designed."
+    )
 
     return 0
 

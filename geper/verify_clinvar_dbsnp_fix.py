@@ -1,3 +1,25 @@
+# *** THE VERDICT BELOW IS UNDATED. ***
+#
+# WHAT THIS IS, in its own words: Verification harness for the ClinVar / dbSNP genome-build fix
+#
+# NOTHING RE-RUNS THIS FILE. Measured 2026-09-11 across the 17 files matching
+# geper/verify_*.py, geper/benchmark_*.py and dry_run_harness.py: ZERO are
+# referenced in .github/workflows, and pytest does not collect any of them,
+# because they are not named test_*. So whatever this script printed, it
+# printed on the day somebody ran it by hand -- AND WHICH DAY THAT WAS IS
+# RECORDED NOWHERE. `git log` on this file gives the date it was EDITED,
+# which is a different fact and must not be quoted as if it were this one.
+#
+# WHY THE NOTE RATHER THAN A FIX: the file is not broken. Its stubs are
+# honest -- it fakes everything EXCEPT the thing it verifies, and it
+# propagates its exit code -- and all 59 stub targets across these harnesses
+# were still defined when this was written, so they can all still be applied.
+# The risk is CITATION: 'verify' is in the filename, which invites someone to
+# quote this file's green as evidence. That is the `docker history` shape --
+# something that reads as a record and is not one.
+#
+# IF YOU ARE ABOUT TO CITE THIS FILE: run it, and say when you ran it.
+#
 """
 Verification harness for the ClinVar / dbSNP genome-build fix.
 
@@ -36,7 +58,7 @@ ClinVar variant pages (accessed via web search).
 
 import sys
 import types
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from unittest import mock
 
 import os as _os
@@ -175,9 +197,10 @@ def main() -> int:
     print("PART 1 -- Unit-level: query construction + build sensitivity")
     print("=" * 78)
 
-    with mock.patch.object(DbSNPClient, "_request_json", _fake_request_json), \
-         mock.patch.object(ClinVarClient, "_request_json", _fake_request_json):
-
+    with (
+        mock.patch.object(DbSNPClient, "_request_json", _fake_request_json),
+        mock.patch.object(ClinVarClient, "_request_json", _fake_request_json),
+    ):
         from pipeline.vcf_parser import Variant
 
         cases = [
@@ -201,18 +224,22 @@ def main() -> int:
             # unconditionally, so this reproduces the original bug faithfully.
             old_dbsnp = dbsnp.lookup_variant(variant, assembly=None)
             old_clinvar = clinvar.query_variant(variant, rsid=None, assembly=None)
-            print(f"  [OLD -- no assembly passed, i.e. pre-fix orchestrator] "
-                  f"dbSNP found={old_dbsnp['found']}  ClinVar found={old_clinvar['found']}")
+            print(
+                f"  [OLD -- no assembly passed, i.e. pre-fix orchestrator] "
+                f"dbSNP found={old_dbsnp['found']}  ClinVar found={old_clinvar['found']}"
+            )
 
             # NEW behavior: assembly correctly resolved and threaded through
             # as GRCh37 (what the fixed orchestrator now does).
             new_dbsnp = dbsnp.lookup_variant(variant, assembly="GRCh37")
             new_clinvar = clinvar.query_variant(variant, rsid=None, assembly="GRCh37")
 
-            print(f"  [NEW -- assembly='GRCh37' passed] "
-                  f"dbSNP found={new_dbsnp['found']} rsid={new_dbsnp.get('rsid')}  "
-                  f"ClinVar found={new_clinvar['found']} "
-                  f"significance={[r['clinical_significance'] for r in new_clinvar.get('records', [])]}")
+            print(
+                f"  [NEW -- assembly='GRCh37' passed] "
+                f"dbSNP found={new_dbsnp['found']} rsid={new_dbsnp.get('rsid')}  "
+                f"ClinVar found={new_clinvar['found']} "
+                f"significance={[r['clinical_significance'] for r in new_clinvar.get('records', [])]}"
+            )
 
             if old_dbsnp["found"] or old_clinvar["found"]:
                 print("  UNEXPECTED: old (no-assembly) query matched -- check fixture data")
@@ -224,19 +251,18 @@ def main() -> int:
         if not all_ok:
             print("\nPART 1: FAILED")
             return 1
-        print("\nPART 1: PASSED -- old queries miss (bug reproduced), "
-              "new queries hit for all 3 known variants.")
+        print("\nPART 1: PASSED -- old queries miss (bug reproduced), new queries hit for all 3 known variants.")
 
     print()
     print("=" * 78)
     print("PART 2 -- Integration: full orchestrator run on the test VCF")
     print("=" * 78)
 
-    with mock.patch.object(DbSNPClient, "_request_json", _fake_request_json), \
-         mock.patch.object(ClinVarClient, "_request_json", _fake_request_json), \
-         mock.patch.object(
-             GeperPipeline, "_run_startup_validation", lambda self: None
-         ):
+    with (
+        mock.patch.object(DbSNPClient, "_request_json", _fake_request_json),
+        mock.patch.object(ClinVarClient, "_request_json", _fake_request_json),
+        mock.patch.object(GeperPipeline, "_run_startup_validation", lambda self: None),
+    ):
         # Stub every stage except VCF parsing, assembly preflight, and the
         # dbSNP/ClinVar stages -- those three are exactly what this audit
         # is about, so they run for real (only the HTTP layer is faked).
@@ -257,9 +283,11 @@ def main() -> int:
         def _noop_blast(self, sequence_context, errors):
             return {"hits": [], "hit_count": 0, "skipped": True}
 
-        with mock.patch.object(type(pipeline), "_run_rna_stage", _noop_rna), \
-             mock.patch.object(type(pipeline), "_run_protein_stage", _noop_protein), \
-             mock.patch.object(type(pipeline), "_run_blast_stage", _noop_blast):
+        with (
+            mock.patch.object(type(pipeline), "_run_rna_stage", _noop_rna),
+            mock.patch.object(type(pipeline), "_run_protein_stage", _noop_protein),
+            mock.patch.object(type(pipeline), "_run_blast_stage", _noop_blast),
+        ):
             from pipeline.sequence_context import SequenceContextGenerator
             from utils.exceptions import SequenceGenerationError
 
@@ -270,12 +298,8 @@ def main() -> int:
                     "the ClinVar/dbSNP fix under test)"
                 )
 
-            with mock.patch.object(
-                SequenceContextGenerator, "build_context", _unavailable_context
-            ):
-                result = pipeline.run(
-                    _os.path.join(_SCRIPT_DIR, "testdata", "known_variants_grch37.vcf"), resume=False
-                )
+            with mock.patch.object(SequenceContextGenerator, "build_context", _unavailable_context):
+                result = pipeline.run(_os.path.join(_SCRIPT_DIR, "testdata", "known_variants_grch37.vcf"), resume=False)
 
     ok = True
     for entry in result["variants"]:
@@ -284,16 +308,20 @@ def main() -> int:
         clinvar_r = entry["clinvar"]
         found_both = dbsnp_r.get("found") and clinvar_r.get("found")
         status = "OK" if found_both else "MISSING RECORD (regression!)"
-        print(f"  {v['chrom']}:{v['pos']} {v['ref']}>{v['alt']}  "
-              f"dbSNP found={dbsnp_r.get('found')} rsid={dbsnp_r.get('rsid')}  "
-              f"ClinVar found={clinvar_r.get('found')}  [{status}]")
+        print(
+            f"  {v['chrom']}:{v['pos']} {v['ref']}>{v['alt']}  "
+            f"dbSNP found={dbsnp_r.get('found')} rsid={dbsnp_r.get('rsid')}  "
+            f"ClinVar found={clinvar_r.get('found')}  [{status}]"
+        )
         if not found_both:
             ok = False
 
     print()
     if ok:
-        print("PART 2: PASSED -- orchestrator resolves GRCh37 from the VCF header and "
-              "retrieves both ClinVar and dbSNP records for all 3 known variants.")
+        print(
+            "PART 2: PASSED -- orchestrator resolves GRCh37 from the VCF header and "
+            "retrieves both ClinVar and dbSNP records for all 3 known variants."
+        )
     else:
         print("PART 2: FAILED")
     return 0 if ok else 1

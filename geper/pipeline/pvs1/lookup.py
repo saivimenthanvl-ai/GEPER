@@ -141,7 +141,28 @@ class TranscriptLookup:
                 return result
 
         result = self._fetch(gene_symbol, build)
-        if self.cache is not None and not result.get("error"):
+        # NOT INERT THE SAME WAY THIS SWEEP'S OTHER CONSUMER SITES ARE
+        # (2026-08-31): this gate decides whether a FAILED lookup gets
+        # CACHED, not what text a reader sees -- if `result["error"]`
+        # were ever an empty string, the old `not result.get("error")`
+        # WOULD wrongly cache the failure (confirmed by a direct test:
+        # it fails on the pre-fix code), and a transient failure would
+        # then be served from cache to every subsequent query for this
+        # gene until the entry expired -- not merely a misleading
+        # sentence, the harm class this sweep's other consumer sites
+        # share. It is IMMUNE today (same class as Batch 2's four
+        # "structurally immune" sites) for a producer-side reason, not
+        # a behavioural one: `result["error"]` only ever reaches here
+        # from `_fetch_local` (never sets "error" at all) or
+        # `_fetch_live`, whose sole "error" assignment is
+        # f"Ensembl transcript lookup failed for {gene_symbol} after
+        # {N} attempts: {last_error}" -- a string with a non-empty
+        # prefix that can never collapse to "" even when the underlying
+        # `last_error` has no message of its own. Fixed to `is not
+        # None` because the immunity is a fact about today's producer,
+        # not the code -- a future second producer of this key could
+        # reopen the class silently otherwise.
+        if self.cache is not None and result.get("error") is None:
             self.cache.put(key, result)
         return result
 
@@ -209,6 +230,15 @@ class TranscriptLookup:
             "assembly": build,
             "source": "ensembl_gtf_cache",
             "transcript": transcript_dict,
+            # Round 14, B2: `pipeline/ensembl/bootstrap.py::_parse_gtf_lines`
+            # only ever creates a gene accumulator when the GTF's own
+            # `gene_biotype` attribute equals `protein_coding` (see that
+            # function's `biotype != _CODING_BIOTYPE` gate) -- a
+            # non-protein-coding gene (e.g. any mitochondrial tRNA/rRNA
+            # gene) never becomes a row in this cache at all, so reaching
+            # this branch guarantees the biotype, rather than requiring a
+            # second lookup to confirm it.
+            "gene_biotype": "protein_coding",
         }
 
     def _fetch_live(self, gene_symbol: str, build: str) -> Dict[str, Any]:
@@ -267,6 +297,15 @@ class TranscriptLookup:
                 "gene_symbol": gene_symbol,
                 "transcript": None,
                 "reason": f"no protein-coding transcript with a translation was returned for {gene_symbol}.",
+                # Round 14, B2: `payload` is Ensembl's own `lookup/symbol`
+                # response, which already carries the gene's `biotype`
+                # (e.g. "protein_coding", "Mt_tRNA", "Mt_rRNA") -- surfaced
+                # here rather than fetched a second time, so a caller that
+                # needs to tell "this gene genuinely has no CDS" (biology)
+                # apart from "the lookup failed" (a data gap) can, without
+                # hardcoding a gene list. `None` when Ensembl's own
+                # response didn't include it -- never guessed.
+                "gene_biotype": payload.get("biotype"),
             }
 
         cds_sequence = self._fetch_cds_sequence(chosen.get("id"), build)
@@ -291,6 +330,7 @@ class TranscriptLookup:
             "assembly": build,
             "source": "ensembl_api",
             "transcript": transcript_dict,
+            "gene_biotype": payload.get("biotype"),
         }
 
     def _fetch_cds_sequence(self, transcript_id: Optional[str], build: str) -> Optional[str]:

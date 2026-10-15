@@ -24,6 +24,21 @@ from pipeline.models.enformer_plugin import (
 from pipeline.models.manager import ModelManager, PluginUnavailableError
 from pipeline.models.registry import ModelRegistry
 from utils.exceptions import ModelLoadError
+from utils.auto_install import PackageCheckStatus
+
+try:
+    import enformer_pytorch  # noqa: F401
+
+    _HAS_ENFORMER_PYTORCH = True
+except ImportError:
+    _HAS_ENFORMER_PYTORCH = False
+
+_ENFORMER_SKIP_REASON = (
+    "enformer-pytorch is not installed in this environment -- Enformer is an "
+    "optional, config-gated integration (CONFIG.splicing.ENABLE_ENFORMER; see "
+    "requirements.txt's own header comment for the rationale), not a broken "
+    "environment."
+)
 
 
 class _FakeEnformerModel:
@@ -93,7 +108,13 @@ class TestPrepareSequence(unittest.TestCase):
         self.assertEqual(prepared, "ACGT")
 
 
+@unittest.skipUnless(_HAS_ENFORMER_PYTORCH, _ENFORMER_SKIP_REASON)
 class TestEnformerInference(unittest.TestCase):
+    """`_infer_impl` itself calls `enformer_pytorch.str_to_one_hot` (see
+    enformer_plugin.py) even though `self.model` is faked here -- so
+    every test in this class needs the real package regardless of
+    mocking, not just the ones that mock.patch it directly."""
+
     def _make_instance(self, fake_model):
         instance = EnformerPlugin.__new__(EnformerPlugin)
         instance.logger = mock.Mock()
@@ -134,6 +155,7 @@ class TestEnformerInference(unittest.TestCase):
         self.assertIn("device", result["meta"])
 
 
+@unittest.skipUnless(_HAS_ENFORMER_PYTORCH, _ENFORMER_SKIP_REASON)
 class TestEnformerDeviceMismatchFix(unittest.TestCase):
     """Regression coverage for the device-mismatch bug: the plugin
     must one-hot encode ref/alt sequences itself and move the
@@ -180,10 +202,14 @@ class TestEnformerLoadImpl(unittest.TestCase):
         self.instance._weight_cache = mock.Mock()
         self.instance._weight_cache.ensure_dir.return_value = "/tmp/fake_enformer_cache"
 
+    @unittest.skipUnless(_HAS_ENFORMER_PYTORCH, _ENFORMER_SKIP_REASON)
     def test_successful_load_calls_to_and_eval(self):
         fake_model = _FakeEnformerModel(ref_value=0.0, alt_value=1.0)
         with (
-            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
             mock.patch("enformer_pytorch.from_pretrained", return_value=fake_model),
         ):
             self.instance._load_impl()
@@ -192,9 +218,13 @@ class TestEnformerLoadImpl(unittest.TestCase):
         self.assertEqual(fake_model.to_calls, ["cpu"])
         self.assertTrue(fake_model.eval_called)
 
+    @unittest.skipUnless(_HAS_ENFORMER_PYTORCH, _ENFORMER_SKIP_REASON)
     def test_network_failure_is_sanitized(self):
         with (
-            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
             mock.patch(
                 "enformer_pytorch.from_pretrained", side_effect=ConnectionError("could not reach huggingface.co")
             ),
@@ -205,17 +235,73 @@ class TestEnformerLoadImpl(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "Enformer model unavailable")
         self.assertNotIn("huggingface.co", str(ctx.exception))
 
-    def test_missing_package_raises_clear_error(self):
-        with mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=False):
+    def test_load_impl_under_not_checked_says_it_was_never_looked_for(self):
+        """NOT_CHECKED: the package is NOT confirmed missing.
+
+        *** REPLACES `test_missing_package_raises_clear_error`, WHICH
+        NEVER EXERCISED THE MISSING-PACKAGE PATH. *** It left
+        `check_pip_package_availability` real and asserted only
+        `"enformer-pytorch" in message`. Under pytest auto-install is
+        disabled, so the real call returns NOT_CHECKED, not ABSENT --
+        and the NOT_CHECKED message happens to contain the package name
+        too, so the assertion passed while the test's name, and the
+        defect it guards, were about ABSENT. Measured 2026-09-10: with
+        the package genuinely installed the error becomes
+        `ModuleNotFoundError: No module named 'enformer_pytorch'` --
+        UNDERSCORE -- and that assertion would be FALSE.
+
+        *** "enformer-pytorch" IS A SUBSTRING OF **BOTH** MESSAGES, SO
+        IT CANNOT DISTINGUISH THE TWO STATES. THAT IS THE WHOLE DEFECT.
+        These two tests assert on what SEPARATES the states, and each
+        also asserts the other state's claim is ABSENT from the text --
+        which is the NOT_CHECKED-vs-ABSENT conflation `335e15a` exists
+        to eliminate, arriving here in the same commit's own subject
+        area. ***
+        """
+        with mock.patch(
+            "pipeline.models.enformer_plugin.check_pip_package_availability",
+            return_value=PackageCheckStatus.NOT_CHECKED,
+        ):
             with self.assertRaises(RuntimeError) as ctx:
                 self.instance._load_impl()
-        self.assertIn("enformer-pytorch", str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn("not checked", message)
+        self.assertIn("never looked for", message)
+        # MUST NOT claim an installation was tried: nothing was.
+        self.assertNotIn("did not succeed", message)
+        self.assertNotIn("Automatic installation", message)
+        # Named, but deliberately NOT the discriminator -- see docstring.
+        self.assertIn("enformer-pytorch", message)
 
+    def test_load_impl_under_absent_says_the_installation_failed(self):
+        """ABSENT: an install WAS attempted and it failed.
+
+        The symmetric half. Its message must not fall back on the
+        "never looked for" language, which would understate a real,
+        failed attempt.
+        """
+        with mock.patch(
+            "pipeline.models.enformer_plugin.check_pip_package_availability",
+            return_value=PackageCheckStatus.ABSENT,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.instance._load_impl()
+        message = str(ctx.exception)
+        self.assertIn("did not succeed", message)
+        # MUST NOT say it was never looked for: it was.
+        self.assertNotIn("not checked", message)
+        self.assertNotIn("never looked for", message)
+        self.assertIn("enformer-pytorch", message)
+
+    @unittest.skipUnless(_HAS_ENFORMER_PYTORCH, _ENFORMER_SKIP_REASON)
     def test_full_load_via_public_api_wraps_in_model_load_error_on_failure(self):
         # Exercise through PluginModel.load() (not _load_impl directly)
         # to confirm the base class's own wrapping still applies.
         with (
-            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.PRESENT,
+            ),
             mock.patch("enformer_pytorch.from_pretrained", side_effect=OSError("network unreachable")),
         ):
             with self.assertRaises(ModelLoadError):
@@ -246,9 +332,68 @@ class TestEnformerMetadataAndAvailability(unittest.TestCase):
             self.assertIn("ENABLE_ENFORMER", EnformerPlugin.unavailability_reason())
 
     def test_available_when_flag_on_and_package_installed(self):
-        with mock.patch("pipeline.models.enformer_plugin.CONFIG") as mock_config:
+        # Mocks ensure_pip_package_available rather than relying on the
+        # real package genuinely being pip-installed, same convention as
+        # the other enformer tests above -- this test's intent is the
+        # "package already installed" path, not the auto-install path
+        # (which, unmocked, used to reach a real unconstrained
+        # `pip install enformer-pytorch` and silently downgrade the
+        # box's transformers pin; post-47748b6 that real call now
+        # correctly fails the requirements.txt constraint instead,
+        # which is right, but means this test can no longer assume the
+        # real package is present just because is_available() is True).
+        with (
+            mock.patch("pipeline.models.enformer_plugin.CONFIG") as mock_config,
+            mock.patch("pipeline.models.enformer_plugin.ensure_pip_package_available", return_value=True),
+        ):
             mock_config.splicing.ENABLE_ENFORMER = True
-            self.assertTrue(EnformerPlugin.is_available())  # enformer_pytorch really is installed
+            self.assertTrue(EnformerPlugin.is_available())
+
+    def test_unavailability_reason_under_absent_does_not_claim_no_attempt(self):
+        """The dangerous case (Commit 2): once a real install attempt has
+        happened and failed (ABSENT), the reason text must not say
+        installation "has not been attempted" -- that specific false
+        claim, made under the opposite state, is the defect this
+        migration exists to close. See design v2 section 6."""
+        with (
+            mock.patch("pipeline.models.enformer_plugin.CONFIG") as mock_config,
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.ABSENT,
+            ),
+        ):
+            mock_config.splicing.ENABLE_ENFORMER = True
+            reason = EnformerPlugin.unavailability_reason()
+        self.assertIn("enformer-pytorch", reason)
+        self.assertNotIn("has not been attempted", reason)
+
+    def test_unavailability_reason_under_not_checked_says_not_checked(self):
+        """NOT_CHECKED is MOCKED here, not inherited from the box.
+
+        *** THIS PREVIOUSLY LEFT `check_pip_package_availability` REAL
+        AND RELIED ON enformer-pytorch NOT BEING INSTALLED. *** That is
+        a dependency on an UNPINNED package's absence: enformer-pytorch
+        is not in `geper/requirements.txt`, so the state this test needs
+        is whatever the box happens to have, and a developer who
+        installs the package turns this green test red -- for succeeding
+        rather than for breaking.
+        Its own sibling three lines above
+        (`..._under_absent_does_not_claim_no_attempt`) already mocked
+        the status explicitly; the pair was asymmetric and this is the
+        half that had not been done. Measured 2026-09-10 with the real
+        function poisoned: this test reached it, the sibling did not.
+        """
+        with (
+            mock.patch("pipeline.models.enformer_plugin.CONFIG") as mock_config,
+            mock.patch(
+                "pipeline.models.enformer_plugin.check_pip_package_availability",
+                return_value=PackageCheckStatus.NOT_CHECKED,
+            ),
+        ):
+            mock_config.splicing.ENABLE_ENFORMER = True
+            reason = EnformerPlugin.unavailability_reason()
+        self.assertIn("enformer-pytorch", reason)
+        self.assertIn("not checked", reason)
 
 
 class TestEnformerThroughModelManager(unittest.TestCase):

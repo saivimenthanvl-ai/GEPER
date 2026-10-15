@@ -315,15 +315,31 @@ class SequenceContextGenerator:
                     time.sleep(CONFIG.api.RETRY_BACKOFF_SECS * attempt)
 
         HEALTH.note_failure("Ensembl")
-        raise ExternalAPIError(
+        logger.warning(
             f"Failed to fetch reference sequence for '{region}' from Ensembl "
-            f"after {CONFIG.api.MAX_RETRIES} attempts: {last_error}"
+            f"after {CONFIG.api.MAX_RETRIES} attempts: {last_error}",
+            exc_info=last_error,
+        )
+        # Round 28: unlike the offline-skip raise above, `region` alone
+        # (bare genomic coordinates, e.g. "17:43094298-43094300") is not
+        # sensitive and stays in the raised message -- `last_error` is
+        # the actual leak here (a real `requests.ConnectionError`
+        # typically stringifies to include the full request URL/host).
+        # This message reaches `process_variant`'s `errors.append(f"Sequence
+        # context generation failed: {exc}")`, rendered unconditionally
+        # into every Markdown report's "Stage Warnings / Errors" section.
+        # Full detail goes to the log line above only.
+        raise ExternalAPIError(
+            f"Failed to fetch reference sequence for '{region}' from Ensembl after {CONFIG.api.MAX_RETRIES} attempts"
         )
 
     @staticmethod
     def _normalize_chrom(chrom: str) -> str:
-        """Ensembl expects '1', 'X', 'MT' (no 'chr' prefix)."""
-        normalized = chrom.replace("chr", "").replace("Chr", "").replace("CHR", "")
-        if normalized in ("M", "mt", "Mt"):
+        """Ensembl expects '1', 'X', 'MT' (no 'chr' prefix). Prefix
+        stripping and the M-family special case are both
+        case-insensitive (round 15: the previous exact-case checks
+        missed spellings like all-lowercase 'chrm')."""
+        normalized = chrom[3:] if chrom.lower().startswith("chr") else chrom
+        if normalized.upper() in ("M", "MT"):
             normalized = "MT"
         return normalized

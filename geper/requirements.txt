@@ -3,7 +3,10 @@
 # RNA-FM, ESM2, and AlphaMissense. (DNABERT-2 has been removed from
 # GEPER entirely -- see LICENSE_AUDIT.md / the AI orchestration audit.
 # Enformer and Borzoi are optional, config-gated integrations
-# (CONFIG.splicing.ENABLE_ENFORMER / ENABLE_BORZOI, both default off)
+# (CONFIG.splicing.ENABLE_ENFORMER / ENABLE_BORZOI -- both default
+# ENABLED, since both are commercially-cleared; opt out per-deployment
+# with GEPER_ENABLE_ENFORMER=false / GEPER_ENABLE_BORZOI=false -- see
+# config.py's SplicingConfig docstring for the full rationale)
 # whose `enformer-pytorch` / `borzoi-pytorch` packages are
 # auto-installed at runtime only when enabled -- same pattern as
 # MMSplice/RNA-FM/HyenaDNA below -- so they are intentionally not
@@ -50,7 +53,16 @@
 # CPU-only development machines (no Evo2) can instead install plain
 # `torch==2.7.1` from PyPI -- everything else in this file works identically.
 torch==2.7.1
-transformers>=5.12.1,<6.0.0
+# transformers is pinned to EXACTLY what the shipped image runs (the
+# Dockerfile's last-wins `pip install "transformers==4.56.2"`), by human
+# ruling 2026-09-11: "The image is what ships, so a requirements file
+# demanding a version the runtime doesn't have is a claim about the product
+# that the product contradicts." Why the image needs 4.56.2: enformer-pytorch
+# 0.8.12 hard-pins transformers==4.56.2 and borzoi-pytorch requires <5 --
+# neither runs on 5.x (see the Dockerfile's transformers writeup). This line
+# was `>=5.12.1,<6.0.0` until then, a range the image never satisfied.
+# tests/test_transformers_pin_matches_image.py fails if the two diverge again.
+transformers==4.56.2
 accelerate>=1.14.0,<2.0.0
 
 # einops is pinned to exactly 0.8.1 (not left as a loose >=) because Evo2's
@@ -65,7 +77,12 @@ einops==0.8.1
 # Migrated from the MultiMolecule reimplementation (AGPL-3.0-or-later,
 # incompatible with commercial/hospital deployment) to the official
 # package -- see MIGRATION_RNA_FM.md for the equivalence verification.
-rna-fm>=0.2.2
+# Pinned exactly rather than left as a floor: 0.2.2 is also PyPI's
+# current latest release (verified live via pypi.org/pypi/rna-fm/json,
+# 2026-08-27), so this changes nothing about what resolves today --
+# it only stops a future 0.2.3+ from silently changing behavior with
+# no GEPER-side signal that anything moved.
+rna-fm==0.2.2
 
 # --- Evo 2 (models/evo2.py) --------------------------------------------------
 # Arc Institute's DNA foundation model, replacing Nucleotide Transformer.
@@ -83,7 +100,12 @@ rna-fm>=0.2.2
 # whatever CUDA toolkit matches the already-installed torch build, which a
 # plain `pip install -r requirements.txt` in a fresh/CPU environment cannot
 # do safely or quickly. Install it manually per the commands above, then:
-evo2>=0.6.0
+# Pinned exactly rather than left as a floor: 0.6.0 is also PyPI's
+# current latest release (verified live via pypi.org/pypi/evo2/json,
+# 2026-08-27), so this changes nothing about what resolves today -- it
+# only stops a future release from silently changing behavior with no
+# GEPER-side signal that anything moved.
+evo2==0.6.0
 # IMPORTANT -- checkpoint choice: use GEPER_EVO2_VARIANT=evo2_7b_base (the
 # default), NOT plain 'evo2_7b'. Verified against
 # https://github.com/ArcInstitute/evo2/issues/208 (open, 2026-03-13): plain
@@ -182,6 +204,45 @@ pyyaml>=6.0
 # with anything else in this file.
 pydantic>=2.0,<3.0
 
+# --- Structures API (api/main.py) -------------------------------------------
+# geper's first HTTP surface (2026-08-23, ruled Option A): the AlphaFold
+# structure-annotation endpoint the 3D viewer calls. Version constraints
+# match kim_pipeline/requirements.txt's own fastapi/uvicorn pins for
+# consistency across the two trees.
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# --- Clinical database driver (api/submission_worker.py, ------------------
+# --- api/exception_retry_worker.py) ---------------------------------------
+# Both workers `import psycopg` inside main() to open a connection to
+# CLINICAL_DSN, so geper cannot run either of them without it.
+#
+# It is only unconditionally required as of the CLINICAL_DSN fail-closed
+# change (2026-09-08). Before it, submission_worker.py reached the import
+# only when CLINICAL_DSN was set, and ran fine without either -- so the
+# driver was genuinely optional for that worker and the missing
+# declaration cost nothing. Now both workers refuse to start without a
+# DSN, and a DSN means this import must succeed. It was
+# imported by this tree for weeks while being declared by no requirements
+# file at all: nothing under geper/ imported it during a CI run, so the
+# gap was real but unreachable, and a green tick meant only that nothing
+# had tried yet. The 2026-09-08 CLINICAL_DSN fail-closed tests
+# (api/tests/test_worker_clinical_dsn_fail_closed.py) were the first thing
+# to import it under CI, and they failed with ModuleNotFoundError on a
+# defect they did not introduce.
+#
+# The `[binary]` extra, not bare `psycopg`: it ships a self-contained
+# libpq, so importing does not depend on a system libpq being present on
+# the runner. It also matches the only other psycopg installation in this
+# repository -- the clinical/ CI job's `pip install psycopg[binary]` in
+# .github/workflows/pytest.yml.
+#
+# Unpinned deliberately. Nothing in this repository pins psycopg (that
+# clinical/ line is unpinned too), so pinning it here would invent a
+# constraint on one of the two installs and silently let them diverge.
+# Pin both together or neither.
+psycopg[binary]
+
 # --- Clinical PDF report generation (report/summary.py) --------------------
 # BSD-licensed (License :: OSI Approved :: BSD License, verified against
 # PyPI's own package metadata) -- no commercial-use restriction, unlike
@@ -221,5 +282,64 @@ Pillow>=9.0
 #   pip install tensorflow "mmsplice==2.4.0" --no-deps
 # (installing plain `tensorflow` first/separately, since --no-deps on
 # the mmsplice line means pip will not pull it in automatically).
+#
+# THIS FILE IS NOT A VERSION AUTHORITY FOR mmsplice. The 2.4.0 above is
+# a suggested pre-provisioning command, not a pin this file enforces --
+# per the IMPORTANT note above there is deliberately no mmsplice
+# requirement line here, so nothing in this file constrains what the
+# runtime auto-install fetches. The two paths can therefore disagree:
+# pre-provisioning gives you 2.4.0, the auto-install gives you whatever
+# PyPI serves that day.
+#
+# Which version a given run ACTUALLY used is recorded per run, resolved
+# from the installed distribution, in `geper_results.json`'s
+# `model_checkpoints.mmsplice.resolved_version` (see
+# `pipeline/provenance.py`). Until 2026-09-02 that field instead
+# asserted "mmsplice==2.4.0 (pinned, see requirements.txt)" and cited
+# this file as its authority -- a pin this file does not contain and,
+# above, explicitly tells you not to add.
 tensorflow>=2.16.0,<3.0.0
 
+# --- Test-only dependencies (not imported by pipeline/ at runtime) -----------
+# These belong HERE, not in a separate requirements-dev.txt, because this
+# file's own header declares itself "ONE environment" for GEPER -- and this
+# project's environment has to be able to run this project's tests. That
+# reconciles the header with reality; until 2026-08-23 the two contradicted
+# each other, and the contradiction was silent.
+#
+# Undeclared until 2026-08-23. Not a decision -- an oversight. This file
+# documents its rationale for five DELIBERATE omissions (enformer, borzoi,
+# spliceformer, splicebert, mmsplice); it documented none for the test
+# runner, which is the asymmetry that identified this as an accident. The
+# consequence: `.github/workflows/pytest.yml` runs `pip install -r
+# requirements.txt` and then `python -m pytest tests/ -v`, so in a clean
+# environment the second step died with "No module named pytest". The geper
+# job has therefore produced ZERO test results for its entire existence
+# while reporting red -- indistinguishable, from the outside, from a job
+# that ran the suite and failed it.
+#
+# pytest: the runner. Lower bound matches kim_pipeline's. MEASURED, not
+# assumed: 22 geper test files use unittest's `subTest`. Under pytest 8 a
+# failing subtest still fails its test (verified with a deliberate 3-case
+# probe: 2 of 3 cases failing -> 1 reported failure), so there is no
+# false-green risk at the lower bound; pytest 9 additionally reports each
+# subtest separately (same probe -> SUBFAILED(i=2) and SUBFAILED(i=3)).
+# Granularity differs, correctness does not. No pytest-subtests plugin is
+# required at either version.
+pytest>=8.0.0
+# pypdf: READS BACK the PDFs that reportlab (pinned above) writes, so tests
+# can assert page count / rendered text. Production never imports it --
+# `grep -rn pypdf` outside tests/ returns nothing.
+pypdf>=4.0.0
+# httpx: starlette's TestClient (`from fastapi.testclient import TestClient`,
+# api/tests/test_interpretations_api.py and tests/test_api_structures.py)
+# imports httpx2, falls back to httpx, and raises RuntimeError at import if
+# neither is installed. geper's own code never imports httpx. Undeclared
+# until 2026-09-11. Before then it arrived ONLY transitively: transformers
+# 5.x pulled huggingface_hub 1.x, which depends on httpx. Pinning
+# transformers==4.56.2 (above) resolves huggingface_hub 0.36.2, which does
+# not, so httpx disappeared and CI's geper job died at collection (run
+# 34623361700; master's run 34623788453 had httpx 0.28.1 via huggingface_hub
+# 1.31.0). Same lower bound as kim_pipeline/ and clinical/ requirements.txt.
+# tests/test_api_imports_are_declared.py checks this statically.
+httpx>=0.27.0

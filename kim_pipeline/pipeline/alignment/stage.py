@@ -100,14 +100,16 @@ class AlignmentStage:
             if not bwa_runner.is_available():
                 raise FastqPipelineError(
                     "aligner='bwa' requested but no BWA binary is installed.",
-                    stage="alignment", tool="bwa",
+                    stage="alignment",
+                    tool="bwa",
                 )
             return "bwa"
         if requested == "minimap2":
             if not minimap2_runner.is_available():
                 raise FastqPipelineError(
                     "aligner='minimap2' requested but minimap2 is not installed.",
-                    stage="alignment", tool="minimap2",
+                    stage="alignment",
+                    tool="minimap2",
                 )
             return "minimap2"
         if requested == "auto":
@@ -118,7 +120,8 @@ class AlignmentStage:
             raise FastqPipelineError(
                 "aligner='auto' but neither BWA nor minimap2 is installed. "
                 "Install one: 'apt install bwa' or 'apt install minimap2'.",
-                stage="alignment", tool="bwa/minimap2",
+                stage="alignment",
+                tool="bwa/minimap2",
             )
         raise FastqPipelineError(
             f"Unknown aligner {requested!r}; expected 'auto', 'bwa', or 'minimap2'.",
@@ -148,30 +151,49 @@ class AlignmentStage:
         out.mkdir(parents=True, exist_ok=True)
         raw_sam_path = str(out / "aligned.raw.sam")
         sorted_bam_path = str(out / "aligned.sorted.bam")
+        fixmate_bam_path = str(out / "aligned.fixmate.bam")
         markdup_bam_path = str(out / "aligned.markdup.bam")
         metrics_report_path = str(out / "alignment_metrics.json")
 
         logger.info(
             "[%s] AlignmentStage: aligner=%s threads=%d ref=%s",
-            sample_id, aligner_choice, threads, reference_fasta,
+            sample_id,
+            aligner_choice,
+            threads,
+            reference_fasta,
         )
 
         if aligner_choice == "bwa":
             bwa_runner.run_bwa_mem(
-                fastq_r1, fastq_r2, reference_fasta, raw_sam_path,
-                sample_id=sample_id, threads=threads, index_dir=index_dir,
+                fastq_r1,
+                fastq_r2,
+                reference_fasta,
+                raw_sam_path,
+                sample_id=sample_id,
+                threads=threads,
+                index_dir=index_dir,
             )
         else:
             minimap2_runner.run_minimap2(
-                fastq_r1, fastq_r2, reference_fasta, raw_sam_path,
-                sample_id=sample_id, threads=threads, preset=preset,
+                fastq_r1,
+                fastq_r2,
+                reference_fasta,
+                raw_sam_path,
+                sample_id=sample_id,
+                threads=threads,
+                preset=preset,
             )
 
-        bam_utils.sam_to_sorted_bam(raw_sam_path, sorted_bam_path, threads=threads)
+        # fixmate BEFORE the coordinate sort: it needs name-grouped input,
+        # and markdup needs the MC/ms tags it writes. Omitting it does not
+        # fail on duplicate-free input, which is why it went unnoticed.
+        bam_utils.name_sort_and_fixmate(raw_sam_path, fixmate_bam_path, threads=threads)
+        bam_utils.sam_to_sorted_bam(fixmate_bam_path, sorted_bam_path, threads=threads)
         bam_utils.mark_duplicates(sorted_bam_path, markdup_bam_path, threads=threads)
 
         if not keep_intermediate_sam:
             Path(raw_sam_path).unlink(missing_ok=True)
+            Path(fixmate_bam_path).unlink(missing_ok=True)
             Path(sorted_bam_path).unlink(missing_ok=True)
 
         bai_path = bam_utils.index_bam(markdup_bam_path, threads=threads)
@@ -183,7 +205,8 @@ class AlignmentStage:
             metrics.duplicate_pct = round(100.0 * metrics.duplicate_reads / metrics.total_reads, 3)
 
         bam_utils.write_metrics_report(
-            metrics, metrics_report_path,
+            metrics,
+            metrics_report_path,
             extra={
                 "sample_id": sample_id,
                 "aligner": aligner_choice,
@@ -198,6 +221,30 @@ class AlignmentStage:
             reference_fasta=reference_fasta,
             fastq_r1=fastq_r1,
             fastq_r2=fastq_r2,
+            # sorted_bam_path IS A DELIBERATE ALIAS of the markdup BAM, not a
+            # mistake. Both fields intentionally hold the same path.
+            #
+            # DO NOT 'CORRECT' THIS TO POINT AT aligned.sorted.bam. Two
+            # reasons, and the second one is a patient-safety issue:
+            #
+            #  1. that file does not survive the run -- it is unlinked above
+            #     unless keep_intermediate_sam is set, and it has no .bai.
+            #
+            #  2. THE ONLY PRODUCTION CONSUMER FEEDS THIS PATH TO THE VARIANT
+            #     CALLER (orchestration/runner.py reads the 'sorted_bam_path'
+            #     key and passes it as bam_path). freebayes is invoked with no
+            #     --use-duplicate-reads, so its default applies and reads
+            #     flagged 1024 are EXCLUDED from calling. Handing it the
+            #     pre-markdup BAM would silently re-admit PCR duplicates as
+            #     independent evidence and inflate alternate-allele fractions,
+            #     which feed --min-alternate-fraction and --min-alternate-count
+            #     directly. Nothing would error; the numbers would just change.
+            #
+            # The name is historical and it is the only thing here that is
+            # wrong. Renaming the field is NOT a free refactor either: runner.py
+            # reads it as a dict key out of a JSON checkpoint, so a rename is a
+            # checkpoint-format change that breaks resume on in-flight runs, and
+            # docs/INSTALL.md publishes the attribute as public usage.
             sorted_bam_path=markdup_bam_path,
             markdup_bam_path=markdup_bam_path,
             bai_path=bai_path,
@@ -208,7 +255,10 @@ class AlignmentStage:
 
         logger.info(
             "[%s] Alignment complete: %s mapped %.1f%% of %d reads in %.2fs",
-            sample_id, aligner_choice, metrics.pct_mapped, metrics.total_reads,
+            sample_id,
+            aligner_choice,
+            metrics.pct_mapped,
+            metrics.total_reads,
             result.elapsed_seconds,
         )
         return result
